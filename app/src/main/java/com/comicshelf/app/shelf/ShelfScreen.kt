@@ -1,0 +1,1263 @@
+package com.comicshelf.app.shelf
+
+import android.graphics.Bitmap
+import android.util.Log
+import android.widget.Toast
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.MenuBook
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CollectionsBookmark
+import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Label
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.outlined.Translate
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.paging.compose.collectAsLazyPagingItems
+import androidx.paging.compose.itemKey
+import com.comicshelf.app.core.BookCell
+import com.comicshelf.app.core.CoreDispatcher
+import com.comicshelf.app.core.CoverStore
+import com.comicshelf.app.core.DirRow
+import com.comicshelf.app.core.Json
+import com.comicshelf.app.core.LibraryRow
+import com.comicshelf.app.core.NativeBridge
+import com.comicshelf.app.core.parseImageBundle
+import com.comicshelf.app.reader.BookTranslateJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.OutlinedButton
+import com.comicshelf.app.core.CsSettings
+import kotlinx.coroutines.Dispatchers
+import org.json.JSONArray
+import org.json.JSONObject
+
+private val coverPlaceholder = Color(0xFF232830)
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@Composable
+fun ShelfScreen(
+    vm: ShelfViewModel,
+    hasAllFilesAccess: Boolean,
+    onOpenAllFilesAccess: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenBook: (Long, String, Boolean) -> Unit,
+) {
+    val libs by vm.libraries.collectAsState()
+    val query by vm.query.collectAsState()
+    val scan by vm.scan.collectAsState()
+    val items = vm.books.collectAsLazyPagingItems()
+    val gridState = vm.gridState
+
+    // 记录滚动位置（仅在"已恢复"之后记录，避免回来时的空状态把记忆冲掉）
+    LaunchedEffect(gridState) {
+        snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+            .collect { (i, o) -> if (vm.scrollRestored()) vm.noteScroll(i, o) }
+    }
+    // 数据就绪后恢复一次：回到你刚才读的那本书所在的那一屏
+    LaunchedEffect(items.itemCount) {
+        if (items.itemCount > 0 && !vm.scrollRestored()) {
+            val saved = vm.savedScroll()
+            vm.markScrollRestored()
+            if (saved != null && saved.first > 0) {
+                gridState.scrollToItem(saved.first.coerceAtMost(items.itemCount - 1), saved.second)
+            }
+        }
+    }
+
+    val drawer = rememberDrawerState(androidx.compose.material3.DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var searchEdit by remember { mutableStateOf(query.search) }
+    var showAddLib by remember { mutableStateOf(false) }
+    var selection by remember { mutableStateOf<Map<Long, BookCell>>(emptyMap()) }
+    var contextBook by remember { mutableStateOf<BookCell?>(null) }
+    val trJob by BookTranslateJob.state.collectAsState()
+    var removeTarget by remember { mutableStateOf<LibraryRow?>(null) }
+    var showTagsDialog by remember { mutableStateOf(false) }
+
+    if (!hasAllFilesAccess) {
+        StorageGate(onOpenAllFilesAccess)
+        return
+    }
+
+    ModalNavigationDrawer(
+        drawerState = drawer,
+        drawerContent = {
+            ModalDrawerSheet {
+                LibraryDrawerContent(
+                    vm, libs, query,
+                    onPickLibrary = {
+                        vm.setLibrary(it)
+                        scope.launch { drawer.close() }
+                    },
+                    onRescan = { vm.rescan(it) },
+                    onRemove = { id -> removeTarget = libs.firstOrNull { it.id == id } },
+                    onPickDir = {
+                        vm.setDir(it)
+                        scope.launch { drawer.close() }
+                    },
+                )
+            }
+        },
+    ) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text(
+                                if (query.dirRel.isEmpty()) "全部漫画"
+                                else query.dirRel.substringAfterLast('/'),
+                                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            libs.firstOrNull { it.id == query.libId }?.let {
+                                Text(
+                                    "${it.count} 本 · ${it.name}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = { scope.launch { drawer.open() } }) {
+                            Icon(Icons.Filled.CollectionsBookmark, "书库")
+                        }
+                    },
+                    actions = {
+                        var showSearch by remember { mutableStateOf(false) }
+                        if (showSearch) {
+                            OutlinedTextField(
+                                value = searchEdit,
+                                onValueChange = {
+                                    searchEdit = it
+                                    vm.setSearch(it)
+                                },
+                                singleLine = true,
+                                placeholder = { Text("搜索…") },
+                                modifier = Modifier.width(200.dp),
+                                trailingIcon = {
+                                    IconButton(onClick = {
+                                        searchEdit = ""
+                                        vm.setSearch("")
+                                        showSearch = false
+                                    }) { Icon(Icons.Filled.Close, null) }
+                                },
+                            )
+                        } else {
+                            IconButton(onClick = { showSearch = true }) {
+                                Icon(Icons.Filled.Search, "搜索")
+                            }
+                        }
+                        var sortMenu by remember { mutableStateOf(false) }
+                        IconButton(onClick = { sortMenu = true }) {
+                            Icon(Icons.Filled.Sort, "排序")
+                        }
+                        DropdownMenu(expanded = sortMenu, onDismissRequest = { sortMenu = false }) {
+                            ShelfSort.entries.forEach { s ->
+                                DropdownMenuItem(
+                                    text = {
+                                        val mark = if (query.sort == s) {
+                                            if (query.desc) " ↓" else " ↑"
+                                        } else ""
+                                        Text((if (query.sort == s) "● " else "○ ") + s.label + mark)
+                                    },
+                                    onClick = {
+                                        val desc = if (query.sort == s) !query.desc else
+                                            s == ShelfSort.ADDED || s == ShelfSort.SIZE ||
+                                            s == ShelfSort.MTIME || s == ShelfSort.PAGES
+                                        vm.setSort(s, desc)
+                                        sortMenu = false
+                                    },
+                                )
+                            }
+                        }
+                        var filterMenu by remember { mutableStateOf(false) }
+                        IconButton(onClick = { filterMenu = true }) {
+                            Icon(Icons.Filled.Visibility, "过滤")
+                        }
+                        DropdownMenu(expanded = filterMenu, onDismissRequest = { filterMenu = false }) {
+                            DropdownMenuItem(
+                                text = { Text((if (query.favOnly) "● " else "○ ") + "只看收藏") },
+                                onClick = { vm.setFilters(!query.favOnly, query.readState) },
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(when (query.readState) {
+                                        0 -> "● 未读"; 1 -> "● 在读"; 2 -> "● 读完"
+                                        else -> "○ 全部状态"
+                                    })
+                                },
+                                onClick = {
+                                    val next = query.readState + 1
+                                    vm.setFilters(query.favOnly, if (next > 2) -1 else next)
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text((if (query.recursive) "● " else "○ ") + "含子目录") },
+                                onClick = { vm.setRecursive(!query.recursive) },
+                            )
+                        }
+                        IconButton(onClick = { vm.rescan() }) {
+                            Icon(Icons.Filled.Refresh, "重扫")
+                        }
+                        IconButton(onClick = onOpenSettings) {
+                            Icon(Icons.Filled.Settings, "设置")
+                        }
+                    },
+                )
+            },
+            floatingActionButton = {
+                ExtendedFloatingActionButton(
+                    onClick = { showAddLib = true },
+                    icon = { Icon(Icons.Filled.Add, null) },
+                    text = { Text("添加书库") },
+                )
+            },
+        ) { pad ->
+            Column(Modifier.padding(pad)) {
+                scan?.let { s ->
+                    if (s.running || s.added + s.updated + s.removed > 0) ScanProgressStrip(s, vm)
+                }
+                if (selection.isNotEmpty()) {
+                    SelectionBar(
+                        n = selection.size,
+                        onTranslate = { on ->
+                            selection.keys.forEach { vm.setBookTranslate(it, on) }
+                            selection = emptyMap()
+                        },
+                        onMore = if (selection.size == 1) ({
+                            contextBook = selection.values.first()
+                            selection = emptyMap()
+                        }) else null,
+                        onFavorite = {
+                            selection.values.forEach { vm.toggleFavorite(it) }
+                            selection = emptyMap()
+                        },
+                        onMark = { st ->
+                            vm.setReadState(selection.keys.toList(), st)
+                            selection = emptyMap()
+                        },
+                        onCancel = { selection = emptyMap() },
+                    )
+                }
+                Box(Modifier.fillMaxSize()) {
+                    if (items.itemCount == 0) {
+                        Column(
+                            Modifier.align(Alignment.Center),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text("没有漫画", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                if (libs.isEmpty()) "先添加一个书库文件夹" else "换个搜索词或目录试试",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(110.dp),
+                        state = gridState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(
+                            count = items.itemCount,
+                            key = items.itemKey { it.id },
+                        ) { idx ->
+                            val cell = items[idx] ?: return@items
+                            CoverCell(
+                                cell = cell,
+                                selected = selection.containsKey(cell.id),
+                                job = trJob.takeIf { it.bookId == cell.id && it.active },
+                                onClick = {
+                                    if (selection.isNotEmpty()) {
+                                        selection = if (selection.containsKey(cell.id))
+                                            selection - cell.id else selection + (cell.id to cell)
+                                    } else {
+                                        onOpenBook(cell.id, cell.title, false)
+                                    }
+                                },
+                                onLongClick = {
+                                    selection = if (selection.containsKey(cell.id))
+                                        selection - cell.id else selection + (cell.id to cell)
+                                },
+                                onToggleFav = { vm.toggleFavorite(cell) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    removeTarget?.let { lib ->
+        AlertDialog(
+            onDismissRequest = { removeTarget = null },
+            title = { Text("移除书库？") },
+            text = {
+                Text("只会把《${lib.name}》（${lib.count} 本）从书库索引里移除，" +
+                     "**不会删除 NAS/手机上的任何文件**。之后可以随时重新添加。\n\n" +
+                     "要移除的是：${lib.root}")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.removeLibrary(lib.id)
+                    removeTarget = null
+                }) { Text("移除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { removeTarget = null }) { Text("取消") } },
+        )
+    }
+
+    contextBook?.let { cell ->
+        BookContextMenu(
+            cell = cell,
+            onDismiss = { contextBook = null },
+            onOpen = { onOpenBook(cell.id, cell.title, false) },
+            onOpenTranslated = { onOpenBook(cell.id, cell.title, true) },
+            onToggleTranslate = { on ->
+                // backend 模式：启用即启动整本后台翻译队列（从阅读进度处开始）
+                vm.setBookTranslate(cell.id, on, cell.pages, cell.lastPage)
+                contextBook = null
+            },
+            job = trJob.takeIf { it.bookId == cell.id },
+            translateEnabledOf = { vm.bookTranslateEnabled(cell.id) },
+            onToggleFav = { vm.toggleFavorite(cell); contextBook = null },
+            onMark = { vm.setReadState(listOf(cell.id), it); contextBook = null },
+            onTags = { showTagsDialog = true; contextBook = null },
+            onRegenerateCover = { vm.regenerateCover(cell.id); contextBook = null },
+            onExportName = {
+                contextBook = null
+                scope.launch {
+                    val name = withContext(Dispatchers.IO) { NativeBridge.bookFileName(cell.id) }
+                    if (name.isBlank()) {
+                        Toast.makeText(ctx, "导出失败：书名缺失", Toast.LENGTH_SHORT).show()
+                    } else {
+                        clipboard.setText(AnnotatedString(name))
+                        Log.i("ShelfExport", "书名已复制: $name")
+                        Toast.makeText(ctx, "已复制书名：$name", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+        )
+    }
+
+    if (showAddLib) {
+        AddLibraryDialog(
+            vm = vm,
+            onDismiss = { showAddLib = false },
+            onConfirm = { path ->
+                vm.addLibrary(path)
+                showAddLib = false
+            },
+        )
+    }
+
+    if (showTagsDialog) {
+        TagsDialog(onDismiss = { showTagsDialog = false })
+    }
+}
+
+// ---------------------------------------------------------------- drawer
+
+@Composable
+private fun LibraryDrawerContent(
+    vm: ShelfViewModel,
+    libs: List<LibraryRow>,
+    query: ShelfQuery,
+    onPickLibrary: (Long) -> Unit,
+    onRescan: (Long) -> Unit,
+    onRemove: (Long) -> Unit,
+    onPickDir: (String) -> Unit,
+) {
+    LazyColumnWithHeader {
+        item(key = "hdr-lib") {
+            Text(
+                "书库",
+                Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        items(libs.size, key = { i -> "lib$i" }) { i ->
+            val lib = libs[i]
+            var actions by remember { mutableStateOf(false) }
+            androidx.compose.material3.NavigationDrawerItem(
+                label = { Text(lib.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                badge = { Text(lib.count.toString()) },
+                selected = lib.id == query.libId,
+                onClick = { onPickLibrary(lib.id) },
+                modifier = Modifier.padding(horizontal = 8.dp),
+            )
+            Row(Modifier.padding(start = 24.dp)) {
+                TextButton(onClick = { onRescan(lib.id) }) { Text("重扫", fontSize = 11.sp) }
+                TextButton(onClick = { onRemove(lib.id) }) { Text("移除", fontSize = 11.sp) }
+            }
+        }
+        if (libs.isEmpty()) {
+            item(key = "no-lib") {
+                Text(
+                    "还没有书库。点右下角“添加书库”。",
+                    Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        item(key = "hdr-dir") {
+            Text(
+                "目录",
+                Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        item(key = "dir-root") {
+            val total = libs.firstOrNull { it.id == query.libId }?.count ?: 0
+            androidx.compose.material3.NavigationDrawerItem(
+                label = { Text("<全部>") },
+                badge = { Text(total.toString()) },
+                selected = query.dirRel.isEmpty(),
+                onClick = { onPickDir("") },
+                modifier = Modifier.padding(horizontal = 8.dp),
+            )
+        }
+        item(key = "dir-tree") {
+            DirTree(vm, query, "", 0, onPickDir)
+        }
+    }
+}
+
+/** Lazily-expanding folder tree backed by the `dirs` table. */
+@Composable
+private fun DirTree(
+    vm: ShelfViewModel,
+    query: ShelfQuery,
+    parentRel: String,
+    depth: Int,
+    onPickDir: (String) -> Unit,
+) {
+    var expanded by remember(parentRel) { mutableStateOf(false) }
+    var children by remember(parentRel) { mutableStateOf<List<DirRow>?>(null) }
+
+    LaunchedEffect(parentRel, query.libId) { children = null }
+
+    Column(Modifier.padding(start = (depth * 12).dp)) {
+        if (children == null) {
+            LaunchedEffect(parentRel, query.libId) {
+                children = vm.childDirs(parentRel)
+            }
+        }
+        children?.let { dirs ->
+            dirs.forEach { d ->
+                var open by remember(d.rel) { mutableStateOf(false) }
+                Column {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onPickDir(d.rel) }
+                            .padding(horizontal = 20.dp, vertical = 6.dp),
+                    ) {
+                        Icon(
+                            if (open) Icons.Filled.ChevronRight else Icons.Filled.Folder,
+                            null,
+                            Modifier.size(16.dp).clickable { open = !open },
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            d.name,
+                            Modifier.weight(1f),
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            "(${d.total})",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        IconButton(onClick = { vm.refreshDir(d.rel) }, Modifier.size(26.dp)) {
+                            Icon(Icons.Filled.Refresh, "刷新此目录", Modifier.size(15.dp))
+                        }
+                    }
+                    if (open) {
+                        DirTree(vm, query, d.rel, depth + 1, onPickDir)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LazyColumnWithHeader(content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit) {
+    androidx.compose.foundation.lazy.LazyColumn(Modifier.fillMaxWidth()) { content() }
+}
+
+// ---------------------------------------------------------------- misc chrome
+
+@Composable
+private fun StorageGate(onOpen: () -> Unit) {
+    Box(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(32.dp),
+        ) {
+            Icon(Icons.Filled.Folder, null, Modifier.size(64.dp),
+                 tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(16.dp))
+            Text("需要“所有文件”访问权限", style = MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "ComicShelf 需要直接遍历漫画文件夹——百万级书库的扫描性能依赖原生文件系统访问。\n\n" +
+                    "授予权限后应用不会修改或删除你的任何文件。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(24.dp))
+            Button(onClick = onOpen) { Text("去授权") }
+        }
+    }
+}
+
+@Composable
+private fun ScanProgressStrip(s: ScanProgressRow, vm: ShelfViewModel) {
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (s.running) {
+                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(
+                    buildString {
+                        if (s.running) append("扫描中 ") else append("上次扫描 ")
+                        append("已见 ${s.seen}")
+                        append(" · 新增 ${s.added}")
+                        append(" · 更新 ${s.updated}")
+                        if (s.dirs > 0) append(" · 目录 ${s.dirs}")
+                        if (s.removed > 0) append(" · 移除 ${s.removed}")
+                        if (s.paused) append("（已暂停）")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                )
+                Spacer(Modifier.weight(1f))
+                if (s.running) {
+                    IconButton(onClick = { vm.pauseScan(!s.paused) }, Modifier.size(28.dp)) {
+                        Icon(
+                            if (s.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                            "暂停", Modifier.size(18.dp),
+                        )
+                    }
+                    IconButton(onClick = { vm.cancelScan() }, Modifier.size(28.dp)) {
+                        Icon(Icons.Filled.Close, "取消", Modifier.size(18.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CoverCell(
+    cell: BookCell,
+    selected: Boolean,
+    job: BookTranslateJob.State?,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onToggleFav: () -> Unit,
+) {
+    Column(
+        Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(
+                if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
+                else Color.Transparent,
+            )
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(4.dp),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.7f)
+                .clip(RoundedCornerShape(6.dp))
+                .background(coverPlaceholder),
+        ) {
+            val bmp by produceCoverBitmap(cell.id)
+            if (bmp != null) {
+                Image(
+                    bitmap = bmp!!.asImageBitmap(),
+                    contentDescription = cell.title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Column(
+                    Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    if (cell.pages > 0) {
+                        Spacer(Modifier.height(4.dp))
+                        Text("${cell.pages}p", fontSize = 10.sp,
+                             color = Color.White.copy(alpha = 0.6f))
+                    }
+                }
+            }
+            Row(Modifier.align(Alignment.TopStart).padding(4.dp)) {
+                if (cell.favorite) {
+                    MiniBadge(Icons.Filled.Favorite, "收藏", Color(0xFFFF6B81))
+                }
+                if (cell.readState == 2) {
+                    Spacer(Modifier.width(3.dp))
+                    MiniBadge(Icons.Filled.DoneAll, "已读完", Color(0xFF7CE38B))
+                } else if (cell.readState == 1) {
+                    Spacer(Modifier.width(3.dp))
+                    MiniBadge(Icons.Filled.Schedule, "在读", Color(0xFF8AB4F8))
+                }
+            }
+            if (cell.lastPage > 0 && cell.readState != 2 && cell.pages > 0) {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.5f),
+                    shape = RoundedCornerShape(4.dp),
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
+                ) {
+                    Text(
+                        "${cell.lastPage + 1}/${cell.pages}",
+                        Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                        fontSize = 9.sp, color = Color.White,
+                    )
+                }
+            }
+            if (job != null) {
+                // 后台整本翻译的进度徽标（暂停态加 ⏸）
+                Surface(
+                    color = Color.Black.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(4.dp),
+                    modifier = Modifier.align(Alignment.BottomStart).padding(4.dp),
+                ) {
+                    Text(
+                        "译 ${job.done}/${job.total}" + (if (job.paused) " ⏸" else ""),
+                        Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                        fontSize = 9.sp, color = Color(0xFF8AB4F8),
+                    )
+                }
+            }
+        }
+        Text(
+            cell.title,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+    }
+}
+
+@Composable
+private fun MiniBadge(icon: ImageVector, desc: String, tint: Color) {
+    Surface(color = Color.Black.copy(alpha = 0.5f), shape = RoundedCornerShape(4.dp)) {
+        Icon(icon, desc, Modifier.padding(2.dp).size(12.dp), tint = tint)
+    }
+}
+
+/** Polls the native cover pipeline until the thumbnail is ready (or gives up). */
+@Composable
+private fun produceCoverBitmap(bookId: Long): androidx.compose.runtime.State<Bitmap?> {
+    return produceState<Bitmap?>(initialValue = CoverStore.get(bookId), key1 = bookId) {
+        if (value != null) return@produceState
+        var tries = 0
+        while (tries < 400) { // ~30s of polling max, then stop asking
+            val bmp = withContext(CoreDispatcher) {
+                // nativeCoverPoll -> Object[3]: int[1] status, int[2] {w,h}, byte[] rgba
+                val bundle = NativeBridge.coverPoll(bookId) ?: return@withContext null
+                val status = (bundle[0] as? IntArray)?.get(0) ?: 0
+                if (status != 2) return@withContext null
+                val dims = bundle[1] as? IntArray ?: return@withContext null
+                val px = bundle[2] as? ByteArray ?: return@withContext null
+                if (dims.size < 2 || px.isEmpty()) null
+                else CoverStore.rgbaToBitmap(dims, px)
+            }
+            if (bmp != null) {
+                CoverStore.put(bookId, bmp)
+                value = bmp
+                return@produceState
+            }
+            tries++
+            delay(80)
+        }
+    }
+}
+
+@Composable
+private fun SelectionBar(
+    n: Int,
+    onTranslate: (Boolean) -> Unit,
+    onMore: (() -> Unit)?,
+    onFavorite: () -> Unit,
+    onMark: (Int) -> Unit,
+    onCancel: () -> Unit,
+) {
+    Surface(color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("已选 $n 本", style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.weight(1f))
+            var trMenu by remember { mutableStateOf(false) }
+            IconButton(onClick = { trMenu = true }) { Icon(Icons.Filled.Translate, "翻译") }
+            DropdownMenu(expanded = trMenu, onDismissRequest = { trMenu = false }) {
+                DropdownMenuItem(text = { Text("为选中书籍启用翻译") },
+                    onClick = { onTranslate(true); trMenu = false })
+                DropdownMenuItem(text = { Text("关闭选中书籍的翻译") },
+                    onClick = { onTranslate(false); trMenu = false })
+            }
+            onMore?.let {
+                IconButton(onClick = it) { Icon(Icons.Filled.MoreVert, "更多") }
+            }
+            IconButton(onClick = onFavorite) { Icon(Icons.Filled.FavoriteBorder, "收藏") }
+            var menu by remember { mutableStateOf(false) }
+            IconButton(onClick = { menu = true }) { Icon(Icons.Filled.DoneAll, "标记") }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(text = { Text("标记未读") }, onClick = { onMark(0); menu = false })
+                DropdownMenuItem(text = { Text("标记在读") }, onClick = { onMark(1); menu = false })
+                DropdownMenuItem(text = { Text("标记读完") }, onClick = { onMark(2); menu = false })
+            }
+            IconButton(onClick = onCancel) { Icon(Icons.Filled.Close, "取消") }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BookContextMenu(
+    cell: BookCell,
+    onDismiss: () -> Unit,
+    onOpen: () -> Unit,
+    onOpenTranslated: () -> Unit,
+    onToggleTranslate: (Boolean) -> Unit,
+    job: BookTranslateJob.State?,
+    translateEnabledOf: suspend () -> Boolean,
+    onToggleFav: () -> Unit,
+    onMark: (Int) -> Unit,
+    onTags: () -> Unit,
+    onRegenerateCover: () -> Unit,
+    onExportName: () -> Unit,
+) {
+    var markMenu by remember { mutableStateOf(false) }
+    val trOn by produceState(initialValue = false, cell.id) { value = translateEnabledOf() }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(bottom = 24.dp)) {
+            Text(
+                cell.title,
+                Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+            SheetAction(Icons.AutoMirrored.Filled.MenuBook, "打开阅读", onOpen)
+            SheetAction(Icons.Filled.Translate, "翻译并打开（本次）", onOpenTranslated)
+            SheetAction(
+                if (trOn) Icons.Filled.Translate else Icons.Outlined.Translate,
+                if (trOn) "关闭本册翻译" else "为本册启用翻译（整本后台）",
+            ) { onToggleTranslate(!trOn) }
+            job?.let { j ->
+                if (j.active) {
+                    SheetAction(Icons.Filled.Schedule, "后台翻译 ${j.done}/${j.total}" +
+                        (if (j.paused) "（已暂停）" else ""), {})
+                    SheetAction(
+                        if (j.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                        if (j.paused) "继续后台翻译" else "暂停后台翻译",
+                    ) {
+                        if (j.paused) BookTranslateJob.resume() else BookTranslateJob.pause()
+                        onDismiss()
+                    }
+                }
+            }
+            SheetAction(
+                if (cell.favorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                if (cell.favorite) "取消收藏" else "加入收藏",
+                onToggleFav,
+            )
+            SheetAction(Icons.Filled.Schedule, "标记为在读", { onMark(1) })
+            SheetAction(Icons.Filled.DoneAll, "标记为读完", { onMark(2) })
+            SheetAction(Icons.Filled.Label, "标签…", onTags)
+            SheetAction(Icons.Filled.Image, "重新生成封面", onRegenerateCover)
+            SheetAction(Icons.Filled.ContentCopy, "导出书名（复制到剪贴板）", onExportName)
+        }
+    }
+    if (markMenu) {
+        AlertDialog(onDismissRequest = { markMenu = false },
+            title = { Text("阅读状态") },
+            confirmButton = {},
+            text = {
+                Column {
+                    TextButton(onClick = { onMark(0); markMenu = false }) { Text("未读") }
+                    TextButton(onClick = { onMark(1); markMenu = false }) { Text("在读") }
+                    TextButton(onClick = { onMark(2); markMenu = false }) { Text("读完") }
+                }
+            })
+    }
+}
+
+@Composable
+private fun SheetAction(icon: ImageVector, label: String, action: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable { action() }
+            .padding(horizontal = 24.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(icon, null, Modifier.size(22.dp),
+             tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.width(16.dp))
+        Text(label, style = MaterialTheme.typography.bodyLarge)
+    }
+}
+
+@Composable
+private fun AddLibraryDialog(
+    vm: ShelfViewModel,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var smbMode by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (smbMode) "添加 SMB 书库" else "添加书库") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Row {
+                    FilterChip(selected = !smbMode, onClick = { smbMode = false },
+                               label = { Text("本机目录") })
+                    Spacer(Modifier.width(8.dp))
+                    FilterChip(selected = smbMode, onClick = { smbMode = true },
+                               label = { Text("SMB 共享") })
+                }
+                Spacer(Modifier.height(8.dp))
+                if (!smbMode) LocalLibraryForm(onConfirm) else SmbLibraryForm(vm, onDismiss)
+            }
+        },
+        confirmButton = {
+            if (!smbMode) TextButton(onClick = onDismiss) { Text("取消") }
+        },
+        dismissButton = {
+            if (smbMode) TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
+
+@Composable
+private fun LocalLibraryForm(onConfirm: (String) -> Unit) {
+    var path by remember { mutableStateOf("/storage/emulated/0/Comics") }
+    Column {
+        Text(
+            "输入漫画所在的文件夹绝对路径（可在“文件”应用中长按文件夹复制路径）：",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(value = path, onValueChange = { path = it },
+                          singleLine = true, label = { Text("路径") })
+        Spacer(Modifier.height(8.dp))
+        Text("常用位置：", style = MaterialTheme.typography.labelSmall)
+        listOf(
+            "/storage/emulated/0/Download",
+            "/storage/emulated/0/DCIM",
+            "/storage/emulated/0/Pictures",
+            "/storage/emulated/0/Documents",
+        ).forEach { p ->
+            TextButton(onClick = { path = p }) { Text(p, fontSize = 12.sp) }
+        }
+        Spacer(Modifier.height(8.dp))
+        Button(onClick = { if (path.isNotBlank()) onConfirm(path) }) { Text("添加并扫描") }
+    }
+}
+
+@Composable
+private fun SmbLibraryForm(vm: ShelfViewModel, onAdded: () -> Unit) {
+    var address by remember { mutableStateOf("") }   // 可整段粘贴的地址
+    var host by remember { mutableStateOf(CsSettings.get("smb_last_host", "")) }
+    var share by remember { mutableStateOf("") }
+    var sub by remember { mutableStateOf("") }
+    var user by remember { mutableStateOf("") }
+    var pass by remember { mutableStateOf("") }
+    var domain by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var msg by remember { mutableStateOf("") }
+    var sharePicker by remember { mutableStateOf(false) }
+    var browser by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    Column {
+        Text(
+            "直接粘贴 NAS 地址也行：smb://192.168.1.10/share/dir 、 " +
+                "192.168.1.10/share/dir 或 Windows 形式 \\\\192.168.1.10\\share\\dir —— " +
+                "会自动拆成下面三格（主机 / 共享名 / 子目录）。\n" +
+                "不确定共享名就点“列出共享”，不确定目录就点“浏览…”。密码只保存在本机应用私有目录。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            address, {
+                address = it
+                parseSmbAddress(it)?.let { p ->
+                    host = p.first
+                    if (p.second.isNotEmpty()) share = p.second
+                    if (p.third.isNotEmpty()) sub = p.third
+                }
+            },
+            Modifier.fillMaxWidth(), singleLine = true,
+            label = { Text("地址（可整段粘贴）") },
+        )
+        Spacer(Modifier.height(6.dp))
+        OutlinedTextField(host, { host = it }, Modifier.fillMaxWidth(), singleLine = true,
+                          label = { Text("主机 host[:端口]（如 192.168.1.10）") })
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(share, { share = it }, Modifier.weight(1f), singleLine = true,
+                              label = { Text("共享名 share（第一段路径）") })
+            Spacer(Modifier.width(6.dp))
+            TextButton(onClick = { sharePicker = true }) { Text("列出共享") }
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(sub, { sub = it }, Modifier.weight(1f), singleLine = true,
+                              label = { Text("子目录（可留空 = 整个共享）") })
+            Spacer(Modifier.width(6.dp))
+            TextButton(onClick = { browser = true }) { Text("浏览…") }
+        }
+        Spacer(Modifier.height(6.dp))
+        OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth(), singleLine = true,
+                          label = { Text("用户名") })
+        Spacer(Modifier.height(6.dp))
+        OutlinedTextField(domain, { domain = it }, Modifier.fillMaxWidth(), singleLine = true,
+                          label = { Text("域（可留空；域账号填 WORKGROUP 或 AD 域名）") })
+        Spacer(Modifier.height(6.dp))
+        OutlinedTextField(pass, { pass = it }, Modifier.fillMaxWidth(), singleLine = true,
+                          label = { Text("密码") },
+                          visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+        if (msg.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Text(msg, style = MaterialTheme.typography.bodySmall,
+                 color = if (msg.startsWith("OK")) MaterialTheme.colorScheme.primary
+                         else MaterialTheme.colorScheme.error)
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(enabled = !busy, onClick = {
+                busy = true; msg = ""
+                scope.launch {
+                    val err = vm.smbProbe(host.trim(), share.trim().trim('/'), user, pass,
+                                          domain.trim())
+                    msg = if (err.isEmpty()) "OK：连接成功"
+                          else "连接失败：" + smbHint(err)
+                    busy = false
+                }
+            }) { Text("测试连接") }
+            Spacer(Modifier.width(11.dp))
+            Button(enabled = !busy, onClick = {
+                busy = true; msg = ""
+                scope.launch {
+                    val err = vm.addSmbLibrary(host.trim(), share.trim().trim('/'),
+                                               sub.trim(), user, pass, domain.trim())
+                    if (err.isEmpty()) {
+                        CsSettings.set("smb_last_host", host.trim())
+                        onAdded()
+                    } else {
+                        msg = "添加失败：" + smbHint(err)
+                    }
+                    busy = false
+                }
+            }) { Text(if (busy) "请稍候…" else "添加并扫描") }
+        }
+    }
+
+    if (sharePicker) {
+        SharePickerDialog(
+            host = host.trim(), user = user, pass = pass, domain = domain.trim(),
+            onDismiss = { sharePicker = false },
+            onPick = { share = it; sharePicker = false },
+        )
+    }
+    if (browser) {
+        DirBrowserDialog(
+            host = host.trim(), share = share.trim().trim('/'), startSub = sub.trim(),
+            user = user, pass = pass, domain = domain.trim(),
+            onDismiss = { browser = false },
+            onPick = { sub = it; browser = false },
+        )
+    }
+}
+
+/** 把用户粘贴的地址拆成 (主机, 共享名, 子目录)。支持
+ *  \\host\share\a\b 、 smb://host:port/share/a/b 、 host/share/a/b 。 */
+private fun parseSmbAddress(raw: String): Triple<String, String, String>? {
+    var t = raw.trim()
+    if (t.isEmpty()) return null
+    t = t.removePrefix("smb://").removePrefix("smb:\\")
+    t = t.replace('\\', '/')
+    while (t.startsWith("/")) t = t.substring(1)
+    if (t.isEmpty()) return null
+    val parts = t.split('/').filter { it.isNotEmpty() }
+    if (parts.isEmpty()) return null
+    val host = parts.getOrElse(0) { "" }
+    val share = parts.getOrElse(1) { "" }
+    val sub = if (parts.size > 2) parts.drop(2).joinToString("/") else ""
+    return Triple(host, share, sub)
+}
+
+/** 把 libsmb2 的错误映射成能看懂的中文提示。 */
+private fun smbHint(err: String): String = when {
+    err.contains("STATUS_BAD_NETWORK_NAME") || err.contains("STATUS_OBJECT_NAME_NOT_FOUND") ->
+        err + "\n→ 共享名不对：主机后面第一段路径就是共享名（可用“列出共享”查看）"
+    err.contains("STATUS_LOGON_FAILURE") || err.contains("STATUS_ACCESS_DENIED") ->
+        err + "\n→ 账号或密码不对（或该账号没有访问权限）。域账号请填“域”；" +
+            "群晖/威联通注意账号大小写与是否允许 SMB 访问"
+    err.contains("STATUS_ACCOUNT_DISABLED") -> err + "\n→ 账号被禁用"
+    err.contains("STATUS_LOGON_TYPE_NOT_GRANTED") -> err + "\n→ 该账号不允许网络登录"
+    err.contains("timed out") || err.contains("Timeout") || err.contains("No route") ||
+        err.contains("refused") || err.contains("Connection") ->
+        err + "\n→ 连不上主机：检查 IP、端口(默认445)、是否与手机同一网段"
+    else -> err
+}
+
+/** 共享名选择：走 IPC$ 的 ShareEnum。 */
+@Composable
+private fun SharePickerDialog(host: String, user: String, pass: String, domain: String,
+                              onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    var busy by remember { mutableStateOf(true) }
+    var err by remember { mutableStateOf("") }
+    var shares by remember { mutableStateOf<List<String>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        val r = withContext(Dispatchers.IO) {
+            runCatching { NativeBridge.smbShares(host, user, pass, domain) }
+                .getOrDefault("{\"error\":\"调用失败\"}")
+        }
+        runCatching {
+            val o = JSONObject(r)
+            err = o.optString("error")
+            val a = o.optJSONArray("shares") ?: JSONArray()
+            val l = ArrayList<String>()
+            for (i in 0 until a.length()) l.add(a.getString(i))
+            shares = l
+        }.onFailure { err = it.message ?: "解析失败" }
+        busy = false
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("选择共享") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                if (busy) Text("查询中…（需要账号能访问 IPC$）")
+                if (err.isNotEmpty()) Text(smbHint(err), color = MaterialTheme.colorScheme.error,
+                                           style = MaterialTheme.typography.bodySmall)
+                shares.forEach { s ->
+                    TextButton(onClick = { onPick(s) }) { Text(s) }
+                }
+                if (!busy && err.isEmpty() && shares.isEmpty()) Text("没有可见的共享")
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+    )
+}
+
+/** 目录浏览：浏览共享内的子目录，显示每层的书数量，避免猜路径。 */
+@Composable
+private fun DirBrowserDialog(host: String, share: String, startSub: String,
+                             user: String, pass: String, domain: String,
+                             onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    var cur by remember { mutableStateOf(startSub.trim('/')) }
+    var dirs by remember { mutableStateOf<List<String>>(emptyList()) }
+    var archives by remember { mutableStateOf(0L) }
+    var images by remember { mutableStateOf(0L) }
+    var busy by remember { mutableStateOf(true) }
+    var err by remember { mutableStateOf("") }
+
+    fun load(path: String) {
+        cur = path
+        busy = true
+        err = ""
+    }
+    LaunchedEffect(cur) {
+        val r = withContext(Dispatchers.IO) {
+            runCatching { NativeBridge.smbList(host, share, cur, user, pass, domain) }
+                .getOrDefault("{\"error\":\"调用失败\"}")
+        }
+        runCatching {
+            val o = JSONObject(r)
+            err = o.optString("error")
+            archives = o.optLong("archives")
+            images = o.optLong("images")
+            val a = o.optJSONArray("dirs") ?: JSONArray()
+            val l = ArrayList<String>()
+            for (i in 0 until a.length()) l.add(a.getString(i))
+            dirs = l
+        }.onFailure { err = it.message ?: "解析失败" }
+        busy = false
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("浏览目录") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("当前：/ " + (if (cur.isEmpty()) share else "$share/$cur"),
+                     style = MaterialTheme.typography.bodySmall)
+                Text("此目录直接包含：${archives} 个压缩包、${images} 张图片",
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.primary)
+                if (busy) Text("列出中…")
+                if (err.isNotEmpty()) Text(smbHint(err), color = MaterialTheme.colorScheme.error,
+                                           style = MaterialTheme.typography.bodySmall)
+                if (cur.isNotEmpty()) {
+                    TextButton(onClick = {
+                        load(cur.substringBeforeLast('/', ""))
+                    }) { Text("⬆ 上一级") }
+                }
+                dirs.sortedWith(compareBy { it.lowercase() }).forEach { d ->
+                    TextButton(onClick = {
+                        load(if (cur.isEmpty()) d else "$cur/$d")
+                    }) { Text("📁 $d", maxLines = 1) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onPick(cur) }) { Text("选定此目录") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+@Composable
+private fun TagsDialog(onDismiss: () -> Unit) {
+    var tags by remember { mutableStateOf<List<String>>(emptyList()) }
+    var edit by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        tags = withContext(CoreDispatcher) { Json.strings(NativeBridge.allTags()) }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("标签") },
+        text = {
+            Column {
+                tags.forEach { t ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(t, Modifier.weight(1f))
+                        TextButton(onClick = {
+                            NativeBridge.deleteTag(t)
+                            tags = tags - t
+                        }) { Text("删除") }
+                    }
+                }
+                if (tags.isEmpty()) {
+                    Text("暂无标签", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(edit, { edit = it }, Modifier.weight(1f),
+                                      label = { Text("新标签") }, singleLine = true)
+                    TextButton(onClick = {
+                        if (edit.isNotBlank()) {
+                            tags = tags + edit
+                            edit = ""
+                        }
+                    }) { Text("添加") }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
+    )
+}

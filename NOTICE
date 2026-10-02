@@ -1,0 +1,52 @@
+# 第三方组件与许可（Third-Party Notices）
+
+本仓库包含或链接以下第三方组件。分发时请一并保留相应许可文本。
+
+## Vendored 源码（app/src/main/cpp/third_party/）
+
+| 组件 | 许可 | 许可文件 |
+|---|---|---|
+| ncnn | BSD-3-Clause | `third_party/ncnn/LICENSE.txt` |
+| aom (libaom, AV1 解码) | BSD-2-Clause (Alliance for Open Media) | `third_party/aom/LICENSE` |
+| libavif | BSD-2-Clause | `third_party/libavif/LICENSE` |
+| libwebp | BSD-3-Clause | `third_party/libwebp/COPYING` |
+| SQLite | Public Domain | —（公共领域） |
+| stb | Public Domain / MIT | `third_party/stb/`（文件头声明） |
+| miniz | MIT | `third_party/miniz/`（文件头声明） |
+| unrar | UnRAR License（非 OSI） | `third_party/unrar/`（见下注） |
+| libsmb2 | LGPL-2.1（libdcerpc 部分 BSD-2） | `third_party/libsmb2/LICENCE-LGPL-2.1.txt` |
+
+**UnRAR 特别说明**（随源码附带的许可要求）：UnRAR 源码可用于处理 RAR 压缩包，**但不得用于开发
+RAR (WinRAR) 兼容的压缩器**。本项目仅将 unrar 用于解压读取。
+
+**libsmb2 (LGPL-2.1) 说明**：本项目以动态链接方式使用（头文件在 `third_party/libsmb2/include`，
+运行库为 `app/src/main/jniLibs/arm64-v8a/libsmb2.so`）。LGPL 允许闭源/他许可项目动态链接使用；
+如需替换该库，重新编译同名 `.so` 放入上述路径即可。
+
+## 可选依赖（不在仓库内，自行提供）
+
+| 组件 | 许可 | 说明 |
+|---|---|---|
+| llama.cpp | MIT | 端侧离线翻译（可选） |
+| Qualcomm QNN SDK | 专有（不可再分发） | 端侧 NPU OCR（可选），需自行从高通获取 |
+
+## 构建依赖（包管理器分发，不随源码附带）
+
+| 组件 | 许可 |
+|---|---|
+| AndroidX / Jetpack Compose / Material Components | Apache-2.0 |
+| onnxruntime-android | MIT |
+| Kotlin / kotlinx-coroutines | Apache-2.0 |
+| Python 侧（backend/）：FastAPI, Uvicorn, requests, huggingface_hub, NumPy, Pillow, OpenCV, PyTorch, Transformers, ONNX Runtime | 各自许可（主要为 Apache-2.0 / BSD / MIT） |
+
+## 参考实现 / 移植来源
+
+- BalloonTranslator（GPL-3.0，上游仓库现已不可公开访问；本项目基于其 0.9 版源码移植）：
+  本项目翻译机制（Sakura system prompt、两级阶梯、重复检测、引号处理）与检测后处理链的
+  移植/对照来源；这是本项目采用 GPL-3.0 的原因。
+
+## 模型权重
+
+CTBD（`ogkalu/comic-text-and-bubble-detector`）、PaddleOCR-VL-For-Manga（`jzhang533/…`）、
+Hy-MT2（`tencent/Hy-MT2-1.8B-GGUF`）等模型**不在本仓库内**，由 `backend/fetch_models.py`
+从 HuggingFace 下载。使用请遵循各模型卡声明的许可与使用条款。

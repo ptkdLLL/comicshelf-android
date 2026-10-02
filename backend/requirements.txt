@@ -1,0 +1,15 @@
+# cs-backend 运行依赖
+# 注意: torch / torchvision / onnxruntime(-gpu) 由 deploy.py 按平台与加速器选择安装,
+#       不写在这里(避免拉到与本机 GPU 不匹配的版本)。
+transformers==4.57.6
+tokenizers>=0.22,<0.23
+sentencepiece
+einops
+numpy
+pillow
+opencv-python-headless; sys_platform == "linux"
+opencv-python; sys_platform != "linux"
+fastapi
+uvicorn
+requests
+huggingface_hub

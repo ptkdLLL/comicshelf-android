@@ -1,0 +1,350 @@
+// Copyright 2021 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
+
+#include "testutil.h"
+
+#include "layer_type.h"
+
+#include <limits.h>
+
+#define OP_TYPE_MAX 11
+
+static int op_type = 0;
+
+static std::vector<int> IntArray(int a0)
+{
+    std::vector<int> m(1);
+    m[0] = a0;
+    return m;
+}
+
+static std::vector<int> IntArray(int a0, int a1)
+{
+    std::vector<int> m(2);
+    m[0] = a0;
+    m[1] = a1;
+    return m;
+}
+
+static std::vector<int> IntArray(int a0, int a1, int a2)
+{
+    std::vector<int> m(3);
+    m[0] = a0;
+    m[1] = a1;
+    m[2] = a2;
+    return m;
+}
+
+static std::vector<int> IntArray(int a0, int a1, int a2, int a3)
+{
+    std::vector<int> m(4);
+    m[0] = a0;
+    m[1] = a1;
+    m[2] = a2;
+    m[3] = a3;
+    return m;
+}
+
+static void print_int_array(const std::vector<int>& a)
+{
+    fprintf(stderr, "[");
+    for (size_t i = 0; i < a.size(); i++)
+    {
+        fprintf(stderr, " %d", a[i]);
+    }
+    fprintf(stderr, " ]");
+}
+
+static int test_reduction(const ncnn::Mat& _a, float coeff, int keepdims)
+{
+    ncnn::Mat a = _a;
+    if (op_type == 9 || op_type == 10)
+    {
+        // value must be positive for logsum and logsumexp
+        Randomize(a, 0.001f, 2.f);
+    }
+
+    ncnn::ParamDict pd;
+    pd.set(0, op_type);
+    pd.set(1, 1); // reduce_all
+    pd.set(2, coeff);
+    pd.set(4, keepdims);
+
+    std::vector<ncnn::Mat> weights(0);
+
+    int ret = test_layer("Reduction", pd, weights, a);
+    if (ret != 0)
+    {
+        fprintf(stderr, "test_reduction failed a.dims=%d a=(%d %d %d %d) op_type=%d coeff=%f keepdims=%d reduce_all=1\n", a.dims, a.w, a.h, a.d, a.c, op_type, coeff, keepdims);
+    }
+
+    return ret;
+}
+
+static int test_reduction(const ncnn::Mat& _a, float coeff, int keepdims, const std::vector<int>& axes_array)
+{
+    ncnn::Mat a = _a;
+    if (op_type == 9 || op_type == 10)
+    {
+        // value must be positive for logsum and logsumexp
+        Randomize(a, 0.001f, 2.f);
+    }
+
+    ncnn::Mat axes(axes_array.size());
+    {
+        int* p = axes;
+        for (size_t i = 0; i < axes_array.size(); i++)
+        {
+            p[i] = axes_array[i];
+        }
+    }
+
+    ncnn::ParamDict pd;
+    pd.set(0, op_type);
+    pd.set(1, 0); // reduce_all
+    pd.set(2, coeff);
+    pd.set(3, axes);
+    pd.set(4, keepdims);
+    pd.set(5, 1); // fixbug0
+
+    std::vector<ncnn::Mat> weights(0);
+
+    int ret = test_layer("Reduction", pd, weights, a);
+    if (ret != 0)
+    {
+        fprintf(stderr, "test_reduction failed a.dims=%d a=(%d %d %d %d) op_type=%d coeff=%f keepdims=%d", a.dims, a.w, a.h, a.d, a.c, op_type, coeff, keepdims);
+        fprintf(stderr, " axes=");
+        print_int_array(axes_array);
+        fprintf(stderr, "\n");
+    }
+
+    return ret;
+}
+
+static int test_reduction_nd(const ncnn::Mat& a)
+{
+    int ret1 = 0
+               || test_reduction(a, 1.f, 0)
+               || test_reduction(a, 2.f, 0)
+               || test_reduction(a, 1.f, 1)
+               || test_reduction(a, 2.f, 1)
+               || test_reduction(a, 1.f, 0, IntArray(0))
+               || test_reduction(a, 1.f, 1, IntArray(0));
+
+    if (a.dims == 1 || ret1 != 0)
+        return ret1;
+
+    int ret2 = 0
+               || test_reduction(a, 2.f, 0, IntArray(1))
+               || test_reduction(a, 2.f, 1, IntArray(1))
+               || test_reduction(a, 1.f, 0, IntArray(0, 1))
+               || test_reduction(a, 1.f, 1, IntArray(0, 1));
+
+    if (a.dims == 2 || ret2 != 0)
+        return ret2;
+
+    int ret3 = 0
+               || test_reduction(a, 1.f, 0, IntArray(2))
+               || test_reduction(a, 1.f, 1, IntArray(2))
+               || test_reduction(a, 2.f, 0, IntArray(0, 2))
+               || test_reduction(a, 2.f, 0, IntArray(1, 2))
+               || test_reduction(a, 2.f, 1, IntArray(0, 2))
+               || test_reduction(a, 2.f, 1, IntArray(1, 2))
+               || test_reduction(a, 1.f, 0, IntArray(0, 1, 2))
+               || test_reduction(a, 1.f, 1, IntArray(0, 1, 2));
+
+    if (a.dims == 3 || ret3 != 0)
+        return ret3;
+
+    int ret4 = 0
+               || test_reduction(a, 2.f, 0, IntArray(3))
+               || test_reduction(a, 2.f, 1, IntArray(3))
+               || test_reduction(a, 1.f, 0, IntArray(0, 3))
+               || test_reduction(a, 1.f, 0, IntArray(1, 3))
+               || test_reduction(a, 2.f, 0, IntArray(2, 3))
+               || test_reduction(a, 1.f, 1, IntArray(0, 3))
+               || test_reduction(a, 1.f, 1, IntArray(1, 3))
+               || test_reduction(a, 2.f, 1, IntArray(2, 3))
+               || test_reduction(a, 2.f, 0, IntArray(0, 1, 3))
+               || test_reduction(a, 1.f, 0, IntArray(0, 2, 3))
+               || test_reduction(a, 2.f, 0, IntArray(1, 2, 3))
+               || test_reduction(a, 2.f, 1, IntArray(0, 1, 3))
+               || test_reduction(a, 1.f, 1, IntArray(0, 2, 3))
+               || test_reduction(a, 2.f, 1, IntArray(1, 2, 3))
+               || test_reduction(a, 1.f, 0, IntArray(0, 1, 2, 3))
+               || test_reduction(a, 1.f, 1, IntArray(0, 1, 2, 3));
+
+    return ret4;
+}
+
+static int test_reduction_0()
+{
+    ncnn::Mat a = RandomMat(5, 6, 7, 24);
+    ncnn::Mat b = RandomMat(7, 8, 9, 12);
+    ncnn::Mat c = RandomMat(3, 4, 5, 13);
+
+    return 0
+           || test_reduction_nd(a)
+           || test_reduction_nd(b)
+           || test_reduction_nd(c);
+}
+
+static int test_reduction_1()
+{
+    ncnn::Mat a = RandomMat(5, 7, 24);
+    ncnn::Mat b = RandomMat(7, 9, 12);
+    ncnn::Mat c = RandomMat(3, 5, 13);
+
+    return 0
+           || test_reduction_nd(a)
+           || test_reduction_nd(b)
+           || test_reduction_nd(c);
+}
+
+static int test_reduction_2()
+{
+    ncnn::Mat a = RandomMat(15, 24);
+    ncnn::Mat b = RandomMat(17, 12);
+    ncnn::Mat c = RandomMat(19, 15);
+
+    return 0
+           || test_reduction_nd(a)
+           || test_reduction_nd(b)
+           || test_reduction_nd(c);
+}
+
+static int test_reduction_3()
+{
+    ncnn::Mat a = RandomMat(128);
+    ncnn::Mat b = RandomMat(124);
+    ncnn::Mat c = RandomMat(127);
+
+    return 0
+           || test_reduction_nd(a)
+           || test_reduction_nd(b)
+           || test_reduction_nd(c);
+}
+
+static int test_reduction_simd_tail()
+{
+    const int sizes[] = {15, 16, 17, 31, 32, 33, 63, 64, 65};
+    for (int i = 0; i < 9; i++)
+    {
+        int ret = test_reduction_nd(RandomMat(sizes[i])) || test_reduction_nd(RandomMat(sizes[i], 3));
+        if (ret != 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+static int test_reduction_singleton_axes()
+{
+    return 0
+           || test_reduction_nd(RandomMat(1, 3, 1, 5))
+           || test_reduction_nd(RandomMat(3, 1, 5, 1))
+           || test_reduction_nd(RandomMat(1, 1, 1, 1))
+           || test_reduction_nd(RandomMat(1, 3, 5))
+           || test_reduction_nd(RandomMat(3, 1, 5))
+           || test_reduction_nd(RandomMat(1, 5))
+           || test_reduction_nd(RandomMat(5, 1));
+}
+
+static ncnn::Mat param_int_array(int size, int value)
+{
+    ncnn::Mat m(size);
+    int* p = m;
+    for (int i = 0; i < size; i++)
+        p[i] = value;
+
+    return m;
+}
+
+#if NCNN_VALIDATION
+static int test_reduction_load_param()
+{
+    ncnn::ParamDict base;
+    base.set(5, 1); // fixbug0
+    base.set(3, param_int_array(1, 0));
+    if (test_layer_param(ncnn::LayerType::Reduction, base, 0)
+            || test_layer_param(ncnn::LayerType::Reduction, base, 3, ncnn::Mat(0), 0))
+        return -1;
+
+    ncnn::Mat missing_data(0);
+    missing_data.w = 1;
+
+    return 0
+           || test_layer_param(ncnn::LayerType::Reduction, base, 3, missing_data, -1)
+           || test_layer_param(ncnn::LayerType::Reduction, base, 3, ncnn::Mat(1, (size_t)1u), -1)
+           || test_layer_param(ncnn::LayerType::Reduction, base, 3, ncnn::Mat(1, 2), -1)
+           || test_layer_param(ncnn::LayerType::Reduction, base, 3, 1.f, -1)
+           || test_layer_param(ncnn::LayerType::Reduction, base, 3, param_int_array(5, 1), -1)
+           || test_layer_param(ncnn::LayerType::Reduction, base, 3, param_int_array(1, INT_MIN), -1);
+}
+
+static int test_reduction_load_param_type()
+{
+    ncnn::ParamDict base;
+    if (test_layer_param(ncnn::LayerType::Reduction, base, 0) != 0)
+        return -1;
+
+    for (int i = 0; i <= 10; i++)
+    {
+        if (test_layer_param(ncnn::LayerType::Reduction, base, 0, i, 0) != 0)
+            return -1;
+    }
+
+    const int invalid[] = {-1, 11, INT_MIN, INT_MAX};
+    for (int i = 0; i < 4; i++)
+    {
+        if (test_layer_param(ncnn::LayerType::Reduction, base, 0, invalid[i], -1) != 0)
+            return -1;
+    }
+
+    return 0;
+}
+
+static int test_reduction_load_param_text()
+{
+#if NCNN_STRING
+    const char* params[] = {"5=1 -23303=1,0", "5=1 -23303=1,0.0"};
+    for (int i = 0; i < 2; i++)
+    {
+        TestParamDict pd;
+        if (pd.load_param(params[i]) != 0 || pd.type(3) != 5 + i)
+            return -1;
+
+        if (test_layer_param(ncnn::LayerType::Reduction, pd, i == 0 ? 0 : -1) != 0)
+            return -1;
+    }
+#endif
+    return 0;
+}
+#endif // NCNN_VALIDATION
+
+int main()
+{
+    SRAND(7767517);
+
+    for (op_type = 0; op_type < OP_TYPE_MAX; op_type++)
+    {
+        int ret = 0
+                  || test_reduction_0()
+                  || test_reduction_1()
+                  || test_reduction_2()
+                  || test_reduction_3()
+                  || test_reduction_singleton_axes()
+                  || test_reduction_simd_tail();
+
+        if (ret != 0)
+            return ret;
+    }
+
+    return 0
+#if NCNN_VALIDATION
+           || test_reduction_load_param()
+           || test_reduction_load_param_type()
+           || test_reduction_load_param_text()
+#endif // NCNN_VALIDATION
+           ;
+}

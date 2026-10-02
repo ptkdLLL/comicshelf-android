@@ -1,0 +1,497 @@
+// Copyright 2020 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
+
+#include <string.h>
+#include "c_api.h"
+
+static int test_c_api_0()
+{
+    ncnn_mat_t a = ncnn_mat_create_1d(2, NULL);
+    ncnn_mat_t b = ncnn_mat_create_1d(2, NULL);
+    ncnn_mat_t c = 0;
+
+    ncnn_option_t opt = ncnn_option_create();
+
+    // set a and b
+    {
+        ncnn_mat_fill_float(a, 2.f);
+        ncnn_mat_fill_float(b, 3.f);
+    }
+
+    // c = a + b
+    {
+        ncnn_layer_t op = ncnn_layer_create_by_type("BinaryOp");
+
+        // load param
+        {
+            ncnn_paramdict_t pd = ncnn_paramdict_create();
+            ncnn_paramdict_set_int(pd, 0, 0); // op_type = ADD
+
+            op->load_param(op, pd);
+
+            ncnn_paramdict_destroy(pd);
+        }
+
+        // load model
+        {
+            ncnn_modelbin_t mb = ncnn_modelbin_create_from_mat_array(0, 0);
+
+            op->load_model(op, mb);
+
+            ncnn_modelbin_destroy(mb);
+        }
+
+        op->create_pipeline(op, opt);
+
+        const ncnn_mat_t bottom_blobs[2] = {a, b};
+        ncnn_mat_t top_blobs[1] = {0};
+        op->forward_n(op, bottom_blobs, 2, top_blobs, 1, opt);
+        c = top_blobs[0];
+
+        op->destroy_pipeline(op, opt);
+
+        ncnn_layer_destroy(op);
+    }
+
+    // check c == a + b
+    bool success = false;
+    if (c)
+    {
+        int dims = ncnn_mat_get_dims(c);
+        int w = ncnn_mat_get_w(c);
+        const float* c_data = (const float*)ncnn_mat_get_data(c);
+
+        success = dims == 1 && w == 2 && c_data[0] == 5.f && c_data[1] == 5.f;
+    }
+
+    ncnn_option_destroy(opt);
+
+    ncnn_mat_destroy(a);
+    ncnn_mat_destroy(b);
+    ncnn_mat_destroy(c);
+
+    if (!success)
+    {
+        fprintf(stderr, "test_c_api_0 failed\n");
+    }
+
+    return success ? 0 : -1;
+}
+
+static int test_c_api_1()
+{
+    ncnn_mat_t a = ncnn_mat_create_1d(24, NULL);
+
+    // set a
+    {
+        const float data[] = {
+            0, 1, 2, 3, 4, 5, 6, 7,
+            10, 11, 12, 13, 14, 15, 16, 17,
+            20, 21, 22, 23, 24, 25, 26, 27
+        };
+
+        float* a_data = (float*)ncnn_mat_get_data(a);
+        memcpy(a_data, data, 24 * sizeof(float));
+    }
+
+    ncnn_mat_t b = ncnn_mat_reshape_3d(a, 4, 2, 3, NULL);
+    ncnn_mat_t c = 0;
+
+    ncnn_option_t opt = ncnn_option_create();
+
+    // c = reorg(b, 2)
+    {
+        ncnn_layer_t op = ncnn_layer_create_by_type("Reorg");
+
+        // load param
+        {
+            ncnn_paramdict_t pd = ncnn_paramdict_create();
+            ncnn_paramdict_set_int(pd, 0, 2); // stride
+
+            op->load_param(op, pd);
+
+            ncnn_paramdict_destroy(pd);
+        }
+
+        // load model
+        {
+            ncnn_modelbin_t mb = ncnn_modelbin_create_from_mat_array(0, 0);
+
+            op->load_model(op, mb);
+
+            ncnn_modelbin_destroy(mb);
+        }
+
+        op->create_pipeline(op, opt);
+
+        op->forward_1(op, b, &c, opt);
+
+        op->destroy_pipeline(op, opt);
+
+        ncnn_layer_destroy(op);
+    }
+
+    // check c
+    bool success = false;
+    if (c)
+    {
+        int dims = ncnn_mat_get_dims(c);
+        int w = ncnn_mat_get_w(c);
+        int h = ncnn_mat_get_h(c);
+        int ch = ncnn_mat_get_c(c);
+
+        success = dims == 3 && w == 2 && h == 1 && ch == 12;
+
+        const float expected[] = {
+            0, 2,
+            1, 3,
+            4, 6,
+            5, 7,
+            10, 12,
+            11, 13,
+            14, 16,
+            15, 17,
+            20, 22,
+            21, 23,
+            24, 26,
+            25, 27
+        };
+        ncnn_mat_t c2 = 0;
+        ncnn_flatten(c, &c2, opt);
+        const float* c2_data = (const float*)ncnn_mat_get_data(c2);
+        if (memcmp(c2_data, expected, 24) != 0)
+        {
+            success = false;
+        }
+        ncnn_mat_destroy(c2);
+    }
+
+    ncnn_option_destroy(opt);
+
+    ncnn_mat_destroy(a);
+    ncnn_mat_destroy(b);
+    ncnn_mat_destroy(c);
+
+    if (!success)
+    {
+        fprintf(stderr, "test_c_api_1 failed\n");
+    }
+
+    return success ? 0 : -1;
+}
+
+static int mylayer_forward_inplace_1(const ncnn_layer_t layer, ncnn_mat_t bottom_top_blob, const ncnn_option_t opt)
+{
+    int w = ncnn_mat_get_w(bottom_top_blob);
+    int h = ncnn_mat_get_h(bottom_top_blob);
+    int channels = ncnn_mat_get_c(bottom_top_blob);
+    int size = w * h;
+
+    #pragma omp parallel for num_threads(ncnn_option_get_num_threads(opt))
+    for (int q = 0; q < channels; q++)
+    {
+        float* ptr = (float*)ncnn_mat_get_channel_data(bottom_top_blob, q);
+        for (int i = 0; i < size; i++)
+        {
+            *ptr = *ptr + 100.f;
+            ptr++;
+        }
+    }
+
+    return 0;
+}
+
+static ncnn_layer_t mylayer_creator(void* /*userdata*/)
+{
+    ncnn_layer_t layer = ncnn_layer_create();
+
+    ncnn_layer_set_one_blob_only(layer, 1);
+    ncnn_layer_set_support_inplace(layer, 1);
+
+    layer->forward_inplace_1 = mylayer_forward_inplace_1;
+
+    return layer;
+}
+
+static void mylayer_destroyer(ncnn_layer_t layer, void* /*userdata*/)
+{
+    ncnn_layer_destroy(layer);
+}
+
+static size_t emptydr_read(ncnn_datareader_t /*dr*/, void* buf, size_t size)
+{
+    memset(buf, 0, size);
+    return size;
+}
+
+static int test_c_api_2()
+{
+    // datareader from empty
+    ncnn_datareader_t emptydr = ncnn_datareader_create();
+    {
+        emptydr->read = emptydr_read;
+    }
+
+    ncnn_allocator_t blob_allocator = ncnn_allocator_create_pool_allocator();
+    ncnn_allocator_t workspace_allocator = ncnn_allocator_create_unlocked_pool_allocator();
+
+    ncnn_option_t opt = ncnn_option_create();
+    {
+        ncnn_option_set_num_threads(opt, 1);
+
+        ncnn_option_set_blob_allocator(opt, blob_allocator);
+        ncnn_option_set_workspace_allocator(opt, workspace_allocator);
+    }
+
+    ncnn_net_t net = ncnn_net_create();
+    {
+        ncnn_net_set_option(net, opt);
+
+        ncnn_net_register_custom_layer_by_type(net, "MyLayer", mylayer_creator, mylayer_destroyer, 0);
+
+        const char param_txt[] = "7767517\n2 2\nInput input 0 1 data\nMyLayer mylayer 1 1 data output\n";
+
+        ncnn_net_load_param_memory(net, param_txt);
+        ncnn_net_load_model_datareader(net, emptydr);
+    }
+
+    ncnn_mat_t a = ncnn_mat_create_1d(24, blob_allocator);
+
+    // set a
+    {
+        const float data[] = {
+            0, 1, 2, 3, 4, 5, 6, 7,
+            10, 11, 12, 13, 14, 15, 16, 17,
+            20, 21, 22, 23, 24, 25, 26, 27
+        };
+
+        float* a_data = (float*)ncnn_mat_get_data(a);
+        memcpy(a_data, data, 24 * sizeof(float));
+    }
+
+    ncnn_mat_t b = ncnn_mat_reshape_3d(a, 4, 2, 3, blob_allocator);
+    ncnn_mat_t c = 0;
+
+    {
+        ncnn_extractor_t ex = ncnn_extractor_create(net);
+
+        ncnn_extractor_input(ex, "data", b);
+
+        ncnn_extractor_extract(ex, "output", &c);
+
+        ncnn_extractor_destroy(ex);
+    }
+
+    ncnn_net_destroy(net);
+
+    // check c
+    bool success = false;
+    if (c)
+    {
+        int dims = ncnn_mat_get_dims(c);
+        int w = ncnn_mat_get_w(c);
+        int h = ncnn_mat_get_h(c);
+        int ch = ncnn_mat_get_c(c);
+
+        success = dims == 3 && w == 4 && h == 2 && ch == 3;
+
+        const float expected[] = {
+            100, 101, 102, 103, 104, 105, 106, 107,
+            110, 111, 112, 113, 114, 115, 116, 117,
+            120, 121, 122, 123, 124, 125, 126, 127
+        };
+        ncnn_mat_t c2 = 0;
+        ncnn_flatten(c, &c2, opt);
+        const float* c2_data = (const float*)ncnn_mat_get_data(c2);
+        if (memcmp(c2_data, expected, 24) != 0)
+        {
+            success = false;
+        }
+        ncnn_mat_destroy(c2);
+    }
+
+    ncnn_mat_destroy(a);
+    ncnn_mat_destroy(b);
+    ncnn_mat_destroy(c);
+
+    ncnn_option_destroy(opt);
+
+    ncnn_allocator_destroy(blob_allocator);
+    ncnn_allocator_destroy(workspace_allocator);
+
+    ncnn_datareader_destroy(emptydr);
+
+    if (!success)
+    {
+        fprintf(stderr, "test_c_api_2 failed\n");
+    }
+
+    return success ? 0 : -1;
+}
+
+static int test_c_api_3()
+{
+    // test option setter getter
+    ncnn_option_t opt = ncnn_option_create();
+    ncnn_allocator_t kvcache_allocator = ncnn_allocator_create_unlocked_pool_allocator();
+    ncnn_option_set_kvcache_allocator(opt, kvcache_allocator);
+    ncnn_option_set_kvcache_max_seqlen_hint(opt, 4096);
+
+#define TEST_OPTION_SET_GET(name, V0, V1)      \
+    {                                          \
+        ncnn_option_set_##name(opt, V0);       \
+        int _s0 = ncnn_option_get_##name(opt); \
+        if (_s0 != V0) return -1;              \
+        ncnn_option_set_##name(opt, V1);       \
+        int _s1 = ncnn_option_get_##name(opt); \
+        if (_s1 != V1) return -1;              \
+    }
+
+    TEST_OPTION_SET_GET(num_threads, 4, 1)
+    TEST_OPTION_SET_GET(use_local_pool_allocator, 1, 0)
+    TEST_OPTION_SET_GET(use_winograd_convolution, 1, 0)
+    TEST_OPTION_SET_GET(use_sgemm_convolution, 1, 0)
+    TEST_OPTION_SET_GET(use_packing_layout, 1, 0)
+    TEST_OPTION_SET_GET(use_fp16_packed, 1, 0)
+    TEST_OPTION_SET_GET(use_fp16_storage, 1, 0)
+    TEST_OPTION_SET_GET(use_fp16_arithmetic, 1, 0)
+    TEST_OPTION_SET_GET(use_int8_packed, 1, 0)
+    TEST_OPTION_SET_GET(use_int8_storage, 1, 0)
+    TEST_OPTION_SET_GET(use_int8_arithmetic, 1, 0)
+    TEST_OPTION_SET_GET(use_int16_packed, 1, 0)
+    TEST_OPTION_SET_GET(use_int16_storage, 1, 0)
+    TEST_OPTION_SET_GET(use_bf16_packed, 1, 0)
+    TEST_OPTION_SET_GET(use_bf16_storage, 1, 0)
+
+#if NCNN_VULKAN
+    TEST_OPTION_SET_GET(use_vulkan_compute, 1, 0)
+    TEST_OPTION_SET_GET(use_shader_local_memory, 1, 0)
+    TEST_OPTION_SET_GET(use_cooperative_matrix, 1, 0)
+#endif
+
+#undef TEST_OPTION_SET_GET
+
+    ncnn_option_destroy(opt);
+    ncnn_allocator_destroy(kvcache_allocator);
+
+    // test layer setter getter
+    ncnn_layer_t layer = ncnn_layer_create();
+
+#define TEST_LAYER_SET_GET(name, V0, V1)        \
+    {                                           \
+        ncnn_layer_set_##name(layer, V0);       \
+        int _s0 = ncnn_layer_get_##name(layer); \
+        if (_s0 != V0) return -1;               \
+        ncnn_layer_set_##name(layer, V1);       \
+        int _s1 = ncnn_layer_get_##name(layer); \
+        if (_s1 != V1) return -1;               \
+    }
+
+    TEST_LAYER_SET_GET(one_blob_only, 1, 0)
+    TEST_LAYER_SET_GET(support_inplace, 1, 0)
+    TEST_LAYER_SET_GET(support_packing, 1, 0)
+    TEST_LAYER_SET_GET(support_bf16_storage, 1, 0)
+    TEST_LAYER_SET_GET(support_fp16_storage, 1, 0)
+    TEST_LAYER_SET_GET(support_any_packing, 1, 0)
+
+#if NCNN_VULKAN
+    TEST_LAYER_SET_GET(support_vulkan, 1, 0)
+    TEST_LAYER_SET_GET(support_vulkan_packing, 1, 0)
+    TEST_LAYER_SET_GET(support_vulkan_any_packing, 1, 0)
+#endif
+
+#undef TEST_LAYER_SET_GET
+
+    ncnn_layer_destroy(layer);
+
+    return 0;
+}
+
+#if NCNN_BATCH
+static int test_c_api_batch()
+{
+    const int W = 4;
+    const int H = 3;
+    const int C = 2;
+    const int B = 3;
+
+    ncnn_mat_t a = ncnn_mat_create_3d_batch(W, H, C, B, NULL);
+    ncnn_mat_t b = 0;
+    ncnn_mat_t c = 0;
+    ncnn_mat_t d = 0;
+
+    bool success = true;
+    success = success && ncnn_mat_get_dims(a) == 3;
+    success = success && ncnn_mat_get_w(a) == W;
+    success = success && ncnn_mat_get_h(a) == H;
+    success = success && ncnn_mat_get_c(a) == C;
+    success = success && ncnn_mat_get_n(a) == B;
+    success = success && ncnn_mat_get_nstep(a) != 0;
+
+    for (int bi = 0; bi < B; bi++)
+    {
+        float* data = (float*)ncnn_mat_get_batch_data(a, bi);
+        for (int q = 0; q < C; q++)
+        {
+            float* ptr = data + q * ncnn_mat_get_cstep(a);
+            for (int i = 0; i < W * H; i++)
+            {
+                ptr[i] = (float)(bi * 100 + q * 10 + i);
+            }
+        }
+    }
+
+    b = ncnn_mat_clone(a, NULL);
+    success = success && ncnn_mat_get_n(b) == B;
+
+    c = ncnn_mat_reshape_1d(a, W * H * C, NULL);
+    success = success && ncnn_mat_get_dims(c) == 1;
+    success = success && ncnn_mat_get_w(c) == W * H * C;
+    success = success && ncnn_mat_get_n(c) == B;
+
+    for (int bi = 0; bi < B; bi++)
+    {
+        const float* bdata = (const float*)ncnn_mat_get_batch_data(b, bi);
+        const float* cptr = (const float*)ncnn_mat_get_batch_data(c, bi);
+
+        for (int q = 0; q < C; q++)
+        {
+            const float* bptr = bdata + q * ncnn_mat_get_cstep(b);
+            for (int i = 0; i < W * H; i++)
+            {
+                float expected = (float)(bi * 100 + q * 10 + i);
+                if (bptr[i] != expected || cptr[q * W * H + i] != expected)
+                    success = false;
+            }
+        }
+    }
+
+    d = ncnn_mat_create_2d_elem_batch(5, 6, (size_t)2u, 1, 2, NULL);
+    success = success && ncnn_mat_get_dims(d) == 2;
+    success = success && ncnn_mat_get_w(d) == 5;
+    success = success && ncnn_mat_get_h(d) == 6;
+    success = success && ncnn_mat_get_n(d) == 2;
+    success = success && ncnn_mat_get_elemsize(d) == 2u;
+
+    ncnn_mat_destroy(a);
+    ncnn_mat_destroy(b);
+    ncnn_mat_destroy(c);
+    ncnn_mat_destroy(d);
+
+    if (!success)
+    {
+        fprintf(stderr, "test_c_api_batch failed\n");
+    }
+
+    return success ? 0 : -1;
+}
+#endif // NCNN_BATCH
+
+int main()
+{
+    int ret = test_c_api_0() || test_c_api_1() || test_c_api_2() || test_c_api_3();
+#if NCNN_BATCH
+    ret = ret || test_c_api_batch();
+#endif
+    return ret;
+}

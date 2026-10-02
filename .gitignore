@@ -1,0 +1,39 @@
+# ---------------- 构建产物 ----------------
+build/
+app/build/
+app/.cxx/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.so.debug
+
+# ---------------- 本机配置 ----------------
+local.properties
+.DS_Store
+.idea/
+*.iml
+
+# ---------------- 私有/本机内容（不随仓库发布）----------------
+# 设计日志（含本机路径/内网信息等）
+docs/
+# 本机实验脚本
+tools/
+# 桌面(Windows/imgui) UI：未参与安卓构建，保留在本地
+app/src/main/cpp/src/ui/
+*.log
+
+# ---------------- 高通 QNN（专有，不可再分发；可选依赖需自备）----------------
+app/src/main/cpp/ocr/qnn_inc/
+app/src/main/assets/qnn/
+app/src/main/jniLibs/arm64-v8a/libQnn*.so
+
+# ---------------- backend 运行时 ----------------
+backend/venv/
+backend/models/
+backend/cache/
+backend/pids/
+backend/config.env
+__pycache__/
+backend/__pycache__/
+*.pyc
