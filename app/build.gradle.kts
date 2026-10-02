@@ -43,6 +43,14 @@ android {
                 jniLibs.keepDebugSymbols += "**/libcomicshelf.so"
             }
         }
+        // 旁装测试包：可与正式包共存（包名后缀 .t）、debug 签名、可 debug/run-as。
+        // 用法: gradle :app:assembleSidestest
+        create("sidestest") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".t"
+            isDebuggable = true
+            signingConfig = signingConfigs.getByName("debug")
+        }
     }
 
     externalNativeBuild {
