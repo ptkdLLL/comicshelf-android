@@ -1,8 +1,8 @@
 # ComicShelf for Android — native core.
 #
-# Reuses the proven desktop core (SQLite metadata, incremental scanner,
-# zip/rar/folder archives, stb/WebP/AVIF decode chain, three-level cover
-# cache, translation engine) behind a JNI bridge.
+# Native core: SQLite metadata, incremental scanner, zip/rar/folder archives,
+# stb/WebP/AVIF decode chain, three-level cover cache, translation engine —
+# all behind a JNI bridge.
 #
 # 可选依赖（缺省即自动裁剪，不影响"局域网后端翻译"主线）：
 #   ocr/qnn_inc/      高通 QNN SDK 头（端侧 NPU OCR；SDK 不可再分发，需自备）
