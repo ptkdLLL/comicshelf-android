@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.activity.compose.BackHandler
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.comicshelf.app.reader.ReaderScreen
 import com.comicshelf.app.reader.ReaderViewModel
@@ -31,6 +32,18 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
 
     val shelfVm: ShelfViewModel = viewModel()
     val readerVm: ReaderViewModel = viewModel()
+
+    // 系统返回键（手势/三键）与界面返回按钮走同一条路径（此前系统返回无人处理，
+    // 阅读器/设置里按返回会直接退到桌面）。书架主屏不拦截：保持"退出应用"的默认行为。
+    val closeReader: () -> Unit = {
+        readerVm.closeBook()
+        // 刷新阅读徽标/页数；书架滚动位置由 VM 里的 gridState 保持
+        shelfVm.refreshAfterRead()
+        screen = Screen.Shelf
+    }
+    val closeSettings: () -> Unit = { screen = Screen.Shelf }
+    BackHandler(enabled = screen is Screen.Reader) { closeReader() }
+    BackHandler(enabled = screen is Screen.Settings) { closeSettings() }
 
     val hasAllFiles = remember {
         mutableStateOf(Environment.isExternalStorageManager())
@@ -75,16 +88,11 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
                 }
                 ReaderScreen(
                     vm = readerVm,
-                    onBack = {
-                        readerVm.closeBook()
-                        // 刷新阅读徽标/页数；书架滚动位置由 VM 里的 gridState 保持
-                        shelfVm.refreshAfterRead()
-                        screen = Screen.Shelf
-                    },
+                    onBack = closeReader,
                 )
             }
             is Screen.Settings -> SettingsScreen(
-                onBack = { screen = Screen.Shelf },
+                onBack = closeSettings,
             )
         }
     }
