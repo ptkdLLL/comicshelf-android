@@ -57,6 +57,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -263,6 +264,9 @@ private fun ZoomablePage(
 
     var scale by remember(page) { mutableFloatStateOf(1f) }
     var offset by remember(page) { mutableStateOf(Offset.Zero) }
+    // 手势回调持有的是组合时的快照：位图加载完成后尺寸会变，必须取最新值
+    // （v0.3.6 限幅修复需要"图片实际显示尺寸"，不能用旧闭包里的 bmp）。
+    val bmpState = rememberUpdatedState(bmp)
 
     Box(
         modifier
@@ -280,10 +284,12 @@ private fun ZoomablePage(
                             val pan = event.calculatePan()
                             val ns = (scale * zoom).coerceIn(1f, 6f)
                             if (ns != 1f) {
-                                offset = Offset(
-                                    (offset.x + pan.x).coerceIn(-size.width * (ns - 1), 0f),
-                                    (offset.y + pan.y).coerceIn(-size.height * (ns - 1), 0f),
-                                )
+                                val b = bmpState.value
+                                if (b != null) {
+                                    offset = clampPan(offset.x + pan.x, offset.y + pan.y, ns,
+                                                      size.width.toFloat(), size.height.toFloat(),
+                                                      b.width, b.height)
+                                }
                             } else {
                                 offset = Offset.Zero
                             }
@@ -305,7 +311,11 @@ private fun ZoomablePage(
                     },
                     onDoubleTap = {
                         scale = if (scale > 1.5f) 1f else 2.5f
-                        if (scale == 1f) offset = Offset.Zero
+                        val b = bmpState.value
+                        offset = if (scale == 1f || b == null) Offset.Zero
+                                 else clampPan(offset.x, offset.y, scale,
+                                               size.width.toFloat(), size.height.toFloat(),
+                                               b.width, b.height)
                     },
                 )
             },
@@ -336,6 +346,21 @@ private fun ZoomablePage(
             }
         }
     }
+}
+
+/**
+ * v0.3.6 缩放平移限幅（修复"放大后只能往一个方向平移"）：
+ * graphicsLayer 默认以【中心】为变换原点 → 可平移范围必须关于 0 **对称**；
+ * 且边界要按【图片实际显示尺寸】（ContentScale.Fit 之后的宽高）算，不能拿容器尺寸。
+ * 旧实现 `coerceIn(-容器×(ns−1), 0)` 两条都错：单边区间 + 幅值 2×（少除 2），
+ * 表现为放大后只能看图片右/下侧，左/上侧永远到不了，且反方向可越界露底。
+ */
+private fun clampPan(nx: Float, ny: Float, ns: Float,
+                     vw: Float, vh: Float, iw: Int, ih: Int): Offset {
+    val fit = minOf(vw / iw, vh / ih)                 // 与 ContentScale.Fit 一致
+    val halfX = maxOf(0f, (iw * fit * ns - vw) / 2f)  // 图片溢出视口部分的一半
+    val halfY = maxOf(0f, (ih * fit * ns - vh) / 2f)
+    return Offset(nx.coerceIn(-halfX, halfX), ny.coerceIn(-halfY, halfY))
 }
 
 // ---------------------------------------------------------------- chrome
