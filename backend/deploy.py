@@ -28,6 +28,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -47,6 +48,11 @@ PY_EXE = VENV / ("Scripts" if IS_WIN else "bin") / ("python.exe" if IS_WIN else 
 GGUF_NAME = "Hy-MT2-1.8B-Q4_K_M.gguf"
 GGUF_MD5 = "436f3ec23b236b2ac1d05dd7a713f8ae"
 HF_MIRROR = "https://hf-mirror.com"
+# 国内自动镜像候选(顺序=优先级); 官方可达时一律走官方。
+PIP_MIRRORS = ("https://pypi.tuna.tsinghua.edu.cn/simple",
+               "https://mirrors.aliyun.com/pypi/simple/")
+TORCH_MIRRORS = ("https://mirrors.aliyun.com/pytorch-wheels",
+                 "https://mirror.sjtu.edu.cn/pytorch-wheels")
 
 DEFAULTS = {
     "CS_BACKEND_PORT": "8787",
@@ -57,6 +63,8 @@ DEFAULTS = {
     "CS_LLAMA_BIN": "",        # 空=自动(PATH -> ./bin/ -> llama-cpp-python)
     "CS_LLAMA_CACHE_MB": "1024",  # llama-server prompt cache 上限(MiB); 新版默认 8192 太占内存
     "HF_ENDPOINT": "",         # 空=自动探测(官方不通时走 hf-mirror.com); 也可显式指定
+    "PIP_INDEX_URL": "",       # 空=自动探测(官方 PyPI 不通自动切清华/阿里镜像); 也可显式指定
+    "CS_TORCH_INDEX": "",      # 空=自动探测(官方 pytorch 源不通自动切阿里/SJTU 镜像)
     "EXTRA_LLAMA_ARGS": "",
 }
 
@@ -89,6 +97,10 @@ def load_config() -> dict:
     for k in cfg:                                   # 环境变量优先于 config.env
         if os.environ.get(k, "") != "":
             cfg[k] = os.environ[k]
+    # 网络/镜像三项: 同步进环境变量, 让子进程(pip / huggingface_hub)也拿到; 真实环境变量优先
+    for k in ("HF_ENDPOINT", "PIP_INDEX_URL", "CS_TORCH_INDEX"):
+        if cfg.get(k):
+            os.environ.setdefault(k, cfg[k])
     return cfg
 
 
@@ -106,7 +118,9 @@ def write_default_config() -> None:
         return
     lines = ["# cs-backend 部署配置(修改后 restart 生效; 也可用环境变量临时覆盖)",
              "# LLAMA_URL 留空=本机托管 llama-server; 填 http://host:port 则用外部 OpenAI 兼容服务",
-             "# HF_ENDPOINT 国内建议 https://hf-mirror.com (留空自动探测)",
+             "# 网络/镜像(HF_ENDPOINT / PIP_INDEX_URL / CS_TORCH_INDEX)留空=自动探测:",
+             "#   官方不通时自动切国内镜像(hf-mirror.com / 清华·阿里 PyPI / 阿里·SJTU torch)",
+             "#   要固定走某个源就填这里(或同名环境变量), 填了就不再自动探测/切换",
              "# CS_OCR_DEVICE 留空自动: cuda > mps > cpu",
              "# CS_LLAMA_CACHE_MB llama-server prompt cache 上限(MiB), 0=关; 新版默认 8192 太占内存"]
     lines += [f"{k}={v}" for k, v in DEFAULTS.items()]
@@ -286,6 +300,64 @@ def probe_hf_endpoint() -> str:
     return HF_MIRROR                                # 都不通也给镜像(至少不更差)
 
 
+def http_status(url: str, timeout: float = 4.0) -> int | None:
+    """返回 HTTP 状态码(含 4xx/5xx); 网络层失败(超时/DNS/拒连)返回 None。"""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def probe_first_ok(urls, timeout: float = 4.0) -> str | None:
+    """返回第一个"可达"的 URL(4xx<500 也算: 部分镜像禁目录列表但文件可下)。"""
+    for u in urls:
+        st = http_status(u, timeout)
+        if st is not None and st < 500:
+            return u
+    return None
+
+
+def ensure_pip_index() -> None:
+    """PyPI 自动镜像: 官方可达不动(用默认); 不通则自动切国内镜像(清华→阿里)。
+    尊重用户已设的 PIP_INDEX_URL / PIP_EXTRA_INDEX_URL(不覆盖)。"""
+    if os.environ.get("PIP_INDEX_URL") or os.environ.get("PIP_EXTRA_INDEX_URL"):
+        info(f"pip 索引: 用指定的 {os.environ.get('PIP_INDEX_URL') or '(PIP_EXTRA_INDEX_URL)'}")
+        return
+    if http_status("https://pypi.org/simple/", 6.0) == 200:
+        return                                       # 官方可达: 用默认
+    m = probe_first_ok(PIP_MIRRORS)
+    if m:
+        os.environ["PIP_INDEX_URL"] = m              # 之后所有 pip 子进程继承
+        info(f"pip 索引: 官方 PyPI 不通 → 自动使用镜像 {m}")
+    else:
+        warn("pip 索引: 官方与国内镜像均不可达(走代理可设 HTTPS_PROXY 后重跑)")
+
+
+def pick_torch_index(tag: str) -> str:
+    """torch 轮子源: CS_TORCH_INDEX 优先; 否则 官方 → 阿里 → SJTU 探测。"""
+    if os.environ.get("CS_TORCH_INDEX"):
+        return os.environ["CS_TORCH_INDEX"]
+    official = f"https://download.pytorch.org/whl/{tag}"
+    if http_status(official + "/", 6.0) == 200:
+        return official
+    m = probe_first_ok([f"{b}/{tag}" for b in TORCH_MIRRORS])
+    if m:
+        info(f"torch 轮子源: 官方不通 → 自动使用镜像 {m}")
+        return m
+    warn("torch 轮子源: 官方与镜像均不可达, 先按官方尝试")
+    return official
+
+
+def torch_index_candidates(tag: str) -> list[str]:
+    """首选索引 + 其余候选(安装失败自动换源用)。"""
+    chosen = pick_torch_index(tag)
+    others = [f"https://download.pytorch.org/whl/{tag}"] + [f"{b}/{tag}" for b in TORCH_MIRRORS]
+    return [chosen] + [u for u in others if u != chosen]
+
+
 # ------------------------------------------------------------------ venv/setup
 
 def _py_ver(exe: list[str]) -> tuple[int, int] | None:
@@ -340,14 +412,31 @@ def ensure_venv() -> None:
     info("venv 创建完成")
 
 
-def pip(args: list[str]) -> None:
-    cmd = [str(PY_EXE), "-m", "pip", "install", *args]
-    shown = " ".join(a for a in args if not a.startswith("http"))
+def pip(args: list[str], extra: list[str] | None = None) -> int:
+    """跑一次 pip install, 返回退出码(不 die——便于上层换源重试)。"""
+    allargs = [*args, *(extra or [])]
+    shown = " ".join(a for a in allargs if not a.startswith("http"))
     info(f"pip install {shown}")
-    r = subprocess.run(cmd, cwd=str(ROOT))
-    if r.returncode != 0:
-        die(f"pip 安装失败: {shown}\n"
-            f"  国内网络可先设镜像: 环境变量 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple 重跑")
+    return subprocess.run([str(PY_EXE), "-m", "pip", "install", *allargs],
+                          cwd=str(ROOT)).returncode
+
+
+def pip_or_die(args: list[str]) -> None:
+    if pip(args) != 0:
+        die(f"pip 安装失败: {' '.join(args)}\n"
+            f"  官方 PyPI 不通会自动切清华/阿里镜像; 仍失败可手动设 "
+            f"PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple 重跑(或设 HTTPS_PROXY)")
+
+
+def pip_indexed(args: list[str], indexes: list[str | None]) -> None:
+    """按候选索引逐个尝试(首个=探测结果), 全失败才 die。"""
+    for i, idx in enumerate(indexes):
+        if i:
+            info(f"换源重试: {idx or '默认 PyPI'}")
+        if pip(args, ["--index-url", idx] if idx else None) == 0:
+            return
+    die(f"pip 安装失败(已自动换源): {' '.join(args)}\n"
+        f"  可手动指定 CS_TORCH_INDEX=<镜像>/<tag> 或 PIP_INDEX_URL=... 后重跑")
 
 
 def detect_accel() -> str:
@@ -359,39 +448,56 @@ def detect_accel() -> str:
 
 
 def install_deps(accel: str) -> None:
-    pip(["-U", "pip", "wheel"])
+    ensure_pip_index()
+    pip_or_die(["-U", "pip", "wheel"])
     if accel == "cuda":
-        idx = os.environ.get("CS_TORCH_INDEX", "https://download.pytorch.org/whl/cu126")
-        pip(["torch", "torchvision", "--index-url", idx])
-        pip(["onnxruntime-gpu"])
+        pip_indexed(["torch", "torchvision"], torch_index_candidates("cu126"))
+        pip_or_die(["onnxruntime-gpu"])
     elif sys.platform == "darwin":
-        pip(["torch", "torchvision"])
-        pip(["onnxruntime"])
+        pip_or_die(["torch", "torchvision"])       # macOS(MPS) 轮子在 PyPI
+        pip_or_die(["onnxruntime"])
     else:
-        idx = os.environ.get("CS_TORCH_INDEX", "https://download.pytorch.org/whl/cpu")
-        pip(["torch", "torchvision", "--index-url", idx])
-        pip(["onnxruntime"])
-    pip(["-r", str(ROOT / "requirements.txt")])
+        pip_indexed(["torch", "torchvision"], torch_index_candidates("cpu"))
+        pip_or_die(["onnxruntime"])
+    pip_or_die(["-r", str(ROOT / "requirements.txt")])
 
 
 def run_fetch_models(cfg: dict, mirror: bool | None) -> None:
+    if subprocess.run([str(PY_EXE), "-c", "import huggingface_hub"],
+                      capture_output=True).returncode != 0:
+        die("venv 里缺 huggingface_hub → 先运行: python deploy.py setup (或 setup --no-models)")
     env = os.environ.copy()
+    explicit = bool(env.get("HF_ENDPOINT") or cfg["HF_ENDPOINT"] or mirror)
     if mirror is True:
         env["HF_ENDPOINT"] = env.get("HF_ENDPOINT") or HF_MIRROR
-    elif not env.get("HF_ENDPOINT") and not cfg["HF_ENDPOINT"]:
+    elif explicit:
+        env["HF_ENDPOINT"] = env.get("HF_ENDPOINT") or cfg["HF_ENDPOINT"]
+    else:
         env["HF_ENDPOINT"] = probe_hf_endpoint()
         info(f"HF 端点自动选择: {env['HF_ENDPOINT']}")
-    elif cfg["HF_ENDPOINT"]:
-        env["HF_ENDPOINT"] = cfg["HF_ENDPOINT"]
     if cfg["CS_MODELS_DIR"]:
         env["CS_MODELS_DIR"] = cfg["CS_MODELS_DIR"]
-    r = subprocess.run([str(PY_EXE), str(ROOT / "fetch_models.py")], env=env, cwd=str(ROOT))
-    if r.returncode != 0:
-        die("模型下载失败(重跑可断点续传; 国内建议 --mirror 或 config.env 设 HF_ENDPOINT)")
+
+    # 自动选择时给两个端点都留机会: 首个失败(如中途被墙/抖动)自动换另一个再试,
+    # 文件级断点续传, 已下部分不浪费; 显式指定(--mirror/配置)则不擅自换。
+    endpoints = [env["HF_ENDPOINT"]]
+    if not explicit:
+        endpoints.append(HF_MIRROR if env["HF_ENDPOINT"] != HF_MIRROR else "https://huggingface.co")
+    for i, ep in enumerate(endpoints):
+        if i:
+            warn(f"模型下载失败 → 自动换端点重试: {ep}")
+        env["HF_ENDPOINT"] = ep
+        if subprocess.run([str(PY_EXE), str(ROOT / "fetch_models.py")],
+                          env=env, cwd=str(ROOT)).returncode == 0:
+            if i:
+                info(f"换端点后下载成功: {ep}")
+            return
+    die("模型下载失败(重跑可断点续传; 国内建议 --mirror 或 config.env 设 HF_ENDPOINT)")
 
 
 def cmd_setup(args) -> None:
     write_default_config()
+    cfg = load_config()          # 先加载: 把 HF/PIP/TORCH 镜像配置同步进环境变量(供 pip 子进程用)
     ensure_venv()
     accel = "cuda" if args.cuda else ("cpu" if args.cpu else detect_accel())
     info(f"目标加速: {accel}")
@@ -399,8 +505,7 @@ def cmd_setup(args) -> None:
     if args.no_models:
         info("跳过模型下载 (--no-models); 之后可运行: python deploy.py fetch-models")
     else:
-        run_fetch_models(load_config(),
-                         mirror=True if args.mirror else None)
+        run_fetch_models(cfg, mirror=True if args.mirror else None)
 
 
 # ----------------------------------------------------------------------- llama
@@ -584,6 +689,21 @@ def cmd_doctor(args) -> None:
     print(f"  目标加速(探测): {detect_accel()}")
     print(f"  config.env: {'存在' if CONFIG.exists() else '未生成(运行 setup 生成)'}")
 
+    print("== 网络/镜像(与 setup 同源的自动探测) ==")
+    hf_auto = probe_hf_endpoint()
+    official_hf = "官方可达" if hf_auto == "https://huggingface.co" else "官方不通→镜像"
+    print(f"  HF 模型端点: {hf_auto}  ({official_hf})")
+    st = http_status("https://pypi.org/simple/", 6.0)
+    if st == 200:
+        print("  PyPI: 官方可达")
+    else:
+        m = probe_first_ok(PIP_MIRRORS)
+        print(f"  PyPI: 官方不通 → {'自动用 ' + m if m else '镜像也不可达!'}")
+    accel_now = detect_accel()
+    if accel_now in ("cuda", "cpu"):
+        tag = "cu126" if accel_now == "cuda" else "cpu"
+        print(f"  torch 轮子源: {pick_torch_index(tag)}")
+
     print("== venv ==")
     if PY_EXE.is_file():
         ver = subprocess.run([str(PY_EXE), "-c", "import sys;print(sys.version.split()[0])"],
@@ -683,7 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mirror", action="store_true", help="模型走 hf-mirror.com")
     p.set_defaults(func=cmd_setup)
 
-    p = sub.add_parser("fetch-models", help="下载三个模型到 ./models")
+    p = sub.add_parser("fetch-models", help="下载三个模型到 ./models(官方不通自动走镜像)")
     p.add_argument("--mirror", action="store_true", help="走 hf-mirror.com")
     p.set_defaults(func=lambda a: (ensure_venv(), run_fetch_models(load_config(), True if a.mirror else None)))
 
@@ -705,7 +825,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("which", nargs="?", choices=["llama", "server"])
     p.set_defaults(func=cmd_logs)
 
-    p = sub.add_parser("doctor", help="环境体检(--full 含管线自测)")
+    p = sub.add_parser("doctor", help="环境体检(含网络/镜像探测; --full 再加管线自测)")
     p.add_argument("--full", action="store_true")
     p.set_defaults(func=cmd_doctor)
 

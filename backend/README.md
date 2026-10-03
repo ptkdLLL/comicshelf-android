@@ -52,8 +52,10 @@
 | Linux / macOS | `./start.sh` |
 
 首次运行自动完成：**建 venv → 按平台装依赖（CUDA/CPU/MPS 自动）→ 从 HuggingFace 下载三个模型
-（~3.1GB，官方不通自动走 hf-mirror.com；断点续传）→ 启动 llama-server + cs-backend**。
-中途 Ctrl+C 可中断，重跑续传。全程无需手工前置。
+（~3.1GB；断点续传）→ 启动 llama-server + cs-backend**。
+**网络全程自动选源**：官方不通时自动切国内镜像（模型 → hf-mirror.com；pip → 清华/阿里；
+torch 轮子 → 阿里/SJTU），下载失败自动换端点重试；`python3 deploy.py doctor` 会打印"当前会用的源"，
+也可用配置项/环境变量固定（§2）。中途 Ctrl+C 可中断，重跑续传。全程无需手工前置。
 
 跑起来后（会打印手机 App 要填的地址）：
 
@@ -82,7 +84,7 @@ python3 deploy.py fetch-models [--mirror]   # 只下模型(国内加 --mirror)
 | Python | **3.10 ~ 3.12 推荐**（3.13+ 会警告，可能与 PaddleOCR-VL 自定义代码不兼容）。Windows 安装时勾选 Add to PATH；Linux 可能需 `apt install python3-venv` |
 | 磁盘 | ≥ 8GB（模型 3.1GB + venv 约 4GB + CUDA 版 torch 另加 ~3GB） |
 | 内存 | ≥ 8GB（两服务常驻 ~5.2GB：OCR 2.6GB + llama 2.6GB；见 §7 内存行） |
-| 网络 | 首次需能访问 HuggingFace（国内走 hf-mirror 自动/`--mirror`）与 PyPI（可设 `PIP_INDEX_URL` 走清华源） |
+| 网络 | 首次需能访问 HuggingFace / PyPI / pytorch 轮子源。**官方不通会自动切国内镜像**（模型→hf-mirror，pip→清华/阿里，torch→阿里/SJTU）并自动换端点重试；也可用 `--mirror` / `HF_ENDPOINT` / `PIP_INDEX_URL` / `CS_TORCH_INDEX` 强制指定 |
 | GPU | 可选。NVIDIA→CUDA、Apple Silicon→MPS 自动启用；纯 CPU 能跑但慢（见 §6.2） |
 | 防火墙 | 放行入站 **8787/tcp**（Windows 首次会弹窗选"允许"；macOS 系统设置→网络→防火墙；Linux `ufw allow 8787`） |
 
@@ -124,10 +126,12 @@ curl -s -X POST http://127.0.0.1:8787/chat -H 'Content-Type: application/json' \
 | `CS_MODELS_DIR` | 空 | 空=`./models`；也可指向别处已有模型 |
 | `CS_LLAMA_BIN` | 空 | 空=自动找（`PATH` → `./bin/` → llama-cpp-python） |
 | `CS_LLAMA_CACHE_MB` | `1024` | llama-server prompt cache 上限（MiB），0=关。**新版 llama.cpp 此项默认 8192**（实测 RSS 8.9GB→限 1GB 后 ~2.6GB）；保留 1GB 足够复用 BT 系统提示词前缀。老版本 llama-server 无此 flag 时自动跳过 |
-| `HF_ENDPOINT` | 空 | 空=自动探测（官方不通走 `https://hf-mirror.com`）；也可显式指定 |
+| `HF_ENDPOINT` | 空 | 空=自动探测（官方不通走 `https://hf-mirror.com`）；也可显式指定。下载失败会自动换另一个端点重试 |
+| `PIP_INDEX_URL` | 空 | 空=自动探测（官方 PyPI 不通自动切清华 → 阿里镜像）；也可显式指定（标准 pip 变量，影响 venv 内所有 pip 操作） |
+| `CS_TORCH_INDEX` | 空 | 空=自动探测（官方 pytorch 源不通自动切阿里/SJTU 镜像）；也可显式指定，如 `https://download.pytorch.org/whl/cu121` |
 | `EXTRA_LLAMA_ARGS` | 空 | 追加给 llama-server 的参数（如 `--threads 12`） |
 
-其它可用的环境变量：`CS_DET_PROVIDERS`（覆盖检测器 onnxruntime providers，如 `CUDAExecutionProvider,CPUExecutionProvider`）、`CS_TORCH_INDEX`（覆盖 torch 轮子源，如 `.../whl/cu121`）、`PIP_INDEX_URL`（pip 镜像）。
+其它可用的环境变量：`CS_DET_PROVIDERS`（覆盖检测器 onnxruntime providers，如 `CUDAExecutionProvider,CPUExecutionProvider`）。
 `PYTORCH_ENABLE_MPS_FALLBACK=1` 由部署器自动设置（MPS 未实现算子回退 CPU 而非报错）。
 
 **LLM 三层降级**（自动按序尝试，全部失败时 `start` 会打印指引）：
@@ -311,7 +315,7 @@ cv2.resize 640×640(INTER_LINEAR, 非 letterbox——直接 squash)
 | 找不到 llama-server（三平台指引） | `python3 deploy.py start` 会打印三种方案（装二进制 / `pip install llama-cpp-python` / 设 `LLAMA_URL` 用外部 ollama 等） |
 | 检测没吃到 CUDA | `/health` 看 `det_providers`：需装 `onnxruntime-gpu`（`setup --cuda` 已含）；仅 CPU 属预期 |
 | OCR 掉到 CPU 了 | `/health` 看 `device`：CUDA 机器上应显示 `cuda`；若显示 cpu 看 `logs` 里回退日志（CUDA 驱动/torch 版本不匹配） |
-| 国内下载慢/失败 | `fetch-models --mirror`；pip 用 `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` |
+| 国内下载慢/失败 | 默认已自动选源（模型→hf-mirror、pip→清华/阿里、torch→阿里/SJTU）并自动换端点重试；`python3 deploy.py doctor` 打印当前会用的源。仍失败可显式固定：`fetch-models --mirror`、`PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`、`CS_TORCH_INDEX=...` |
 | OCR 输出乱码成片 | 页面裁剪/缩放异常；用 `timing_test.py` 单页复现（同款预处理） |
 | 命中缓存但不是最新结果 | 语义如此；App「重译当前页」走 `?fresh=1` |
 | 手机连不上 8787 | 同网检查 `adb shell curl -s http://<服务机IP>:8787/health`；被防火墙挡则放行或改用 adb reverse |
@@ -351,7 +355,7 @@ cs_backend/
 - **`llama-cpp-python` 降级档未实测翻译质量**：chat 模板按 GGUF 元数据；以 `llama-server` 为准。
 
 **后续可选**
-- **剥离端侧推理遗骸（App 侧）**：`libcomicshelf.so` 静态编入的 llama.cpp 与 QNN/onnxruntime 运行库属死重（端侧路径已弃用，见 App 侧说明）；剥离后可给 APK 瘦身、加快构建。
+- **剥离端侧推理遗骸**：App 的 `libcomicshelf.so`(142MB) 仍静态编入 llama.cpp，APK 还带 QNN 四件套(12MB)+onnxruntime(17MB)——端侧模型已删，属死重。剥离后可给 APK 瘦身 ~30-60MB、加快构建，并释放 `task37/deps/llama.cpp`(913MB)。
 - `POST /translate_page`：把 BT Sakura 阶梯搬到服务端（payload/重复检测/两级阶梯照 `trans_sakura.py` 移植），实现**离线整本预翻译**（不依赖 App 常驻）；App 侧阶梯保留为另一传输路径。
 - 缓存 LRU/上限 + `/stats`。
 - 开机自启模板（systemd unit / launchd plist / Win 任务计划）。
@@ -362,8 +366,8 @@ cs_backend/
 
 ## 附：相关文档
 
-- 翻译机制（BT Sakura 两级阶梯/重复检测/引号剥离）的移植说明与理由，见 App 侧
-  `app/src/main/java/com/comicshelf/app/reader/OnDeviceTranslator.kt`（顶层注释与阶梯实现）。
-- 参考实现（上游 BalloonTranslator，GPL-3.0）：`modules/textdetector/detector_ctbd.py`、
-  `modules/ocr/ocr_paddleVL_manga.py`、`modules/translators/trans_sakura.py` —— 本后端管线与
-  App 侧翻译机制的移植对照来源；模型由 `fetch_models.py` 从 HuggingFace 下载，运行不依赖上游仓库。
+- 端侧/后端全景、BT 机制移植实录与全部真机数据：
+  `task37/ComicShelfAndroid/docs/BALLOONTRANSLATOR_WORKFLOW.md`（附录 F/G/G2/G4/G5）
+- 全过程时间线复盘、踩坑归因与方法论（M1-M10）：
+  `task37/ComicShelfAndroid/docs/PROJECT_RETROSPECTIVE.md`
+- BT 参考实现：`本地 BT 参考实现（未随仓库分发）`（`ballontranslator/modules/textdetector/detector_ctbd.py`、`…/ocr/ocr_paddleVL_manga.py`、`…/translators/trans_sakura.py`；管线移植的对照来源。模型已拷入本目录 `models/`，服务运行不依赖它）
