@@ -92,6 +92,9 @@ public:
     ThumbPtr cover(const Book& b);
     bool cover_ready(const Book& b);
     void warm_covers(int64_t lib_id, int max_books);
+    // 手动“重提失败封面”（书库页顶部按钮）：清掉所有失败标记（含永久失败），
+    // 可见单元格立即重新轮询、其余随浏览懒重试。返回被重置的条数。
+    int retry_failed_covers();
     // Drops the on-disk + in-memory cover and clears the failed/short-lived
     // state so the next cover() call regenerates it from scratch.
     void forget_cover(const Book& b);

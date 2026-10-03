@@ -642,6 +642,15 @@ Java_com_comicshelf_app_core_NativeBridge_nativeCoverPoll(JNIEnv* env, jobject, 
     return out;
 }
 
+// 手动“重提失败封面”：清掉失败标记（含永久失败），返回重置条数。
+// 可见单元格由 UI 侧立即重新轮询；其余随浏览懒重试。
+JNIEXPORT jint JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativeRetryFailedCovers(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lk(g_bridge_mtx);
+    if (!g_core.lib) return 0;
+    return g_core.lib->retry_failed_covers();
+}
+
 JNIEXPORT void JNICALL
 Java_com_comicshelf_app_core_NativeBridge_nativeForgetCover(JNIEnv*, jobject, jlong book_id) {
     std::lock_guard<std::mutex> lk(g_bridge_mtx);

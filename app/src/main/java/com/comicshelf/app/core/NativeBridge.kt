@@ -103,6 +103,8 @@ object NativeBridge {
     /** Object[3]: int[1] status (2 = ready), int[2] {w,h}, byte[] rgba */
     fun coverPoll(bookId: Long): Array<Any?>? = nativeCoverPoll(bookId)
     fun forgetCover(bookId: Long) = nativeForgetCover(bookId)
+    /** 手动重提失败封面：清掉失败标记（含永久失败），返回重置条数。 */
+    fun retryFailedCovers(): Int = nativeRetryFailedCovers()
 
     // ---- user state -------------------------------------------------------
     fun setFavorite(bookId: Long, fav: Boolean) = nativeSetFavorite(bookId, fav)
@@ -279,6 +281,7 @@ object NativeBridge {
     private external fun nativeBookFileName(bookId: Long): String
     private external fun nativeCoverPoll(bookId: Long): Array<Any?>?
     private external fun nativeForgetCover(bookId: Long)
+    private external fun nativeRetryFailedCovers(): Int
     private external fun nativeSetFavorite(bookId: Long, fav: Boolean)
     private external fun nativeSetReadState(bookId: Long, state: Int)
     private external fun nativeSaveProgress(bookId: Long, page: Int, pageCount: Int)

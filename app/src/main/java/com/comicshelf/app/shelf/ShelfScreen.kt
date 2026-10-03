@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CollectionsBookmark
@@ -289,6 +290,23 @@ fun ShelfScreen(
                         }
                         IconButton(onClick = { vm.rescan() }) {
                             Icon(Icons.Filled.Refresh, "重扫")
+                        }
+                        // 手动重提失败封面：清掉失败标记（含永久失败），可见格立即重新轮询
+                        IconButton(onClick = {
+                            scope.launch {
+                                val n = withContext(CoreDispatcher) {
+                                    NativeBridge.retryFailedCovers()
+                                }
+                                coverRetryGen.value++
+                                Toast.makeText(
+                                    ctx,
+                                    if (n > 0) "已重置 $n 个失败封面，重新提取中…"
+                                    else "已重新排队可见封面",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                        }) {
+                            Icon(Icons.Filled.Autorenew, "重提失败封面")
                         }
                         IconButton(onClick = onOpenSettings) {
                             Icon(Icons.Filled.Settings, "设置")
@@ -784,6 +802,9 @@ private fun MiniBadge(icon: ImageVector, desc: String, tint: Color) {
  */
 private data class CoverSlot(val bmp: Bitmap? = null, val unavailable: Boolean = false)
 
+/** “重提失败封面”代际：顶部按钮触发 +1，所有可见单元格立即重新轮询。 */
+private val coverRetryGen = mutableStateOf(0)
+
 /** 单次原生轮询（工作线程）：status 1=生成中 2=就绪 3=不可用。 */
 private suspend fun pollCover(bookId: Long): Pair<Int, Bitmap?> = withContext(CoreDispatcher) {
     // nativeCoverPoll -> Object[3]: int[1] status, int[2] {w,h}, byte[] rgba
@@ -803,10 +824,12 @@ private suspend fun pollCover(bookId: Long): Pair<Int, Bitmap?> = withContext(Co
 @Composable
 private fun produceCoverState(bookId: Long): androidx.compose.runtime.State<CoverSlot> {
     val lifecycleOwner = LocalLifecycleOwner.current
+    val retryGen = coverRetryGen.value  // 顶部“重提失败封面”触发本轮重启
     return produceState(
         initialValue = CoverSlot(CoverStore.get(bookId)),
         bookId,
         lifecycleOwner,
+        retryGen,
     ) {
         if (value.bmp != null) return@produceState
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {

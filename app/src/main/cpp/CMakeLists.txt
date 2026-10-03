@@ -191,6 +191,25 @@ add_library(cs_core STATIC ${CS_CORE_SOURCES})
 target_include_directories(cs_core PUBLIC "${SRC}")
 target_link_libraries(cs_core PUBLIC cs_sqlite3 cs_miniz cs_stb log)
 
+# ---------------------------------------------------------------- 图像解码后端
+# 注意：libwebp / libavif 的 add_subdirectory 只“编库”，启用必须同时
+#   target_compile_definitions（宏——源码里是 #if CS_HAS_WEBP 判断）
+#   + target_link_libraries（符号）
+# 少任何一半，image_util_webp.cpp / image_util_avif.cpp 都会走
+# “永远返回 false”的桩——Android 上所有 webp/avif 图会静默解码失败。
+if(CS_HAS_WEBP)
+    target_link_libraries(cs_core PUBLIC webp)
+    target_compile_definitions(cs_core PUBLIC CS_HAS_WEBP=1)
+else()
+    target_compile_definitions(cs_core PUBLIC CS_HAS_WEBP=0)
+endif()
+if(CS_HAS_AVIF)
+    target_link_libraries(cs_core PUBLIC avif)
+    target_compile_definitions(cs_core PUBLIC CS_HAS_AVIF=1)
+else()
+    target_compile_definitions(cs_core PUBLIC CS_HAS_AVIF=0)
+endif()
+
 # ---------------------------------------------------------------- libsmb2 (SMB2)
 # libsmb2 (LGPL-2.1): 头文件 vendored 在 third_party/libsmb2/include，
 # 运行时 .so 由 APK 的 jniLibs/arm64-v8a/libsmb2.so 提供（均在仓库内）。

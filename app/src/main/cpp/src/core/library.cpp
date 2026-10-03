@@ -365,6 +365,24 @@ LibraryManager::CoverPoll LibraryManager::cover_poll(const Book& b) {
 
 ThumbPtr LibraryManager::cover(const Book& b) { return cover_poll(b).thumb; }
 
+int LibraryManager::retry_failed_covers() {
+    std::lock_guard<std::mutex> lk(state_mtx_);
+    int n = 0;
+    for (auto it = cover_state_.begin(); it != cover_state_.end();) {
+        if (it->second.state == CoverState::Failed) {
+            // 状态清成 None：下一次轮询即可重新提交；已在队列里的条目
+            // 由 pump/接力按 None 正常调度（无需动队列）。
+            it = cover_state_.erase(it);
+            ++n;
+        } else {
+            ++it;
+        }
+    }
+    if (n > 0)
+        log_info("retry_failed_covers: 重置失败标记 " + std::to_string(n) + " 条");
+    return n;
+}
+
 bool LibraryManager::cover_ready(const Book& b) {
     const std::string key = ThumbnailCache::make_key(b);
     if (thumbs_.try_get(key)) return true;
