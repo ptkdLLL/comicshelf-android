@@ -15,6 +15,16 @@
   - BT Sakura 机制完整移植：官方 system prompt、**两级独立阶梯**（重复检测 + 行数对齐）、逐行兜底、永不空手返回
   - **整本书后台队列**：书架启动 → 可见页插队 → 暂停/继续/跨会话续传
 
+## 截图
+
+| 书库 / 书架（扫描统计、封面、阅读进度） | 翻译设置（局域网后端：地址 / 测试 / 缓存用量） |
+|---|---|
+| ![书库](screenshots/01-library-shelf.jpg) | ![翻译设置](screenshots/02-settings-backend.jpg) |
+
+| 目录树（多级目录 + 每目录书目数） | 书籍操作（长按：翻译 / 阅读 / 封面 / 标记 / 标签） |
+|---|---|
+| ![目录树](screenshots/03-folder-tree.jpg) | ![书籍操作](screenshots/04-book-actions.jpg) |
+
 ## 架构
 
 ```
