@@ -12,7 +12,9 @@
     4. download llama.cpp Windows CUDA binaries (ghproxy accelerator chain,
        automatic llama-cpp-python CPU fallback)
     5. download the three models (hf-mirror/official x direct/system-proxy, probed per pair)
-    6. start services and verify /health
+    6. start services, OPEN INBOUND FIREWALL 8787 BY DEFAULT (idempotent, one UAC if
+       needed; opt out with -NoFirewall), verify /health, print phone address
+       (192.168.* physical LAN preferred)
   Idempotent: finished phases are skipped; safe to re-run after interruption.
   Network-routing lessons applied (see deployment archive SS5):
     - probe and download use the SAME stack (curl.exe)
@@ -25,7 +27,7 @@
 param(
     [switch]$NoStart,     # deploy only, do not start
     [switch]$Cpu,         # force CPU (skip CUDA)
-    [switch]$Firewall     # try to add inbound rule for 8787 (may raise UAC)
+    [switch]$NoFirewall   # skip opening inbound port 8787 (open is the DEFAULT; phone needs it)
 )
 $ErrorActionPreference = 'Continue'
 $T0 = Get-Date
@@ -429,17 +431,45 @@ try {
 
     # ============================================================ phase 7: start
     Phase '7/7 start services'
-    if ($Firewall) {
-        $fw = 'netsh advfirewall firewall add rule name="ComicShelf backend 8787" dir=in action=allow protocol=TCP localport=8787'
-        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        if ($isAdmin) { cmd /c $fw | Out-Null; Ok 'firewall inbound rule added (8787/tcp)' }
-        else {
-            try { Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile -Command $fw" -Wait; Ok 'firewall rule added (elevated)' }
-            catch { Warn 'UAC declined. manual one-liner (admin cmd):'; Write-Host "    $fw" }
-        }
+    # firewall: OPEN BY DEFAULT (phone on LAN must reach 8787). Idempotent: existing
+    # enabled rule -> skip (no UAC). Adding requires admin -> one UAC prompt otherwise.
+    if ($NoFirewall) {
+        Warn '-NoFirewall: inbound 8787 NOT opened. LAN devices cannot reach the service until opened manually.'
     } else {
-        Warn 'firewall: if the phone cannot connect later, run this in an ADMIN cmd:'
-        Write-Host '    netsh advfirewall firewall add rule name="ComicShelf backend 8787" dir=in action=allow protocol=TCP localport=8787' -ForegroundColor DarkGray
+        $fwName = 'ComicShelf backend 8787'
+        # detection via netsh TEXT output matching the ASCII rule name:
+        #  - works for standard users (Get-NetFirewallRule returns nothing without admin
+        #    on domain-joined machines)
+        #  - locale-independent (the not-found message never echoes the name; our name
+        #    appears verbatim only when a rule exists)
+        function Test-FwRule {
+            $out = (netsh advfirewall firewall show rule name="$fwName" 2>$null | Out-String)
+            return ($out -match [regex]::Escape($fwName))
+        }
+        if (Test-FwRule) {
+            Ok "firewall rule already present ($fwName, inbound 8787/tcp)"
+        } else {
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            $added = $false
+            if ($isAdmin) {
+                cmd /c "netsh advfirewall firewall add rule name=`"$fwName`" dir=in action=allow protocol=TCP localport=8787" | Out-Null
+                $added = $true
+            } else {
+                # one UAC prompt for the single add command; decline -> fall through with manual hint
+                try {
+                    Start-Process netsh -Verb RunAs -ArgumentList 'advfirewall firewall add rule name="ComicShelf backend 8787" dir=in action=allow protocol=TCP localport=8787' -Wait
+                    $added = $true
+                } catch { $added = $false }
+            }
+            if ($added) {
+                Start-Sleep -Seconds 1
+                if (Test-FwRule) { Ok 'firewall inbound rule ADDED (8787/tcp, all profiles) - LAN devices can connect' }
+                else { Warn 'firewall rule add returned but rule not visible; verify manually' }
+            } else {
+                Warn 'UAC declined -> firewall NOT opened. phones on LAN cannot connect. manual one-liner (admin cmd):'
+                Write-Host '    netsh advfirewall firewall add rule name="ComicShelf backend 8787" dir=in action=allow protocol=TCP localport=8787' -ForegroundColor DarkGray
+            }
+        }
     }
     # convenience launchers for daily use after deploy
     foreach ($p in @(@{ n = 'start-backend.bat';  a = 'start'  },
@@ -483,10 +513,19 @@ try {
                     Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.InterfaceAlias -notmatch 'Loopback|vEthernet|WSL|VMware|Virtual|Docker|Hyper' } |
                     Select-Object -ExpandProperty IPAddress -Unique
             } catch {}
-            if (-not $phys) { $phys = @('<LAN-IP-from-deploy-output-above>') }
+            # LAN routers use 192.168.* by default -> show those FIRST as the recommended address
+            $lan192 = @($phys | Where-Object { $_ -match '^192\.168\.' })
+            $others = @($phys | Where-Object { $_ -notmatch '^192\.168\.' })
+            if ($lan192.Count -eq 0 -and $others.Count -eq 0) { $lan192 = @('<LAN-IP-from-deploy-output-above>') }
             Write-Host ''
-            Write-Host '   PHONE APP: set the backend address to one of:' -ForegroundColor Yellow
-            foreach ($ip in $phys) { Write-Host ("       http://{0}:8787" -f $ip) -ForegroundColor Yellow }
+            if ($lan192.Count -gt 0) {
+                Write-Host '   PHONE APP (recommended):' -ForegroundColor Yellow
+                foreach ($ip in $lan192) { Write-Host ("       http://{0}:8787" -f $ip) -ForegroundColor Yellow }
+            }
+            if ($others.Count -gt 0) {
+                Write-Host '   other interfaces (use only if the phone is on that network):'
+                foreach ($ip in $others) { Write-Host ("       http://{0}:8787" -f $ip) }
+            }
             Write-Host '   USB alternative: adb reverse tcp:8787 tcp:8787  +  http://127.0.0.1:8787'
         } else {
             Warn 'service not healthy yet; check via backend\logs-backend.bat'
