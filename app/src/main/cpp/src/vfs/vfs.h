@@ -81,4 +81,10 @@ bool smb_list_shares(const std::string& host, const std::string& user,
                      const std::string& password, const std::string& domain,
                      std::vector<std::string>* out, std::string* err);
 
+// SMB 传输健康度“纪元”：每次检测到连接断开 / 会话损坏即 +1。
+// 后台任务（如封面生成）在提交时记录纪元，返回值变化即说明“当时的连接已死”，
+// 可安全地把该次失败当作可重试处理——避免网络抖动把任务永久卡死。
+// 本地文件系统恒为 0（无此概念）。
+uint64_t smb_epoch();
+
 }  // namespace cs::vfs

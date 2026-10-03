@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.ImageNotSupported
 import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -91,6 +92,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.paging.compose.collectAsLazyPagingItems
 import androidx.paging.compose.itemKey
 import com.comicshelf.app.core.BookCell
@@ -678,14 +682,32 @@ private fun CoverCell(
                 .clip(RoundedCornerShape(6.dp))
                 .background(coverPlaceholder),
         ) {
-            val bmp by produceCoverBitmap(cell.id)
-            if (bmp != null) {
+            val slot by produceCoverState(cell.id)
+            if (slot.bmp != null) {
                 Image(
-                    bitmap = bmp!!.asImageBitmap(),
+                    bitmap = slot.bmp!!.asImageBitmap(),
                     contentDescription = cell.title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize(),
                 )
+            } else if (slot.unavailable) {
+                // 不可用（不是图片包 / 读取失败冷却中）：占位图标，不再无限转圈
+                Column(
+                    Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Icon(
+                        Icons.Filled.ImageNotSupported,
+                        contentDescription = "封面暂不可用",
+                        modifier = Modifier.size(22.dp),
+                        tint = Color.White.copy(alpha = 0.35f),
+                    )
+                    if (cell.pages > 0) {
+                        Spacer(Modifier.height(4.dp))
+                        Text("${cell.pages}p", fontSize = 10.sp,
+                             color = Color.White.copy(alpha = 0.6f))
+                    }
+                }
             } else {
                 Column(
                     Modifier.align(Alignment.Center),
@@ -756,30 +778,56 @@ private fun MiniBadge(icon: ImageVector, desc: String, tint: Color) {
     }
 }
 
-/** Polls the native cover pipeline until the thumbnail is ready (or gives up). */
+/**
+ * 封面槽位：bmp 就绪；或 unavailable = 暂不可用（永久失败 / 瞬态失败冷却中），
+ * 此时显示占位图标而非无限转圈，原生侧冷却到点后会自动重试。
+ */
+private data class CoverSlot(val bmp: Bitmap? = null, val unavailable: Boolean = false)
+
+/** 单次原生轮询（工作线程）：status 1=生成中 2=就绪 3=不可用。 */
+private suspend fun pollCover(bookId: Long): Pair<Int, Bitmap?> = withContext(CoreDispatcher) {
+    // nativeCoverPoll -> Object[3]: int[1] status, int[2] {w,h}, byte[] rgba
+    val bundle = NativeBridge.coverPoll(bookId) ?: return@withContext 1 to null
+    val status = (bundle[0] as? IntArray)?.get(0) ?: 1
+    if (status != 2) return@withContext status to null
+    val dims = bundle[1] as? IntArray ?: return@withContext 1 to null
+    val px = bundle[2] as? ByteArray ?: return@withContext 1 to null
+    val bmp = if (dims.size < 2 || px.isEmpty()) null else CoverStore.rgbaToBitmap(dims, px)
+    if (bmp == null) 3 to null else 2 to bmp
+}
+
+/**
+ * 轮询原生封面管线直到就绪：退避 80ms→1s→5s，不可用时 30s 慢询。
+ * 只在前台（lifecycle STARTED）轮询——退到后台即暂停，回前台自动续。
+ */
 @Composable
-private fun produceCoverBitmap(bookId: Long): androidx.compose.runtime.State<Bitmap?> {
-    return produceState<Bitmap?>(initialValue = CoverStore.get(bookId), key1 = bookId) {
-        if (value != null) return@produceState
-        var tries = 0
-        while (tries < 400) { // ~30s of polling max, then stop asking
-            val bmp = withContext(CoreDispatcher) {
-                // nativeCoverPoll -> Object[3]: int[1] status, int[2] {w,h}, byte[] rgba
-                val bundle = NativeBridge.coverPoll(bookId) ?: return@withContext null
-                val status = (bundle[0] as? IntArray)?.get(0) ?: 0
-                if (status != 2) return@withContext null
-                val dims = bundle[1] as? IntArray ?: return@withContext null
-                val px = bundle[2] as? ByteArray ?: return@withContext null
-                if (dims.size < 2 || px.isEmpty()) null
-                else CoverStore.rgbaToBitmap(dims, px)
+private fun produceCoverState(bookId: Long): androidx.compose.runtime.State<CoverSlot> {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    return produceState(
+        initialValue = CoverSlot(CoverStore.get(bookId)),
+        bookId,
+        lifecycleOwner,
+    ) {
+        if (value.bmp != null) return@produceState
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var tries = 0
+            while (value.bmp == null) {
+                val (status, bmp) = pollCover(bookId)
+                if (status == 2 && bmp != null) {
+                    CoverStore.put(bookId, bmp)
+                    value = CoverSlot(bmp)
+                    return@repeatOnLifecycle
+                }
+                if (status == 3) {
+                    // 不可用（永久失败，或瞬态失败冷却中）：占位 + 慢询等原生侧重试
+                    value = CoverSlot(unavailable = true)
+                    delay(30_000)
+                } else {
+                    value = CoverSlot(unavailable = false)
+                    tries++
+                    delay(if (tries <= 5) 80L else if (tries <= 20) 1_000L else 5_000L)
+                }
             }
-            if (bmp != null) {
-                CoverStore.put(bookId, bmp)
-                value = bmp
-                return@produceState
-            }
-            tries++
-            delay(80)
         }
     }
 }

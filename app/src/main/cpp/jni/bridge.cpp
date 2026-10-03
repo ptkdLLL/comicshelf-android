@@ -607,8 +607,8 @@ Java_com_comicshelf_app_core_NativeBridge_nativeRebuildDirs(JNIEnv*, jobject, jl
 
 // ---------------------------------------------------------------- covers
 
-// Object[3]: int[1] status (0 none+schedule, 1 inflight, 2 ready, 3 failed),
-//            int[2] {w,h}, byte[] rgba. Only when status==ready are w/h/rgba set.
+// Object[3]: int[1] status (1 inflight, 2 ready, 3 unavailable),
+//            int[2] {w,h}, byte[] rgba. Only when status==2 are w/h/rgba set.
 JNIEXPORT jobjectArray JNICALL
 Java_com_comicshelf_app_core_NativeBridge_nativeCoverPoll(JNIEnv* env, jobject, jlong book_id) {
     std::lock_guard<std::mutex> lk(g_bridge_mtx);
@@ -616,16 +616,12 @@ Java_com_comicshelf_app_core_NativeBridge_nativeCoverPoll(JNIEnv* env, jobject, 
     Book b = find_book(book_id);
     if (b.id == 0) return nullptr;
 
-    // cover() schedules generation on the pool on first sight and returns
-    // nullptr until the thumbnail is in the memory LRU.
-    ThumbPtr t = g_core.lib->cover(b);
+    // 状态机在原生侧：cover_poll() 驱动提交/重试/冷却，如实返回
+    // 1=生成中、2=就绪、3=不可用（永久失败，或瞬态失败冷却中）。
+    auto r = g_core.lib->cover_poll(b);
+    ThumbPtr t = r.thumb;
+    const int status = t ? 2 : r.status;
 
-    int status = t ? 2 : 1;
-    if (!t && !g_core.lib->progress().running.load()) {
-        // Distinguish "generation running" from "failed" via the cache state:
-        // a Failed state never resolves until forget_cover(); report inflight
-        // for both and let the UI stop polling after a grace period.
-    }
     jintArray st = env->NewIntArray(1);
     jint sv[1] = {status};
     env->SetIntArrayRegion(st, 0, 1, sv);

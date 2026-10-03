@@ -18,6 +18,7 @@
 
 // 裁剪构建（没有 libsmb2）：给出明确的失败实现。
 namespace cs::vfs {
+uint64_t smb_epoch() { return 0; }  // 无 SMB：纪元恒 0
 std::shared_ptr<Vfs> make_smb_vfs_impl(const SmbConfig&, std::string* err) {
     if (err) *err = "本构建未包含 SMB2 客户端（libsmb2 缺失）";
     return nullptr;
@@ -59,6 +60,10 @@ constexpr int kMaxSessions = 8;        // 扫描 worker + 阅读器 + 余量（N
 constexpr int kAcquireTimeoutMs = 30000;
 constexpr int kSmbTimeoutSec = 30;     // 单次请求超时（卡死检测）
 constexpr uint32_t kReadChunk = 1u << 20;
+
+// 传输健康度纪元：任何会话被判为“损坏/断连”时 +1（语义见 vfs.h 的 smb_epoch()）。
+std::atomic<uint64_t> g_smb_epoch{0};
+void bump_smb_epoch() { g_smb_epoch.fetch_add(1, std::memory_order_relaxed); }
 
 int64_t now_ms() {
     using namespace std::chrono;
@@ -306,7 +311,10 @@ private:
             fh_ = nullptr;
         }
         fh_ = nullptr;
-        if (broken) session_->broken = true;
+        if (broken && !session_->broken) {
+            session_->broken = true;
+            bump_smb_epoch();
+        }
         pool_->release(session_);
         session_.reset();
     }
@@ -441,7 +449,10 @@ private:
                 ok = fn(s->ctx);
                 if (!ok) {
                     aerr = smb_err(s->ctx);
-                    s->broken = looks_transport(aerr);
+                    if (looks_transport(aerr)) {
+                        s->broken = true;
+                        bump_smb_epoch();
+                    }
                 }
             }
             pool_->release(s);
@@ -462,6 +473,8 @@ private:
 };
 
 } // namespace
+
+uint64_t smb_epoch() { return g_smb_epoch.load(std::memory_order_relaxed); }
 
 // ---------------------------------------------------------------- 工厂实现
 
@@ -555,6 +568,7 @@ private:
                 if (rc > 0 && fd >= 0 && FD_ISSET(fd, &rfds)) revents = smb2_which_events(ctx_);
                 if (smb2_service(ctx_, revents) < 0) {
                     log_warn("smb watch: 连接断开（稍后重连）: " + smb_err(ctx_));
+                    bump_smb_epoch();  // 连接已死：在途任务的结果不可信
                     break;
                 }
                 flush_pending();

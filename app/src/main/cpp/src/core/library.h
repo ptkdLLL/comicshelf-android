@@ -8,10 +8,13 @@
 #include "image/thumbnail_cache.h"
 #include "util/thread_pool.h"
 
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace cs {
@@ -74,8 +77,18 @@ public:
     void rebuild_dirs(int64_t lib_id);
 
     // ---- covers ----------------------------------------------------------
-    // Non-blocking. Returns a ready thumbnail or nullptr while one is being
-    // generated (the UI should draw a placeholder).
+    // 轮询接口（JNI/UI 用）。每次调用都推进一次状态机：
+    //   status: 1 = 生成中（稍后再试）; 2 = 就绪（thumb 非空）;
+    //           3 = 暂不可用（内容层永久失败，或瞬态失败冷却中；UI 显示占位并慢速重试）
+    // 失败分两类：内容层“永久”（不是图片/包损坏）不再自动重试；
+    // 其余（IO/网络/超时）60s 冷却后按需重试；提交时记录 SMB 断连纪元，
+    // 期间断过线则任何失败都按可重试处理（断线时读到的“坏数据”不可信）。
+    struct CoverPoll {
+        int status = 1;
+        ThumbPtr thumb;
+    };
+    CoverPoll cover_poll(const Book& b);
+    // 兼容旧调用（桌面壳/预热）：就绪返回缩略图，否则 nullptr（已按需排队生成）。
     ThumbPtr cover(const Book& b);
     bool cover_ready(const Book& b);
     void warm_covers(int64_t lib_id, int max_books);
@@ -112,7 +125,24 @@ public:
 
 private:
     enum class CoverState { None, Inflight, Ready, Failed };
-    bool generate_cover(const Book& b, ImageRGBA& out) const;
+    struct CoverEntry {
+        CoverState state = CoverState::None;
+        bool permanent = false;  // Failed 且内容层不可恢复 → 不再自动重试
+        uint64_t epoch = 0;      // 提交时的 SMB 断连纪元（见 vfs::smb_epoch）
+        uint64_t token = 0;      // 提交序号：完成时校验，防止超时重投后旧任务改写新状态
+        int64_t stamp_ms = 0;    // 进入当前状态的时间（冷却 / inflight 保险丝）
+    };
+    struct CoverGenResult {
+        bool ok = false;
+        bool permanent = false;  // 内容层永久失败（与网络无关）
+        std::string reason;
+    };
+    CoverGenResult generate_cover(const Book& b, ImageRGBA& out) const;
+    // 以下 *locked 都要求已持有 state_mtx_。
+    CoverState schedule_cover_locked(const Book& b, const std::string& key, int64_t now);
+    void pump_warm_locked();
+    void enqueue_cover_locked(const Book& b, const std::string& key, bool front);
+    void forget_key_locked(const std::string& key);
 
     Settings& settings_;
     ThreadPool& pool_;
@@ -128,7 +158,12 @@ private:
     Resample thumb_resample_ = Resample::Box;
 
     mutable std::mutex state_mtx_;
-    std::unordered_map<std::string, CoverState> cover_state_;
+    std::unordered_map<std::string, CoverEntry> cover_state_;
+    std::deque<Book> cover_queue_;                  // 待生成（前=屏上单元格，后=warm 预热）
+    std::unordered_set<std::string> cover_queued_;  // 去重：已在队列中的 key
+    uint64_t cover_token_ = 0;                      // 提交序号发号器
+    int cover_inflight_ = 0;                        // 生成中任务数（与任务完成配对）
+    int cover_cap_ = 3;                             // 并发上限（settings: cover_max_inflight）
 };
 
 } // namespace cs
