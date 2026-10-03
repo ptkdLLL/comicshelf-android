@@ -85,6 +85,16 @@ gradle :app:assembleDebug          # 或直接用 Android Studio 打开本目录
 见 [backend/README.md](backend/README.md)：拷贝目录 → `python deploy.py`（自动建 venv、按平台装依赖、
 从 HuggingFace 下载三个模型（含国内镜像自动探测）、启动服务）。
 
+**Windows（NVIDIA）一键部署**：见 [backend/cs-deploy/](backend/cs-deploy/)——双击 `deploy.bat`，
+七阶段全自动（Python / 依赖 / llama.cpp 二进制 / 模型 / 启动健康检查，全程幂等可断点续跑），
+真机实测约 40 分钟全自动；坑位、根因与运维手册见
+[WINDOWS_DEPLOY_RECORD.md](backend/cs-deploy/WINDOWS_DEPLOY_RECORD.md)。
+
+> **分发形态（重要）**：部署脚本的"从零自动下载仓库"兜底要求上游仓库可公开访问；
+> 当前以**源码随包**形式分发——把 `comicshelf-android\` 整个文件夹与 `cs-deploy\`
+> 放在同一目录（或其父目录）一起拷贝即可。脚本的同目录/父目录扫描原生支持该形态，
+> 无需任何改动。
+
 ## 许可与致谢
 
 - 本项目以 **GPL-3.0** 发布（见 [LICENSE](LICENSE)）。原因：翻译机制（Sakura 模板、两级阶梯、
