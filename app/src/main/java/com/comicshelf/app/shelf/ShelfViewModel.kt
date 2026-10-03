@@ -84,7 +84,12 @@ class ShelfPagingSource(private val q: ShelfQuery) : PagingSource<Long, BookCell
                     "load lib=${q.libId} off=$offset lim=$limit total=$total rows=${rows.size}")
                 val next = if (offset + rows.size < total) offset + rows.size else null
                 val prev = if (offset > 0) maxOf(0L, offset - limit) else null
-                LoadResult.Page(rows, prev, next, 0, 0)
+                // S-2：喂给 Paging 的前后计数（placeholders 的 itemCount 推导），
+                // 配合 jumpingThreshold 让深跳只加载目标窗；Long→Int 按纪律夹紧。
+                val itemsBefore = offset.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                val itemsAfter = (total - offset - rows.size)
+                    .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                LoadResult.Page(rows, prev, next, itemsBefore, itemsAfter)
             } catch (t: Throwable) {
                 android.util.Log.e("ShelfPaging", "load failed", t)
                 LoadResult.Error(t)
@@ -108,7 +113,11 @@ class ShelfViewModel : ViewModel() {
             pageSize = 120,
             initialLoadSize = 240,
             prefetchDistance = 48,
-            enablePlaceholders = false,
+            // 滚动条跳转（S-1/S-2）：placeholders 让 itemCount=全库数（LoadResult.Page
+            // 携带 itemsBefore/After），配合 jumpingSupported/jumpThreshold 实现
+            // "丢弃中间页、直载目标窗"；maxSize 上界防跳来跳去时已加载页无限积累。
+            enablePlaceholders = true,
+            maxSize = 2048,
             jumpThreshold = 240,
         )) { ShelfPagingSource(q) }.flow
     }.cachedIn(viewModelScope)

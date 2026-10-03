@@ -93,6 +93,24 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.interaction.DragInteraction
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.lazy.grid.LazyGridState
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlin.math.roundToInt
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
@@ -135,6 +153,32 @@ fun ShelfScreen(
     val scan by vm.scan.collectAsState()
     val items = vm.books.collectAsLazyPagingItems()
     val gridState = vm.gridState
+
+    // ---- S-4 双通道低清门控（封面风暴止血；两通道隔离）----
+    // 通道 A（直接滚格）：手指拖着滚 = 看内容，不抑制；松手后的惯性甩动 = 内容飞掠，抑制。
+    // 通道 B（滚动条拖动）：按下即抑制（传送语义，内容只是闪现）。
+    // 低清期间格子不发任何封面请求（produceCoverState 以 lowFi 为 key）；退出滞后 300ms，
+    // 落定后只给静止视口加载。滚动条拖动状态由 ShelfScrollbar 回调进来。
+    var barDragging by remember { mutableStateOf(false) }      // 通道 B
+    var gridDragActive by remember { mutableStateOf(false) }   // 手指正在拖网格（通道 A 的豁免位）
+    var gridScrolling by remember { mutableStateOf(false) }    // 网格在滚（含甩动）
+    LaunchedEffect(gridState) {
+        launch {
+            gridState.interactionSource.interactions.collect { i ->
+                when (i) {
+                    is DragInteraction.Start -> gridDragActive = true
+                    is DragInteraction.Stop, is DragInteraction.Cancel -> gridDragActive = false
+                }
+            }
+        }
+        launch { snapshotFlow { gridState.isScrollInProgress }.collect { gridScrolling = it } }
+    }
+    val rawFast = barDragging || (gridScrolling && !gridDragActive)
+    var lowFi by remember { mutableStateOf(false) }
+    LaunchedEffect(rawFast) {
+        if (rawFast) lowFi = true
+        else { delay(300); lowFi = false }
+    }
 
     // 记录滚动位置（仅在"已恢复"之后记录，避免回来时的空状态把记忆冲掉）
     LaunchedEffect(gridState) {
@@ -374,11 +418,25 @@ fun ShelfScreen(
                             count = items.itemCount,
                             key = items.itemKey { it.id },
                         ) { idx ->
-                            val cell = items[idx] ?: return@items
+                            val cell = items[idx]
+                            if (cell == null) {
+                                // 占位格（目标窗未到，S-1/S-3）：骨架底色，跳转落点不空白
+                                Box(Modifier.padding(4.dp)) {
+                                    Box(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .aspectRatio(0.7f)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(coverPlaceholder),
+                                    )
+                                }
+                                return@items
+                            }
                             CoverCell(
                                 cell = cell,
                                 selected = selection.containsKey(cell.id),
                                 job = trJob.takeIf { it.bookId == cell.id && it.active },
+                                lowFi = lowFi,
                                 onClick = {
                                     if (selection.isNotEmpty()) {
                                         selection = if (selection.containsKey(cell.id))
@@ -395,6 +453,14 @@ fun ShelfScreen(
                             )
                         }
                     }
+                    // S-3：全库滚动条（大库快跳）。状态读取/跳转提交全部封装在组件内部；
+                    // onDraggingChange 接入 S-4 通道 B（拖动期间低清=不拉封面）。
+                    ShelfScrollbar(
+                        gridState = gridState,
+                        total = items.itemCount,
+                        onDraggingChange = { barDragging = it },
+                        modifier = Modifier.align(Alignment.CenterEnd),
+                    )
                 }
             }
         }
@@ -679,6 +745,7 @@ private fun CoverCell(
     cell: BookCell,
     selected: Boolean,
     job: BookTranslateJob.State?,
+    lowFi: Boolean,          // S-4：快滑/拖滚动条期间不拉封面、不转圈
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onToggleFav: () -> Unit,
@@ -700,7 +767,7 @@ private fun CoverCell(
                 .clip(RoundedCornerShape(6.dp))
                 .background(coverPlaceholder),
         ) {
-            val slot by produceCoverState(cell.id)
+            val slot by produceCoverState(cell.id, lowFi)
             if (slot.bmp != null) {
                 Image(
                     bitmap = slot.bmp!!.asImageBitmap(),
@@ -726,7 +793,8 @@ private fun CoverCell(
                              color = Color.White.copy(alpha = 0.6f))
                     }
                 }
-            } else {
+            } else if (!lowFi) {
+                // S-4：低清期间保持静态骨架（不转圈省帧）；非低清时才显示转圈
                 Column(
                     Modifier.align(Alignment.Center),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -822,7 +890,7 @@ private suspend fun pollCover(bookId: Long): Pair<Int, Bitmap?> = withContext(Co
  * 只在前台（lifecycle STARTED）轮询——退到后台即暂停，回前台自动续。
  */
 @Composable
-private fun produceCoverState(bookId: Long): androidx.compose.runtime.State<CoverSlot> {
+private fun produceCoverState(bookId: Long, lowFi: Boolean): androidx.compose.runtime.State<CoverSlot> {
     val lifecycleOwner = LocalLifecycleOwner.current
     val retryGen = coverRetryGen.value  // 顶部“重提失败封面”触发本轮重启
     return produceState(
@@ -830,7 +898,9 @@ private fun produceCoverState(bookId: Long): androidx.compose.runtime.State<Cove
         bookId,
         lifecycleOwner,
         retryGen,
+        lowFi,   // S-4：低清态翻转即重启本 effect；低清期间体直接返回 → 零封面请求
     ) {
+        if (lowFi) return@produceState
         if (value.bmp != null) return@produceState
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             var tries = 0
@@ -1331,4 +1401,173 @@ private fun TagsDialog(onDismiss: () -> Unit) {
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
     )
+}
+
+// ---------------------------------------------------------------- scrollbar
+
+/** 小于此本数不显示滚动条（小库用不上，避免遮挡）。 */
+private const val SCROLLBAR_MIN_TOTAL = 150
+
+/**
+ * 全库滚动条（S-3）：粗定位 + 拖动时"第 N / M 本"序号气泡（纯算术，零 IO）。
+ *
+ * 两条纪律（见 docs/SHELF_SCROLLBAR_PLAN.md）：
+ *  · 状态读取只发生在本组件内部（derivedStateOf / 手势闭包、offset 延迟读取）——
+ *    gridState 的 firstVisibleItemIndex 等高频值严禁提升到 ShelfScreen 顶层，
+ *    否则滚动时整屏重组；
+ *  · 跳转提交走"最新目标位"（conflated StateFlow）+ 单条协程循环（≥120ms 间隔），
+ *    结构上同一时刻最多一个悬挂的 scrollToItem，消灭拖动时的加载洪峰。
+ */
+@Composable
+private fun ShelfScrollbar(
+    gridState: LazyGridState,
+    total: Int,
+    onDraggingChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (total <= SCROLLBAR_MIN_TOTAL) return
+
+    var dragging by remember { mutableStateOf(false) }
+    var dragFrac by remember { mutableFloatStateOf(0f) }
+    var dragTarget by remember { mutableIntStateOf(0) }
+    var bubbleVisible by remember { mutableStateOf(false) }
+    val stripH = remember { mutableFloatStateOf(0f) }
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+
+    // 目标位（conflated）：拖动只写这里；提交协程每次取走最新值执行一次跳转。
+    // compareAndSet 清零：取走后若已有更新的值，清旧不动新，不丢最新落点。
+    val pending = remember { MutableStateFlow(-1) }
+    val totalNow = rememberUpdatedState(total)
+    LaunchedEffect(gridState) {
+        while (true) {
+            val t = pending.first { it >= 0 }
+            pending.compareAndSet(t, -1)
+            gridState.scrollToItem(t.coerceIn(0, (totalNow.value - 1).coerceAtLeast(0)))
+            delay(120)
+        }
+    }
+
+    // 组件内部读取（滚动每帧只失效本组件的布局/重组，不碰 ShelfScreen 与网格）
+    val visibleCount by remember { derivedStateOf {
+        gridState.layoutInfo.visibleItemsInfo.size.coerceAtLeast(1)
+    } }
+    val gridProgress by remember { derivedStateOf {
+        (gridState.firstVisibleItemIndex.toFloat() /
+            (total - visibleCount).coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+    } }
+    val scrollActive by remember { derivedStateOf { gridState.isScrollInProgress } }
+
+    val minThumbPx = with(density) { 72.dp.toPx() }   // 2× 长：36→72dp 的抓握滑块
+    val thumbFrac = (visibleCount.toFloat() / total).coerceIn(0.02f, 1f)
+    fun thumbHpx(): Float =
+        (stripH.value * thumbFrac).coerceAtLeast(minThumbPx)
+            .coerceAtMost(stripH.value.coerceAtLeast(0f))   // 几何护栏：滑块永不超过轨道
+    fun thumbTopPx(): Float {
+        val span = (stripH.value - thumbHpx()).coerceAtLeast(0f)
+        return span * (if (dragging) dragFrac else gridProgress)
+    }
+    fun fracForY(y: Float): Float {
+        val span = (stripH.value - thumbHpx()).coerceAtLeast(1f)
+        return ((y - thumbHpx() / 2f) / span).coerceIn(0f, 1f)
+    }
+    fun pushTarget() {
+        val t = (dragFrac * (total - visibleCount).coerceAtLeast(1))
+            .roundToInt().coerceIn(0, (total - 1).coerceAtLeast(0))
+        dragTarget = t
+        pending.value = t
+    }
+
+    val barAlpha by animateFloatAsState(
+        targetValue = if (dragging || scrollActive) 0.85f else 0.22f,
+        label = "shelfScrollbarAlpha",
+    )
+
+    // 外层容器加宽到 250dp：气泡需要水平空间（宽条带 + 气泡偏移后文字仍要单行）；
+    // 容器本身无 pointerInput → 触点穿透，命中区为右侧 72dp 条带。
+    Box(
+        modifier
+            .fillMaxHeight()
+            .width(250.dp),
+        contentAlignment = Alignment.CenterEnd,
+    ) {
+        // 命中条带（只有这条带消费拖动）：24dp × 3 = 72dp
+        Box(
+            Modifier
+                .align(Alignment.CenterEnd)
+                .fillMaxHeight()
+                .width(72.dp)
+                .onSizeChanged { stripH.value = it.height.toFloat() }
+                .pointerInput(total) {
+                    detectDragGestures(
+                        onDragStart = { pos ->
+                            dragging = true
+                            bubbleVisible = true
+                            onDraggingChange(true)                 // S-4 通道 B 进入
+                            dragFrac = fracForY(pos.y)
+                            pushTarget()
+                        },
+                        onDrag = { change, _ ->
+                            change.consume()
+                            dragFrac = fracForY(change.position.y)
+                            pushTarget()
+                        },
+                        onDragEnd = {
+                            dragging = false
+                            onDraggingChange(false)                // S-4 通道 B 退出（300ms 滞后由外壳处理）
+                            pushTarget()                                  // 追投最终落点
+                            scope.launch { delay(900); if (!dragging) bubbleVisible = false }
+                        },
+                        onDragCancel = {
+                            dragging = false
+                            onDraggingChange(false)
+                            scope.launch { delay(900); if (!dragging) bubbleVisible = false }
+                        },
+                    )
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            // 轨道
+            Box(
+                Modifier
+                    .fillMaxHeight()
+                    .width(12.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color.White.copy(alpha = 0.12f)),
+            )
+            // 滑块（offset 延迟读取：滚动时只走布局，不触发重组）：6dp→18dp 宽
+            Box(
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .offset { IntOffset(0, thumbTopPx().roundToInt()) }
+                    .width(18.dp)
+                    .height(with(density) { thumbHpx().toDp() })
+                    .clip(RoundedCornerShape(9.dp))
+                    .alpha(barAlpha)
+                    .background(MaterialTheme.colorScheme.primary),
+            )
+        }
+        // 序号气泡（拖动时显示，松手 900ms 后淡出；单行不打折）
+        if (bubbleVisible) {
+            Surface(
+                color = Color.Black.copy(alpha = 0.82f),
+                shape = RoundedCornerShape(6.dp),
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .offset {
+                        IntOffset(
+                            -with(density) { 90.dp.toPx() }.toInt(),   // 宽条带左侧留白
+                            thumbTopPx().roundToInt(),
+                        )
+                    },
+            ) {
+                Text(
+                    "第 ${dragTarget + 1} / $total 本",
+                    Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    fontSize = 12.sp, color = Color.White,
+                    maxLines = 1, softWrap = false,
+                )
+            }
+        }
+    }
 }
