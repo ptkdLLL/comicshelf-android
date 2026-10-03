@@ -48,7 +48,7 @@
 
 | 平台 | 操作 |
 |---|---|
-| Windows | 双击 `start.bat`（或命令行 `start.bat`） |
+| Windows | 双击 `start.bat`（或命令行 `start.bat`）；**NVIDIA 机器推荐 [cs-deploy/](cs-deploy/) 一键包**（自动装 Python/依赖/llama 二进制/模型，无需任何前置，实测 40 分钟全自动） |
 | Linux / macOS | `./start.sh` |
 
 首次运行自动完成：**建 venv → 按平台装依赖（CUDA/CPU/MPS 自动）→ 从 HuggingFace 下载三个模型
@@ -328,6 +328,8 @@ cv2.resize 640×640(INTER_LINEAR, 非 letterbox——直接 squash)
 cs_backend/
 ├── deploy.py          # 跨平台部署器: setup/start/stop/status/logs/doctor/fetch-models  ← 入口
 ├── start.sh / start.bat / run.sh   # 平台薄包装(双击/兼容旧入口)
+├── cs-deploy/         # Windows(NVIDIA) 独立一键包: deploy.bat/deploy.ps1/README
+│                      #   + WINDOWS_DEPLOY_RECORD.md（真机部署归档：坑位/根因/runbook）
 ├── pipeline.py        # 检测(onnx)+后处理链+OCR(GPU/CPU)+sha1 缓存       ← 核心
 ├── server.py          # FastAPI: /health /ocr_page /chat                 ← 协议层
 ├── fetch_models.py    # HF 三模型下载(镜像/续传/md5)
@@ -347,7 +349,7 @@ cs_backend/
 
 **限制**
 - **无鉴权**：假设可信局域网。暴露到更大网络前需加 token。
-- **Windows / Linux 路径未真机验证**：`deploy.py` 的平台分支按标准库实现（`tasklist/taskkill`、`Scripts\python.exe`、DETACHED_PROCESS 等），macOS 全路径已实测；新平台先跑 `python deploy.py doctor --full` 验环境。
+- **Windows 已真机验证（2026-10-03，RTX 3090 / Win10）**：`deploy.py` 在真实 Windows 上暴露多个阻断点（Python 发现候选表窄/Store stub、llama 二进制无自动获取、系统代理与"镜像直连"冲突、控制台编码），全部案例与解法见 `cs-deploy/WINDOWS_DEPLOY_RECORD.md`；**Windows 用户建议直接用 `cs-deploy/` 一键包**（已修复上述全部问题）。Linux 路径仍未真机验证，先用 `python deploy.py doctor --full` 验环境。
 - **缓存无淘汰**：磁盘 `cache/` 只增不删（量级小，可手工清）。
 - **无服务端渲染**：排版依赖手机端（有意为之，见 §0）。
 - **翻译不可复现**：`/chat` 未固定 seed（llama-server 默认随机）——质量 A/B 或复现个别句时需在转发 payload 里透传 `seed`。
