@@ -13,6 +13,7 @@
 #include "util/path_util.h"
 #include "core/scanner.h"
 #include "vfs/vfs.h"
+#include "vfs/stall_watch.h"
 #include "core/settings.h"
 #include "image/image_util.h"
 #include "translate/translate_engine.h"
@@ -864,13 +865,40 @@ Java_com_comicshelf_app_core_NativeBridge_nativeReadPage(JNIEnv* env, jobject, j
         s = find_session(book_id);
     }
     if (!s) return nullptr;
-    std::lock_guard<std::mutex> slk(s->mtx);
-    if (index < 0 || index >= (int)s->arch->count()) return nullptr;
-    std::vector<uint8_t> bytes;
-    if (!s->arch->read((size_t)index, bytes) || bytes.empty()) return nullptr;
-    jbyteArray out = env->NewByteArray((jsize)bytes.size());
-    env->SetByteArrayRegion(out, 0, (jsize)bytes.size(), (const jbyte*)bytes.data());
-    return out;
+    // v0.3.3d 诊断：会话锁等待 + arch 读取两段分别登记（守护线程 >12s 抓栈）。
+    {
+        const int64_t w0 = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        smbwatch::op_begin("readPage p" + std::to_string((int)index) + " 等会话锁 book=" +
+                           std::to_string((long long)book_id));
+        std::lock_guard<std::mutex> slk(s->mtx);
+        const int64_t wms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() - w0;
+        if (wms > 1000)
+            log_info("readPage book=" + std::to_string((long long)book_id) + " p" +
+                     std::to_string((int)index) + " 等会话锁 " + std::to_string(wms) + "ms");
+        if (index < 0 || index >= (int)s->arch->count()) { smbwatch::op_end(); return nullptr; }
+        smbwatch::op_begin("readPage p" + std::to_string((int)index) + " arch->read（SMB 读+解包）");
+        const int64_t t0 = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::vector<uint8_t> bytes;
+        bool ok = s->arch->read((size_t)index, bytes) && !bytes.empty();
+        smbwatch::op_end();
+        const int64_t rms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() - t0;
+        if (!ok) {
+            log_warn("readPage book=" + std::to_string((long long)book_id) + " p" +
+                     std::to_string((int)index) + " arch->read 失败（" + std::to_string(rms) + "ms）");
+            return nullptr;
+        }
+        if (rms > 2000)
+            log_info("readPage book=" + std::to_string((long long)book_id) + " p" +
+                     std::to_string((int)index) + " 读取 " + std::to_string(rms) + "ms bytes=" +
+                     std::to_string(bytes.size()));
+        jbyteArray out = env->NewByteArray((jsize)bytes.size());
+        env->SetByteArrayRegion(out, 0, (jsize)bytes.size(), (const jbyte*)bytes.data());
+        return out;
+    }
 }
 
 JNIEXPORT jint JNICALL

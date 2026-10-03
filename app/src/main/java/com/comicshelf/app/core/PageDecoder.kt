@@ -88,6 +88,12 @@ object PageDecoder {
             // Power-of-two subsample: decode at <= 2x the target, keeps zoom crisp.
             var sample = 1
             while (max(w, h) / (sample * 2) >= targetDim) sample *= 2
+            // v0.3.3 超大页像素预算：单页解码 ≤ 12MP（≈48MB ARGB）。
+            // 巨页（4535×6307 = 28.6MP）全清解码 = 114MB/张，5 张页位图就占 550MB →
+            // 整机内存紧缩（实测 lmkd 连杀后台、单页加载退化到 9s、分配卡死 60s+）。
+            // 12MP（本机 2268×3153）已覆盖 2x 捏合缩放的 1:1 像素（1080×2=2160），
+            // 仅 >2x 超高倍缩放略软——用一点锐度换稳定性。
+            while ((w.toLong() * h) / (sample.toLong() * sample) > 12_000_000L) sample *= 2
             decoder.setTargetSampleSize(sample)
             decoder.setTargetColorSpace(android.graphics.ColorSpace.get(android.graphics.ColorSpace.Named.SRGB))
             // Hardware bitmaps draw straight from GPU memory — the fast path

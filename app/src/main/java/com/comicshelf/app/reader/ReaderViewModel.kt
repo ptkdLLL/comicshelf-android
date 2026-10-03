@@ -48,18 +48,24 @@ private const val FAST_LOAD_MS = 400.0
 private const val MAX_LOAD_ATTEMPTS = 2
 /** 失败计数窗口：超过 30s 未再失败则重新计数（避免长会话里旧失败永久封死该页）。 */
 private const val RETRY_WINDOW_MS = 30_000L
+/** v0.3.3：单次加载超过 20s 未返回视为卡死——允许重新排队（旧任务跑完自行清理）。 */
+private const val STUCK_LOAD_MS = 20_000L
 
 class ReaderViewModel : ViewModel() {
 
     val open = MutableStateFlow(ReaderOpenState())
     val prefs = MutableStateFlow(ReaderPrefs())
-    /** page -> decoded original page (bounded LRU by bytes). */
-    private val pageCache = object : LruCache<Int, Bitmap>(24) {
-        override fun sizeOf(key: Int, value: Bitmap): Int = 1
+    /** page -> decoded original page。v0.3.3：按**字节数**封顶（160MB）。
+     *  之前是"24 张"计数封顶——巨页 28.6MB/张时可吃 690MB，实测导致整机内存紧缩。
+     *  160MB 恰好容纳大页模式的整个 Compose 窗口（±2 = 5 张 × 28.6MB）。 */
+    private val pageCache = object : LruCache<Int, Bitmap>(160 * 1024) {
+        override fun sizeOf(key: Int, value: Bitmap): Int =
+            (value.byteCount / 1024).coerceAtLeast(1)   // 防御：sizeOf 必须 >0（极小位图）
     }
-    /** page -> translated overlay bitmap (sidecar engine, RAM only). */
-    private val trCache = object : LruCache<Int, Bitmap>(8) {
-        override fun sizeOf(key: Int, value: Bitmap): Int = 1
+    /** page -> translated overlay bitmap (sidecar engine, RAM only)，同样按字节封顶（64MB）。 */
+    private val trCache = object : LruCache<Int, Bitmap>(64 * 1024) {
+        override fun sizeOf(key: Int, value: Bitmap): Int =
+            (value.byteCount / 1024).coerceAtLeast(1)
     }
     val trStates = MutableStateFlow<Map<Int, TranslatePageState>>(emptyMap())
 
@@ -76,8 +82,9 @@ class ReaderViewModel : ViewModel() {
 
     // ---- v0.3.2 页加载去重 / 自适应门控状态 ----
     private class LoadAttempt(var n: Int, var at: Long)
-    /** (bookId,page) 正在解码中——杜绝同一页被重组风暴重复入队（自激队列根因）。 */
-    private val loadsInFlight = HashSet<Pair<Long, Int>>()
+    /** (bookId,page) -> 本次加载的启动时刻——杜绝同一页被重组风暴重复入队（自激队列根因）。
+     *  v0.3.3：改为记时间戳，>STUCK_LOAD_MS 判卡死、允许重排（幂等去重 + 自愈兼顾）。 */
+    private val loadsInFlight = HashMap<Pair<Long, Int>, Long>()
     /** (bookId,page) -> 失败次数（仅在解码返回 null 时累计）。 */
     private val loadAttempts = HashMap<Pair<Long, Int>, LoadAttempt>()
     /** 连续慢页达到 2 页 → 进入大页模式：只为当前页加载，不再预取邻居。 */
@@ -86,6 +93,8 @@ class ReaderViewModel : ViewModel() {
     private var fastStreak = 0
     /** 本次开书以来已完成的加载数；前 2 页不计入门控（首开含 SMB 建连开销，不代表稳态）。 */
     private var loadsDone = 0
+    /** v0.3.3：大页模式"读一页预取下一页"的定时任务（只保留最后一个）。 */
+    private var prefetchJob: Job? = null
 
     init {
         // backend 模式：后台队列每落档一页 → 若正是可见页则立即渲染显示
@@ -111,6 +120,27 @@ class ReaderViewModel : ViewModel() {
                     else -> cur
                 }
                 if (new != null && new != cur) trStates.value = trStates.value + (vis to new)
+            }
+        }
+        // v0.3.4 安全网：每 5s 巡检"可见页既无缓存、又无在途加载"的真空态
+        //（= 没有任何路径会再加载它，转圈将永不结束）。根因已在 goto() 修复；
+        // 此网兜住未来任何新增"当前页变更"入口的遗漏。
+        viewModelScope.launch(Dispatchers.Default) {
+            while (true) {
+                delay(5000)
+                val st = open.value
+                if (st.bookId == 0L || st.pageCount <= 0) continue
+                val vis = st.page
+                if (pageAt(vis) != null) continue
+                val infl = synchronized(loadsInFlight) {
+                    loadsInFlight.entries.map { (k, v) ->
+                        "p${k.second}:${(System.currentTimeMillis() - v) / 1000}s"
+                    }
+                }
+                if (infl.isEmpty()) {
+                    Log.w("Reader", "真空自愈：page=$vis 无缓存且无在途（big=$bigPageMode）→ 补发 ensurePage")
+                    ensurePage(vis)
+                }
             }
         }
     }
@@ -176,12 +206,14 @@ class ReaderViewModel : ViewModel() {
         open.value = ReaderOpenState()
     }
 
-    /** v0.3.2：清空门控/重试状态（loadsInFlight 不清理——在途任务自行移除，避免重复触发去重空洞）。 */
+    /** v0.3.2：清空门控/重试状态（loadsInFlight 不清理——在途任务自行移除，避免重复触发去重空洞）。
+     *  v0.3.3：一并取消待执行的邻页预取。 */
     private fun resetLoadGating() {
         bigPageMode = false
         slowStreak = 0
         fastStreak = 0
         loadsDone = 0
+        prefetchJob?.cancel()
         synchronized(loadAttempts) { loadAttempts.clear() }
     }
 
@@ -209,14 +241,22 @@ class ReaderViewModel : ViewModel() {
      *     （巨页包下预取会把单会话 SMB 队列堵死；连续 3 页 < 0.4s 自动退出）；
      *  3) 失败重试上限：解码返回 null 最多 bump revision 重试 MAX_LOAD_ATTEMPTS 次，
      *     30s 窗口后计数重置；超出则放弃并留日志（防止无限重试队列）。
+     *
+     * v0.3.3：
+     *  4) 卡死自愈：同一页在途超过 STUCK_LOAD_MS(20s) 视为卡死 → 允许重新排队
+     *     （实测巨页 114MB 分配在内存紧缩下会卡死 60s+；旧任务跑完用时间戳守卫
+     *      自行清理，不会误删新任务的在途标记）；
+     *  5) [allowAhead]：仅供"读一页预取下一页"内部通道使用（大页模式下预取 +1 页）。
      */
-    fun ensurePage(page: Int) {
+    fun ensurePage(page: Int) = ensurePageInner(page, allowAhead = false)
+
+    private fun ensurePageInner(page: Int, allowAhead: Boolean) {
         val st = open.value
         if (page !in 0 until st.pageCount) return
         val key = st.bookId to page
         if (pageAt(page) == null) {
-            // 大页模式下不给窗口外的页加载（在途任务跑完自然入缓存，不做取消）。
-            if (bigPageMode && page != st.page) {
+            // 大页模式下不给窗口外的页加载（allowAhead 通道除外：仅 +1 预取）。
+            if (bigPageMode && page != st.page && !allowAhead) {
                 maybeTranslateOnDevice(page, prefetchOnly = true)
                 return
             }
@@ -229,12 +269,20 @@ class ReaderViewModel : ViewModel() {
                 maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
                 return
             }
-            synchronized(loadsInFlight) {
-                if (!loadsInFlight.add(key)) {
+            val start = synchronized(loadsInFlight) {
+                val started = loadsInFlight[key]
+                if (started != null && now - started < STUCK_LOAD_MS) {
                     maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
                     return
                 }
+                if (started != null) {
+                    Log.w("Reader", "page $page 上一次加载 ${(now - started) / 1000}s 未返回，" +
+                        "视为卡死，重新排队（旧任务跑完自行清理）")
+                }
+                loadsInFlight[key] = now
+                now
             }
+            Log.i("Reader", "load start page=$page" + (if (allowAhead) " (prefetch)" else ""))
             viewModelScope.launch(Dispatchers.IO) {
                 val t0 = System.nanoTime()
                 var ok = false
@@ -250,12 +298,17 @@ class ReaderViewModel : ViewModel() {
                 } catch (e: Throwable) {
                     Log.w("Reader", "page $page load failed: $e")
                 } finally {
-                    synchronized(loadsInFlight) { loadsInFlight.remove(key) }
+                    synchronized(loadsInFlight) {
+                        // 时间戳守卫：卡死重排后旧任务的 finally 不能误删新任务的在途标记
+                        if (loadsInFlight[key] == start) loadsInFlight.remove(key)
+                    }
                     val ms = (System.nanoTime() - t0) / 1e6
                     lastFlipMs = ms
                     if (ok) {
                         Log.i("Reader", "page $page loaded in $ms ms")
                         onLoadTiming(ms)
+                        // v0.3.3：大页模式下，用户若停在这一页读，预取下一页
+                        if (bigPageMode) scheduleNeighborPrefetch(st.bookId, page)
                     } else {
                         val n = synchronized(loadAttempts) {
                             val fa = loadAttempts.getOrPut(key) { LoadAttempt(0, now) }
@@ -272,6 +325,23 @@ class ReaderViewModel : ViewModel() {
             }
         }
         maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
+    }
+
+    /**
+     * v0.3.3 大页模式"读一页预取下一页"：当前页落地 600ms 后，若用户仍停在它上面
+     * （= 在读，而非连翻走）→ 预取 +1 页（仅一页，不链式扩散——只有 +1 页真正成为
+     * 当前页时，它的落地才会再触发下一次预取）。
+     */
+    private fun scheduleNeighborPrefetch(bookId: Long, page: Int) {
+        prefetchJob?.cancel()
+        prefetchJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(600)
+            val cur = open.value
+            if (cur.bookId != bookId || cur.page != page) return@launch
+            val next = page + 1
+            if (next >= cur.pageCount || pageAt(next) != null) return@launch
+            ensurePageInner(next, allowAhead = true)
+        }
     }
 
     /** 自适应门控：慢 → 进大页模式（只保当前页）；快 → 退出门控恢复预取。 */
@@ -403,6 +473,10 @@ class ReaderViewModel : ViewModel() {
             }
         }
         maybeTranslateOnDevice(page, prefetchOnly = false)
+        // v0.3.4 修复（真空卡死根因）：goto 是"当前页变更"的统一入口，必须由它保证
+        // "当前页有加载在途或已缓存"这一状态不变量。此前加载触发依赖 UI 偶发事件
+        // （页项组合时或 pager 落定 else 分支），快滑场景两条都不满足 → 页永不加载。
+        ensurePage(page)
     }
 
     fun setPrefs(p: ReaderPrefs) {

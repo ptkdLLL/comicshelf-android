@@ -48,10 +48,17 @@ bool smb_list_shares(const std::string&, const std::string&, const std::string&,
 extern "C" void smb2_free_data(struct smb2_context* smb2, void* ptr);
 
 #include "vfs/smb_watch.h"
+#include "vfs/stall_watch.h"
 
 #include <atomic>
+#include <csignal>
+#include <dlfcn.h>
+#include <unwind.h>
 #include <sys/select.h>
+#include <unistd.h>
+#include <android/log.h>
 #include <thread>
+#include <unordered_map>
 
 namespace cs::vfs {
 namespace {
@@ -103,6 +110,7 @@ std::string norm_path(const std::string& p) {
     return "/" + p;
 }
 
+
 struct SmbSession {
     smb2_context* ctx = nullptr;
     std::mutex mtx;       // 一个 libsmb2 上下文不可并发使用
@@ -113,7 +121,7 @@ using SessionPtr = std::shared_ptr<SmbSession>;
 
 class SmbPool {
 public:
-    explicit SmbPool(SmbConfig cfg) : cfg_(std::move(cfg)) {}
+    explicit SmbPool(SmbConfig cfg) : cfg_(std::move(cfg)) { smbwatch::ensure_watchdog(); }
 
     ~SmbPool() {
         std::lock_guard<std::mutex> g(mtx_);
@@ -126,6 +134,7 @@ public:
 
     SessionPtr acquire(std::string* err) {
         std::unique_lock<std::mutex> lk(mtx_);
+        const int64_t t0 = now_ms();
         for (;;) {
             if (!idle_.empty()) {
                 SessionPtr s = idle_.back();
@@ -134,7 +143,9 @@ public:
                 return s;
             }
             if ((int)(idle_.size() + busy_.size()) < kMaxSessions) {
+                smbwatch::op_begin("smb connect share（新建会话）");
                 smb2_context* c = connect(&cfg_, err);
+                smbwatch::op_end();
                 if (!c) return nullptr;
                 auto s = std::make_shared<SmbSession>();
                 s->ctx = c;
@@ -145,8 +156,12 @@ public:
             if (cv_.wait_for(lk, std::chrono::milliseconds(kAcquireTimeoutMs)) ==
                 std::cv_status::timeout) {
                 if (err) *err = "SMB 会话池忙（" + std::to_string(kMaxSessions) + " 个会话全在用）";
+                log_warn("[SMB] 会话池等待超时（30s）：idle=" + std::to_string(idle_.size()) +
+                         " busy=" + std::to_string(busy_.size()));
                 return nullptr;
             }
+            if (now_ms() - t0 > 1000)
+                log_info("[SMB] 会话池等待 " + std::to_string(now_ms() - t0) + "ms 后取到会话");
         }
     }
 
@@ -165,6 +180,7 @@ public:
     }
 
     static smb2_context* connect(const SmbConfig* cfg, std::string* err) {
+        const int64_t t0 = now_ms();
         smb2_context* c = smb2_init_context();
         if (!c) {
             if (err) *err = "smb2_init_context 失败";
@@ -178,9 +194,13 @@ public:
         if (smb2_connect_share(c, cfg->host.c_str(), cfg->share.c_str(),
                                cfg->user.empty() ? nullptr : cfg->user.c_str()) < 0) {
             if (err) *err = smb_err(c);
+            log_warn("[SMB] 新建会话失败（" + std::to_string(now_ms() - t0) + "ms）: " +
+                     (err ? *err : "?"));
             smb2_destroy_context(c);
             return nullptr;
         }
+        log_info("[SMB] 新建会话成功（" + std::to_string(now_ms() - t0) + "ms）" +
+                 (now_ms() - t0 > 3000 ? " ← 慢！" : ""));
         return c;
     }
 
@@ -227,18 +247,34 @@ public:
             size_t total = 0;
             bool failed = false;
             {
+                smbwatch::op_begin("等会话锁 " + path_);   // v0.3.3d：锁等待也可被守护线程抓栈
                 std::lock_guard<std::mutex> g(session_->mtx);
+                int chunk = 0;
+                const int nchunks = (int)((len + kReadChunk - 1) / kReadChunk);
                 while (total < len) {
                     uint32_t want = (uint32_t)std::min<size_t>(len - total, kReadChunk);
+                    smbwatch::op_begin("smb2_read 第" + std::to_string(++chunk) + "/" +
+                                       std::to_string(nchunks) + "块 off=" + std::to_string(pos_ + total) +
+                                       " len=" + std::to_string(want) + " " + path_);
+                    const int64_t ct0 = now_ms();
                     int got = smb2_read(session_->ctx, fh_, buf + total, want);
+                    const int64_t cms = now_ms() - ct0;
                     if (got < 0) {
                         last_err_ = smb_err(session_->ctx);
+                        log_warn("[SMB] read 失败 chunk=" + std::to_string(chunk) + "/" +
+                                 std::to_string(nchunks) + " off=" + std::to_string(pos_ + total) +
+                                 " 耗时=" + std::to_string(cms) + "ms err=" + last_err_ + " " + path_);
                         failed = true;
                         break;
                     }
                     if (got == 0) break; // EOF
+                    if (cms > 1500)
+                        log_info("[SMB] read 慢块 " + std::to_string(cms) + "ms off=" +
+                                 std::to_string(pos_ + total) + " got=" + std::to_string(got) +
+                                 " " + path_);
                     total += (size_t)got;
                 }
+                smbwatch::op_end();
             }
             if (!failed) {
                 pos_ += total;
@@ -326,6 +362,8 @@ private:
         if (!session_) return false;
         bool ok = false, transport = false;
         {
+            const int64_t t0 = now_ms();
+            smbwatch::op_begin("smb2_open+lseek " + path_);
             std::lock_guard<std::mutex> g(session_->mtx);
             fh_ = smb2_open(session_->ctx, path_.c_str(), O_RDONLY);
             if (!fh_) {
@@ -344,6 +382,10 @@ private:
             } else {
                 ok = true;
             }
+            smbwatch::op_end();
+            if (now_ms() - t0 > 1000)
+                log_info("[SMB] open+lseek 耗时 " + std::to_string(now_ms() - t0) +
+                         "ms ok=" + std::to_string((int)ok) + " " + path_);
         }
         if (!ok) drop_session(transport);
         return ok;
@@ -740,5 +782,101 @@ std::shared_ptr<SmbWatcher> make_smb_watcher(const SmbConfig& cfg, const std::st
 }
 
 } // namespace cs::vfs
+
+// ---------------------------------------------------------------- v0.3.3d 卡死守护
+// 见 vfs/stall_watch.h：登记"当前长操作"，>12s 打日志 + SIGUSR2 自抓栈 + EINTR 自愈。
+namespace smbwatch {
+namespace {
+constexpr long long kStallCheckMs = 3000;
+constexpr long long kStallMs = 12000;
+
+struct OpRec { long long start_ms; std::string what; };
+std::mutex g_mtx;
+std::unordered_map<pid_t, OpRec> g_ops;
+std::atomic<bool> g_wd_started{false};
+std::atomic<bool> g_reported{false};   // 一轮卡死只抓一次；全部清空后重新武装
+
+long long sw_now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// SIGUSR2 处理器：在"被卡住的线程上"执行。只打裸 PC + 本 .so 基址（无 malloc），
+// 离线用 build/intermediates 里未剥离的 libcomicshelf.so 做 addr2line 还原。
+// 用 _Unwind_Backtrace（平台常驻 libunwind，API<33 也可用；backtrace() 被 INTO_33 门控）。
+struct UWCtx { void** frames; int n; int max; };
+
+_Unwind_Reason_Code uw_cb(struct _Unwind_Context* ctx, void* arg) {
+    auto* c = static_cast<UWCtx*>(arg);
+    uintptr_t ip = _Unwind_GetIP(ctx);
+    if (ip && c->n < c->max) c->frames[c->n++] = (void*)ip;
+    return _URC_NO_REASON;
+}
+
+void stack_handler(int) {
+    void* frames[48];
+    UWCtx ctx{frames, 0, 48};
+    _Unwind_Backtrace(uw_cb, &ctx);
+    Dl_info info{};
+    void* base = nullptr;
+    if (dladdr((void*)&stack_handler, &info)) base = info.dli_fbase;
+    pid_t tid = gettid();
+    // 拼成一行多帧，减少日志行数（logcat 单行上限远大于此）
+    char line[48 * 20 + 80];
+    int off = snprintf(line, sizeof line, "FRAMES tid=%d so_base=%p |", (int)tid, base);
+    for (int i = 0; i < ctx.n && off < (int)sizeof line - 24; i++)
+        off += snprintf(line + off, sizeof line - off, " %p", frames[i]);
+    __android_log_print(ANDROID_LOG_ERROR, "CS_STALL", "%s", line);
+}
+
+void watchdog_loop() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kStallCheckMs));
+        std::vector<std::pair<long long, std::pair<pid_t, std::string>>> stale;
+        {
+            std::lock_guard<std::mutex> g(g_mtx);
+            long long t = sw_now_ms();
+            for (auto& kv : g_ops) {
+                long long age = t - kv.second.start_ms;
+                if (age > kStallMs) stale.push_back({age, {kv.first, kv.second.what}});
+            }
+        }
+        if (stale.empty()) { g_reported = false; continue; }
+        if (g_reported) continue;
+        g_reported = true;
+        for (auto& it : stale)
+            cs::log_warn("[CS_STALL] 线程 " + std::to_string((int)it.second.first) +
+                     " 卡在「" + it.second.second + "」已 " +
+                     std::to_string(it.first / 1000) + "s → 抓栈并中断(EINTR 自愈)");
+        for (auto& it : stale)
+            pthread_kill(it.second.first, SIGUSR2);
+    }
+}
+} // namespace
+
+void ensure_watchdog() {
+    if (g_wd_started.exchange(true)) return;
+    struct sigaction sa{};
+    sa.sa_handler = stack_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;   // 不设 SA_RESTART：让 poll() 得到 EINTR（这是自愈的一部分）
+    sigaction(SIGUSR2, &sa, nullptr);
+    std::thread(watchdog_loop).detach();
+    cs::log_info("stall watchdog 已启动（12s 阈值，SIGUSR2 抓栈）");
+}
+
+void op_begin(const std::string& what) {
+    pid_t tid = gettid();
+    std::lock_guard<std::mutex> g(g_mtx);
+    g_ops[tid] = OpRec{sw_now_ms(), what};
+}
+
+void op_end() {
+    pid_t tid = gettid();
+    std::lock_guard<std::mutex> g(g_mtx);
+    g_ops.erase(tid);
+}
+} // namespace smbwatch
+
 
 #endif // CS_HAS_SMB2
