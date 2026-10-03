@@ -355,7 +355,7 @@ cs_backend/
 - **`llama-cpp-python` 降级档未实测翻译质量**：chat 模板按 GGUF 元数据；以 `llama-server` 为准。
 
 **后续可选**
-- **剥离端侧推理遗骸**：App 的 `libcomicshelf.so`(142MB) 仍静态编入 llama.cpp，APK 还带 QNN 四件套(12MB)+onnxruntime(17MB)——端侧模型已删，属死重。剥离后可给 APK 瘦身 ~30-60MB、加快构建，并释放 `task37/deps/llama.cpp`(913MB)。
+- **剥离端侧推理遗骸（App 侧）**：`libcomicshelf.so` 静态编入的 llama.cpp 与 QNN/onnxruntime 运行库属死重（端侧路径已弃用，见 App 侧说明）；剥离后可给 APK 瘦身、加快构建。
 - `POST /translate_page`：把 BT Sakura 阶梯搬到服务端（payload/重复检测/两级阶梯照 `trans_sakura.py` 移植），实现**离线整本预翻译**（不依赖 App 常驻）；App 侧阶梯保留为另一传输路径。
 - 缓存 LRU/上限 + `/stats`。
 - 开机自启模板（systemd unit / launchd plist / Win 任务计划）。
@@ -366,8 +366,11 @@ cs_backend/
 
 ## 附：相关文档
 
-- 端侧/后端全景、BT 机制移植实录与全部真机数据：
-  `task37/ComicShelfAndroid/docs/BALLOONTRANSLATOR_WORKFLOW.md`（附录 F/G/G2/G4/G5）
-- 全过程时间线复盘、踩坑归因与方法论（M1-M10）：
-  `task37/ComicShelfAndroid/docs/PROJECT_RETROSPECTIVE.md`
-- BT 参考实现：`本地 BT 参考实现（未随仓库分发）`（`ballontranslator/modules/textdetector/detector_ctbd.py`、`…/ocr/ocr_paddleVL_manga.py`、`…/translators/trans_sakura.py`；管线移植的对照来源。模型已拷入本目录 `models/`，服务运行不依赖它）
+- 全过程复盘与方法论（时间线 P0~P15 / 踩坑归因 / M1-M13）：`ComicShelfAndroid/docs/PROJECT_RETROSPECTIVE.md`；
+  端侧/后端全景、BT 机制移植实录与全部真机数据：`ComicShelfAndroid/docs/BALLOONTRANSLATOR_WORKFLOW.md`
+  （附录 F/G/G2/G4/G5）。（`docs/` 为本地开发文档，**未随本仓库分发**。）
+- 翻译机制（BT Sakura 两级阶梯/重复检测/引号剥离）的移植说明与理由，见 App 侧
+  `app/src/main/java/com/comicshelf/app/reader/OnDeviceTranslator.kt`（顶层注释与阶梯实现）。
+- 参考实现（上游 BalloonTranslator，GPL-3.0）：`modules/textdetector/detector_ctbd.py`、
+  `modules/ocr/ocr_paddleVL_manga.py`、`modules/translators/trans_sakura.py` —— 本后端管线与
+  App 侧翻译机制的移植对照来源；模型由 `fetch_models.py` 从 HuggingFace 下载，运行不依赖上游仓库。
