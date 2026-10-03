@@ -198,7 +198,8 @@ target_link_libraries(cs_core PUBLIC cs_sqlite3 cs_miniz cs_stb log)
 # 少任何一半，image_util_webp.cpp / image_util_avif.cpp 都会走
 # “永远返回 false”的桩——Android 上所有 webp/avif 图会静默解码失败。
 if(CS_HAS_WEBP)
-    target_link_libraries(cs_core PUBLIC webp)
+    # webpdemux：动画 webp 取首帧（封面/预览）用
+    target_link_libraries(cs_core PUBLIC webp webpdemux)
     target_compile_definitions(cs_core PUBLIC CS_HAS_WEBP=1)
 else()
     target_compile_definitions(cs_core PUBLIC CS_HAS_WEBP=0)

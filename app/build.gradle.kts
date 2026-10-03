@@ -15,8 +15,8 @@ android {
         applicationId = "com.comicshelf.app"
         minSdk = 30
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.3.0-android"
+        versionCode = 2
+        versionName = "0.3.1-android"
 
         externalNativeBuild {
             cmake {
