@@ -9,6 +9,7 @@
 |---|---|
 | 全新机器部署 | 把 `cs-deploy\` 整个文件夹（连同 `comicshelf-android\` 仓库，见下）拷过去，双击 `deploy.bat` |
 | 日常启停 | 部署完成后用 `backend\` 里生成的 `start-backend.bat` / `stop-backend.bat` / `status-backend.bat` / `logs-backend.bat` |
+| 日常启动（推荐，可见窗口） | 双击本目录 `start-service.bat`——自动清理旧后端进程、开两个**可见**窗口（llama :8080 / cs-backend :8787），**关窗即停**；兜底强停 `stop-service.bat` |
 | 中断后续跑 | 再次双击 `deploy.bat`——已完成的阶段自动跳过，下载断点续传 |
 | 防火墙 | **默认自动放行入站 8787**（幂等：已有规则不重复加；非管理员时弹一次 UAC，拒绝则打印手动命令）。手机/内网设备即可直连 |
 
@@ -19,6 +20,15 @@
 - `-NoFirewall` 不动防火墙（内网设备将无法连入，需自行放行）
 
 部署完成时会在结果框里**优先打印 192.168.\* 物理网段地址**作为手机 App 的推荐后端地址（其他网卡地址列为备选）。注意服务**无鉴权**，放行即对整个局域网开放，仅限可信网络使用。
+
+## 一键启动（start-service，可见窗口）
+
+部署完成后日常使用的启动器（与部署脚本相互独立）。双击 `start-service.bat`：
+
+1. **清理旧进程**：按端口（8787/8080）与 pidfile 定位旧后端进程（命令行核验为 llama-server / 本服务 uvicorn），真并发会先询问，随后确认端口已释放；
+2. **两个可见窗口**：llama-server(:8080) 与 cs-backend(:8787) 各开一个控制台窗口，日志实时可见，**关闭窗口即停止对应服务**；
+3. **手机地址**：按默认路由识别物理网卡（排除 VPN/虚拟网卡），优先 192.168.* 打印手机 App 后端地址，复制到剪贴板并保存 `PHONE-ADDRESS.txt`；
+4. 等待 `/health` 通过后打印 RUNNING 横幅；`stop-service.bat` 按端口兜底强停。
 
 ## 仓库代码来源
 
@@ -77,7 +87,8 @@ $script:LlamaZips = @("llama-<tag>-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin
 ```
 cs-deploy\
 ├── deploy.bat    ← 双击这个
-├── deploy.ps1    ← 全部逻辑（纯英文注释，防 PS 5.1 ANSI 解析乱码）
+├── deploy.ps1    ← 部署全部逻辑（纯英文注释，防 PS 5.1 ANSI 解析乱码）
+├── start-service.bat / start-service.ps1 / stop-service.bat  ← 日常一键启动（可见窗口，关窗即停）
 └── README.md     ← 本文件
 运行时产物（自动生成）:
   cs-deploy\.deploy.lock            并发锁（正常退出自动删除；被中断遗留的锁下次运行
