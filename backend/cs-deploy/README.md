@@ -20,17 +20,16 @@
 
 部署完成时会在结果框里**优先打印 192.168.\* 物理网段地址**作为手机 App 的推荐后端地址（其他网卡地址列为备选）。注意服务**无鉴权**，放行即对整个局域网开放，仅限可信网络使用。
 
-## 仓库代码来源与分发形态（重要）
+## 仓库代码来源
 
 脚本按以下顺序找仓库（认 `deploy.py` 所在目录）：
 
 1. 脚本同目录 / 父目录下的 `comicshelf-android\backend` 或 `backend`
-2. 都没有 → 自动经 ghproxy 加速链下载 GitHub 仓库 zip 并解压（**要求上游仓库可公开访问**）
+2. 都没有 → 自动经 ghproxy 加速链下载 GitHub 仓库 zip 并解压
 
-**分发要求：源码随包。** 当前上游仓库不可公开访问，第 2 条兜底必然失败——
-分发时请把 `comicshelf-android\` 整个文件夹与 `cs-deploy\` **放在同一目录一起拷贝**
-（或把 `cs-deploy\` 放进仓库内任意位置），脚本命中第 1 条，其余阶段照常。
-这是设计内的分发形态，**无需修改任何代码**。
+**注意**：上游仓库若为私有/已删除（2026-10-03 实测 `ptkdLLL/comicshelf-android` 已
+无法公开访问），自动下载会失败并提示——此时把已有的 `comicshelf-android\` 文件夹
+放在 `deploy.bat` 旁边即可，其余阶段照常。
 
 ## 七个阶段（全部幂等）
 
@@ -81,7 +80,8 @@ cs-deploy\
 ├── deploy.ps1    ← 全部逻辑（纯英文注释，防 PS 5.1 ANSI 解析乱码）
 └── README.md     ← 本文件
 运行时产物（自动生成）:
-  cs-deploy\.deploy.lock            并发锁（正常退出自动删除）
+  cs-deploy\.deploy.lock            并发锁（正常退出自动删除；被中断遗留的锁下次运行
+                                    会按 PID 存活检测自动清掉，无需手动删）
   backend\venv\ models\ bin\        venv(4.7G) / 模型(3.1G) / llama 二进制(1.2G)
   backend\{start|stop|status|logs}-backend.bat   日常运维双击入口
 ```

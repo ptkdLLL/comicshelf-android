@@ -131,9 +131,23 @@ else { Ok 'no registry system proxy' }
 
 $lockPath = Join-Path $script:Root '.deploy.lock'
 if (Test-Path $lockPath) {
-    $age = ((Get-Date) - (Get-Item $lockPath).LastWriteTime).TotalHours
-    if ($age -lt 6) { Die "another deploy seems running (lock < 6h old): $lockPath. If not, delete it and retry." }
-    Warn 'stale lock (>6h) removed'
+    # self-healing lock: block ONLY when the recorded PID is alive AND is actually
+    # running deploy.ps1. A previous run killed by window-close / logout / power
+    # loss leaves the file behind; time-based staleness would wrongly block for
+    # hours, so we verify process liveness instead of trusting the timestamp.
+    $oldPid = 0
+    try { $first = Get-Content $lockPath -TotalCount 1 -ErrorAction Stop; if ($first -match '^pid=(\d+)') { $oldPid = [int]$Matches[1] } } catch {}
+    $live = $false
+    if ($oldPid -gt 0) {
+        try {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $oldPid" -ErrorAction Stop
+            if ($proc -and ("$($proc.CommandLine)" -match 'deploy\.ps1')) { $live = $true }
+        } catch {}
+    }
+    if ($live) {
+        Die "another deploy (pid $oldPid) is running right now. close that window first, or delete $lockPath"
+    }
+    Warn "stale lock removed (recorded pid $oldPid is no longer running deploy): $lockPath"
     Remove-Item $lockPath -Force
 }
 Set-Content -Path $lockPath -Value ("pid=" + $PID + " time=" + (Get-Date -Format s))
