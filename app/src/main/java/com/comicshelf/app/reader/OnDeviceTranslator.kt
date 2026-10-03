@@ -48,9 +48,9 @@ object OnDeviceTranslator {
         "你是一个轻小说翻译模型，可以流畅通顺地以日本轻小说的风格将日文翻译成简体中文，" +
         "并联系上下文正确使用人称代词，不擅自添加原文中没有的代词。"
 
-    /** backend 模式（局域网后端）默认地址：cs-backend（检测+OCR 在服务机，翻译转发 llama-server）。
-     *  adb reverse 时可用 http://127.0.0.1:8787；Wi-Fi 直连用服务机的局域网 IP（以下为占位示例）。 */
-    const val DEFAULT_BACKEND = "http://192.168.1.100:8787"
+    /** backend 模式（局域网后端）默认地址：留空 = 未配置（不会误连占位 IP）。
+     *  用户在设置页填写：Wi-Fi 直连填服务机的局域网 IP:8787；USB 用 adb reverse tcp:8787 后填 http://127.0.0.1:8787。 */
+    const val DEFAULT_BACKEND = ""
 
     private var initialized = false
     private var ort = false
@@ -1507,6 +1507,10 @@ object OnDeviceTranslator {
     private suspend fun backendCore(page: Bitmap, fresh: Boolean): BackendPage? =
         withContext(Dispatchers.Default) {
         val url = backendUrl()
+        if (url.isEmpty()) {
+            Log.w("OnDeviceTr", "backend_url 未配置：请在 设置 → 翻译 → 后端地址 填写服务机 IP:8787")
+            return@withContext null
+        }
         val t0 = System.nanoTime()
         val png = withContext(Dispatchers.IO) {
             java.io.ByteArrayOutputStream(1 shl 21).use { bo ->

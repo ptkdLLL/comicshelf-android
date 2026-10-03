@@ -351,6 +351,7 @@ private fun TranslateSection() {
         var bHealth by remember { mutableStateOf<String?>(null) }
         OutlinedTextField(bUrl, { bUrl = it },
                           label = { Text("后端地址 http://Mac-IP:8787 (adb reverse 可用 127.0.0.1)") },
+                          placeholder = { Text("未配置") },
                           singleLine = true, modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
         Row {
@@ -362,8 +363,11 @@ private fun TranslateSection() {
             Button(onClick = {
                 scope.launch {
                     bHealth = withContext(Dispatchers.IO) {
-                        try {
-                            val conn = java.net.URL(bUrl.trim().trimEnd('/') + "/health")
+                        val u = bUrl.trim().trimEnd('/')
+                        if (u.isEmpty()) {
+                            "请先填写后端地址（Mac 的局域网 IP:8787；USB 可用 adb reverse tcp:8787 后填 http://127.0.0.1:8787）"
+                        } else try {
+                            val conn = java.net.URL(u + "/health")
                                 .openConnection() as java.net.HttpURLConnection
                             conn.connectTimeout = 3000
                             conn.readTimeout = 3000

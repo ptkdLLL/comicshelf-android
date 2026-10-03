@@ -39,6 +39,16 @@ data class ReaderOpenState(
 
 enum class TranslatePageState { NONE, QUEUED, BUSY, READY, FAILED }
 
+// ---- v0.3.2 自适应页加载门控（阈值见 docs/PROJECT_RETROSPECTIVE.md §2.8）----
+/** 单页解码耗时 > 1.0s 计一次"慢"（大页包/慢网）。 */
+private const val SLOW_LOAD_MS = 1000.0
+/** 单页解码耗时 < 0.4s 计一次"快"；0.4~1.0s 为死区，不改变判定。 */
+private const val FAST_LOAD_MS = 400.0
+/** 一张 (bookId,page) 最多自动重试次数（加载失败时 bump revision 重触发）。 */
+private const val MAX_LOAD_ATTEMPTS = 2
+/** 失败计数窗口：超过 30s 未再失败则重新计数（避免长会话里旧失败永久封死该页）。 */
+private const val RETRY_WINDOW_MS = 30_000L
+
 class ReaderViewModel : ViewModel() {
 
     val open = MutableStateFlow(ReaderOpenState())
@@ -63,6 +73,19 @@ class ReaderViewModel : ViewModel() {
     private var targetDim = 2048
 
     var lastFlipMs = 0.0
+
+    // ---- v0.3.2 页加载去重 / 自适应门控状态 ----
+    private class LoadAttempt(var n: Int, var at: Long)
+    /** (bookId,page) 正在解码中——杜绝同一页被重组风暴重复入队（自激队列根因）。 */
+    private val loadsInFlight = HashSet<Pair<Long, Int>>()
+    /** (bookId,page) -> 失败次数（仅在解码返回 null 时累计）。 */
+    private val loadAttempts = HashMap<Pair<Long, Int>, LoadAttempt>()
+    /** 连续慢页达到 2 页 → 进入大页模式：只为当前页加载，不再预取邻居。 */
+    private var bigPageMode = false
+    private var slowStreak = 0
+    private var fastStreak = 0
+    /** 本次开书以来已完成的加载数；前 2 页不计入门控（首开含 SMB 建连开销，不代表稳态）。 */
+    private var loadsDone = 0
 
     init {
         // backend 模式：后台队列每落档一页 → 若正是可见页则立即渲染显示
@@ -97,6 +120,7 @@ class ReaderViewModel : ViewModel() {
     fun openBook(bookId: Long, title: String, forceTranslate: Boolean) {
         viewModelScope.launch(CoreDispatcher) {
             val info = NativeBridge.readerOpen(bookId) ?: return@launch
+            resetLoadGating()
             val pageCount = info[0]
             val lastPage = info[1]
             prefs.value = ReaderPrefs(
@@ -148,7 +172,17 @@ class ReaderViewModel : ViewModel() {
         pollJob?.cancel()
         synchronized(pageCache) { pageCache.evictAll() }
         synchronized(trCache) { trCache.evictAll() }
+        resetLoadGating()
         open.value = ReaderOpenState()
+    }
+
+    /** v0.3.2：清空门控/重试状态（loadsInFlight 不清理——在途任务自行移除，避免重复触发去重空洞）。 */
+    private fun resetLoadGating() {
+        bigPageMode = false
+        slowStreak = 0
+        fastStreak = 0
+        loadsDone = 0
+        synchronized(loadAttempts) { loadAttempts.clear() }
     }
 
     override fun onCleared() {
@@ -168,23 +202,100 @@ class ReaderViewModel : ViewModel() {
      * Loads [page] (and neighbors) if missing. Called from LaunchedEffect of
      * every composed reader item — Compose's beyond-bounds composition acts
      * as the prefetch window, exactly like the C++ preload of the Windows UI.
+     *
+     * v0.3.2 修复（翻页冻结根因：重组风暴 → 重复入队 → 自激队列）：
+     *  1) (bookId,page) 去重：已在途的页直接跳过，不再重复 launch；
+     *  2) 大页模式：连续 2 页 > 1.0s 后只加载当前页，不再预取邻居
+     *     （巨页包下预取会把单会话 SMB 队列堵死；连续 3 页 < 0.4s 自动退出）；
+     *  3) 失败重试上限：解码返回 null 最多 bump revision 重试 MAX_LOAD_ATTEMPTS 次，
+     *     30s 窗口后计数重置；超出则放弃并留日志（防止无限重试队列）。
      */
     fun ensurePage(page: Int) {
-        if (page !in 0 until open.value.pageCount) return
-        val had = pageAt(page) != null
-        if (!had) {
+        val st = open.value
+        if (page !in 0 until st.pageCount) return
+        val key = st.bookId to page
+        if (pageAt(page) == null) {
+            // 大页模式下不给窗口外的页加载（在途任务跑完自然入缓存，不做取消）。
+            if (bigPageMode && page != st.page) {
+                maybeTranslateOnDevice(page, prefetchOnly = true)
+                return
+            }
+            val now = System.currentTimeMillis()
+            val fail = synchronized(loadAttempts) {
+                val fa = loadAttempts[key]
+                if (fa != null && now - fa.at > RETRY_WINDOW_MS) { loadAttempts.remove(key); null } else fa
+            }
+            if (fail != null && fail.n >= MAX_LOAD_ATTEMPTS) {
+                maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
+                return
+            }
+            synchronized(loadsInFlight) {
+                if (!loadsInFlight.add(key)) {
+                    maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
+                    return
+                }
+            }
             viewModelScope.launch(Dispatchers.IO) {
                 val t0 = System.nanoTime()
-                val bmp = PageDecoder.decode(open.value.bookId, page, targetDim)
-                if (bmp != null) {
-                    synchronized(pageCache) { pageCache.put(page, bmp) }
-                    revision.value++
-                    lastFlipMs = (System.nanoTime() - t0) / 1e6
-                    Log.d("Reader", "page $page loaded in $lastFlipMs ms")
+                var ok = false
+                try {
+                    val bmp = PageDecoder.decode(st.bookId, page, targetDim)
+                    if (bmp != null) {
+                        if (open.value.bookId == st.bookId) {      // 已切书则丢弃，避免串页
+                            synchronized(pageCache) { pageCache.put(page, bmp) }
+                            revision.value++
+                            ok = true
+                        }
+                    }
+                } catch (e: Throwable) {
+                    Log.w("Reader", "page $page load failed: $e")
+                } finally {
+                    synchronized(loadsInFlight) { loadsInFlight.remove(key) }
+                    val ms = (System.nanoTime() - t0) / 1e6
+                    lastFlipMs = ms
+                    if (ok) {
+                        Log.i("Reader", "page $page loaded in $ms ms")
+                        onLoadTiming(ms)
+                    } else {
+                        val n = synchronized(loadAttempts) {
+                            val fa = loadAttempts.getOrPut(key) { LoadAttempt(0, now) }
+                            if (now - fa.at > RETRY_WINDOW_MS) { fa.n = 0; fa.at = now }
+                            fa.n++; fa.at = System.currentTimeMillis(); fa.n
+                        }
+                        Log.w("Reader", "page $page load failed (attempt $n/$MAX_LOAD_ATTEMPTS) in $ms ms")
+                        if (n < MAX_LOAD_ATTEMPTS &&
+                            open.value.bookId == st.bookId && pageAt(page) == null) {
+                            revision.value++   // 触发订阅者重试（有上限）
+                        }
+                    }
                 }
             }
         }
-        maybeTranslateOnDevice(page, prefetchOnly = page != open.value.page)
+        maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
+    }
+
+    /** 自适应门控：慢 → 进大页模式（只保当前页）；快 → 退出门控恢复预取。 */
+    private fun onLoadTiming(ms: Double) {
+        if (loadsDone < 2) { loadsDone++; return }   // 前两页含建连开销，不计入
+        loadsDone++
+        when {
+            ms > SLOW_LOAD_MS -> {
+                slowStreak++; fastStreak = 0
+                if (!bigPageMode && slowStreak >= 2) {
+                    bigPageMode = true
+                    Log.i("Reader", "big-page mode ON (slowStreak=$slowStreak, last ${ms}ms): " +
+                        "loading current page only, prefetch paused")
+                }
+            }
+            ms < FAST_LOAD_MS -> {
+                fastStreak++; slowStreak = 0
+                if (bigPageMode && fastStreak >= 3) {
+                    bigPageMode = false
+                    Log.i("Reader", "big-page mode OFF (fastStreak=$fastStreak, last ${ms}ms): prefetch resumed")
+                }
+            }
+            else -> { slowStreak = 0; fastStreak = 0 }   // 死区：不动
+        }
     }
 
     /** Engine selection: "sidecar" (LAN service) / "ondevice" (GPU OCR + LLM) /
