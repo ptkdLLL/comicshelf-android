@@ -356,14 +356,16 @@ private fun TranslateSection() {
         Spacer(Modifier.height(8.dp))
         Row {
             Button(onClick = {
-                CsSettings.set("backend_url", bUrl.trim().trimEnd('/'))
+                val norm = com.comicshelf.app.reader.OnDeviceTranslator.normalizedBackend(bUrl)
+                bUrl = norm   // 回显归一化后的值（少写 http:// 会被自动补全）
+                CsSettings.set("backend_url", norm)
                 CsSettings.save()
             }) { Text("保存后端地址") }
             Spacer(Modifier.width(8.dp))
             Button(onClick = {
                 scope.launch {
                     bHealth = withContext(Dispatchers.IO) {
-                        val u = bUrl.trim().trimEnd('/')
+                        val u = com.comicshelf.app.reader.OnDeviceTranslator.normalizedBackend(bUrl)
                         if (u.isEmpty()) {
                             "请先填写后端地址（Mac 的局域网 IP:8787；USB 可用 adb reverse tcp:8787 后填 http://127.0.0.1:8787）"
                         } else try {

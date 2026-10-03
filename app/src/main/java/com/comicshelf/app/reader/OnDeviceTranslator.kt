@@ -1488,9 +1488,20 @@ object OnDeviceTranslator {
     /** 后端档案 pipeline 前缀（服务端 /ocr_page 的 `pipeline` 字段）。换前缀=旧档失效。 */
     const val BACKEND_PIPELINE = "bt-mac"
 
+    /**
+     * v0.3.5：后端地址归一化——用户只填 `IP:端口`（少写 http://）时自动补全。
+     * 空串保持空（继续走"未配置"守卫，不产生 `http://` 这种半配置）；
+     * 显式带协议（含 `://`）则原样保留。设置页保存/测试与实际请求三处共用此函数。
+     */
+    fun normalizedBackend(raw: String): String {
+        val u = raw.trim().trimEnd('/')
+        if (u.isEmpty()) return u
+        return if (u.contains("://")) u else "http://$u"
+    }
+
     private fun backendUrl(): String =
-        runCatching { CsSettings.get("backend_url", DEFAULT_BACKEND) }
-            .getOrDefault(DEFAULT_BACKEND).trimEnd('/')
+        normalizedBackend(runCatching { CsSettings.get("backend_url", DEFAULT_BACKEND) }
+            .getOrDefault(DEFAULT_BACKEND))
 
     /** backend 一页的翻译产物。 */
     private class BackendPage(val boxes: List<Box>, val sources: List<String>,
