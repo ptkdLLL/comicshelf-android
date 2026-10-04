@@ -21,7 +21,7 @@ int64_t to_epoch(fs::file_time_type ft) {
 
 class LocalFile : public File {
 public:
-    explicit LocalFile(const std::string& p) : in_(p, std::ios::binary) {}
+    explicit LocalFile(const std::string& p) : path_(p), in_(p, std::ios::binary) {}
     bool ok() const { return (bool)in_; }
 
     int64_t read(uint8_t* buf, size_t len) override {

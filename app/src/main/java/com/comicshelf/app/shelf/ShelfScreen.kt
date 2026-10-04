@@ -93,6 +93,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.net.Uri
+import android.provider.DocumentsContract
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.interaction.DragInteraction
@@ -207,6 +211,15 @@ fun ShelfScreen(
     val trJob by BookTranslateJob.state.collectAsState()
     var removeTarget by remember { mutableStateOf<LibraryRow?>(null) }
     var showTagsDialog by remember { mutableStateOf(false) }
+
+    // L3：一次性提示（如"刚添加的库首扫 0 本"）——消费后置空，避免重组重复弹。
+    val notice by vm.notice.collectAsState()
+    LaunchedEffect(notice) {
+        notice?.let {
+            Toast.makeText(ctx, it, Toast.LENGTH_LONG).show()
+            vm.consumeNotice()
+        }
+    }
 
     if (!hasAllFilesAccess) {
         StorageGate(onOpenAllFilesAccess)
@@ -1084,29 +1097,86 @@ private fun AddLibraryDialog(
     )
 }
 
+/**
+ * SAF 目录树 URI → 本机真实绝对路径（L1/L2）。
+ * DocumentsContract.getTreeDocumentId 形如 "primary:Comics/x"（内置存储）或
+ * "1A2B-3C4D:Comics/x"（SD/OTG 卷）→ 映射 /storage/emulated/0/… 与 /storage/<卷>/…。
+ * 无法映射的位置（云盘 provider、"home:" 等）返回 null——调用方提示并保留手输通道。
+ */
+private fun treeUriToPath(uri: Uri): String? {
+    val docId = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull() ?: return null
+    val idx = docId.indexOf(':')
+    if (idx <= 0) return null
+    val vol = docId.substring(0, idx)
+    val sub = docId.substring(idx + 1).trim('/')
+    // 卷 ID：primary（内置）或 4-4 十六进制（SD/OTG，如 0000-0000 形）；其余视为不可映射
+    val base = when {
+        vol == "primary" -> "/storage/emulated/0"
+        vol.matches(Regex("^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$")) -> "/storage/$vol"
+        else -> return null
+    }
+    return if (sub.isEmpty()) base else "$base/$sub"
+}
+
 @Composable
 private fun LocalLibraryForm(onConfirm: (String) -> Unit) {
     var path by remember { mutableStateOf("/storage/emulated/0/Comics") }
+    var err by remember { mutableStateOf("") }   // L3：内联失败反馈（区分 不存在/非目录/不可读）
+    // L1：系统文件夹选择器（SAF）。只取"真实路径"交给现有扫描管道，native 零改动。
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult   // 用户取消
+        val resolved = treeUriToPath(uri)
+        if (resolved == null) {
+            err = "该位置无法映射为本机目录（可能是云盘/特殊位置），请手输路径"
+        } else {
+            path = resolved
+            err = ""
+        }
+    }
     Column {
         Text(
-            "输入漫画所在的文件夹绝对路径（可在“文件”应用中长按文件夹复制路径）：",
+            "点「浏览」从手机里选漫画文件夹（推荐）；也可以直接输入文件夹绝对路径" +
+                "（在“文件”应用中长按文件夹可复制路径）：",
             style = MaterialTheme.typography.bodySmall,
         )
         Spacer(Modifier.height(8.dp))
-        OutlinedTextField(value = path, onValueChange = { path = it },
-                          singleLine = true, label = { Text("路径") })
+        OutlinedButton(onClick = { runCatching { picker.launch(null) } },
+                       modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Filled.Folder, contentDescription = null, Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("浏览… 选择文件夹")
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(value = path, onValueChange = { path = it; err = "" },
+                          singleLine = true, label = { Text("路径") },
+                          isError = err.isNotEmpty())
+        if (err.isNotEmpty()) {
+            Text(err, style = MaterialTheme.typography.bodySmall,
+                 color = MaterialTheme.colorScheme.error)
+        }
         Spacer(Modifier.height(8.dp))
         Text("常用位置：", style = MaterialTheme.typography.labelSmall)
         listOf(
+            "/storage/emulated/0/漫画",
+            "/storage/emulated/0/Comics",
             "/storage/emulated/0/Download",
-            "/storage/emulated/0/DCIM",
             "/storage/emulated/0/Pictures",
-            "/storage/emulated/0/Documents",
         ).forEach { p ->
-            TextButton(onClick = { path = p }) { Text(p, fontSize = 12.sp) }
+            TextButton(onClick = { path = p; err = "" }) { Text(p, fontSize = 12.sp) }
         }
         Spacer(Modifier.height(8.dp))
-        Button(onClick = { if (path.isNotBlank()) onConfirm(path) }) { Text("添加并扫描") }
+        // L3：提交前轻校验，失败不再静默（此前路径打错毫无反应）
+        Button(onClick = {
+            val f = java.io.File(path.trim())
+            err = when {
+                path.isBlank() -> "请输入或选择文件夹"
+                !f.exists() -> "目录不存在：${f.absolutePath}"
+                !f.isDirectory -> "这不是文件夹：${f.absolutePath}"
+                !f.canRead() -> "目录不可读（请检查「所有文件访问」权限）"
+                else -> ""
+            }
+            if (err.isEmpty()) onConfirm(f.absolutePath)
+        }) { Text("添加并扫描") }
     }
 }
 

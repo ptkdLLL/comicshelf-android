@@ -126,6 +126,14 @@ class ShelfViewModel : ViewModel() {
     private val _scan = MutableStateFlow<ScanProgressRow?>(null)
     val scan: StateFlow<ScanProgressRow?> = _scan.asStateFlow()
 
+    /** L3：一次性用户提示（Screen 弹 Toast 后调 consumeNotice 置空）。 */
+    private val _notice = MutableStateFlow<String?>(null)
+    val notice: StateFlow<String?> = _notice.asStateFlow()
+    fun consumeNotice() { _notice.value = null }
+
+    /** L3：最近一次「添加书库」的库 id——首扫完成时用于判断是否 0 本（跨线程读写）。 */
+    @Volatile private var firstScanLibId = 0L
+
     /**
      * 书架网格的滚动状态提升到 ViewModel：进阅读器时书架会被移出组合，
      * 若状态留在 composable 里就会丢，回来时回到目录开头。放在 VM 里
@@ -228,6 +236,7 @@ class ShelfViewModel : ViewModel() {
         viewModelScope.launch(CoreDispatcher) {
             val id = NativeBridge.addLibrary(path, scan = true)
             if (id > 0) {
+                firstScanLibId = id                       // L3：等这次首扫结果
                 refreshLibraries()
                 setLibrary(id)
             }
@@ -320,6 +329,21 @@ class ShelfViewModel : ViewModel() {
                                 queryVersion.value++
                             }
                             lastSerial = serial
+                            // L3：刚添加的库首扫 0 本（空目录/无图片）→ 一次性提示。
+                            // 三重判据排除误报：仅刚添加的库 + 本扫 0 变更 + 该库 0 本书
+                            //（重复添加已有书的库、手动重扫大库都不会命中）。
+                            val fid = firstScanLibId
+                            if (fid > 0 && row.libId == fid) {
+                                firstScanLibId = 0
+                                if (row.added == 0L && row.updated == 0L && row.removed == 0L) {
+                                    val st = withContext(CoreDispatcher) {
+                                        NativeBridge.libraryStats(fid)
+                                    }
+                                    if (st != null && st.isNotEmpty() && st[0] == 0L) {
+                                        _notice.value = "该目录未发现可入库的漫画；放入文件后可手动重扫"
+                                    }
+                                }
+                            }
                         }
                         // running == true 时先不动 lastSerial，等它结束再刷新
                     } else if (!running && row.added + row.updated + row.removed > 0) {
