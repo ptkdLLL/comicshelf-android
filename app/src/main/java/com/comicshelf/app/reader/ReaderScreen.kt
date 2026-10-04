@@ -62,19 +62,23 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.comicshelf.app.core.BookmarkRow
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
@@ -106,7 +110,7 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
 
     Box(Modifier.fillMaxSize().background(bg)) {
         if (open.pageCount > 0) {
-            ReaderPager(vm, open, prefs.rtl, prefs.spread, rotation, rev,
+            ReaderPager(vm, open, prefs.rtl, prefs.spread, prefs.fit, rotation, rev,
                         onToggleChrome = { chrome = !chrome })
         } else {
             Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -177,6 +181,7 @@ private fun ReaderPager(
     open: ReaderOpenState,
     rtl: Boolean,
     spread: Boolean,
+    fit: Int,
     rotation: Int,
     rev: Int,
     onToggleChrome: () -> Unit,
@@ -221,10 +226,10 @@ private fun ReaderPager(
         ) { idx ->
             val first = idx * step
             Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center) {
-                ZoomablePage(vm, open, first, rotation, rev, rtl, onToggleChrome,
+                ZoomablePage(vm, open, first, fit, rotation, rev, rtl, onToggleChrome,
                              Modifier.weight(1f))
                 if (step == 2 && first + 1 < pageCount) {
-                    ZoomablePage(vm, open, first + 1, rotation, rev, rtl, onToggleChrome,
+                    ZoomablePage(vm, open, first + 1, fit, rotation, rev, rtl, onToggleChrome,
                                  Modifier.weight(1f))
                 }
             }
@@ -238,6 +243,7 @@ private fun ZoomablePage(
     vm: ReaderViewModel,
     open: ReaderOpenState,
     page: Int,
+    fit: Int,
     rotation: Int,
     rev: Int,
     rtl: Boolean,
@@ -262,8 +268,11 @@ private fun ZoomablePage(
     }
     val bmp = if (useTranslate) translated ?: original else original
 
-    var scale by remember(page) { mutableFloatStateOf(1f) }
-    var offset by remember(page) { mutableStateOf(Offset.Zero) }
+    // v0.4.3：适配模式/旋转也是几何输入——任一变化即重建（统一重置缩放平移）。
+    // 注意：下方两处 pointerInput 的 key 必须同步含 fit/rotation，否则手势闭包
+    // 会握旧 delegate（写旧 state、渲染读新 state 的分裂）。
+    var scale by remember(page, fit, rotation) { mutableFloatStateOf(1f) }
+    var offset by remember(page, fit, rotation) { mutableStateOf(Offset.Zero) }
     // 手势回调持有的是组合时的快照：位图加载完成后尺寸会变，必须取最新值
     // （v0.3.6 限幅修复需要"图片实际显示尺寸"，不能用旧闭包里的 bmp）。
     val bmpState = rememberUpdatedState(bmp)
@@ -273,7 +282,7 @@ private fun ZoomablePage(
             .fillMaxSize()
             // 缩放/平移手势只在“双指”或“已放大”时消费事件：
             // 单指拖动必须留给 HorizontalPager 翻页，否则滑动翻页会失效。
-            .pointerInput(page) {
+            .pointerInput(page, fit, rotation) {
                 awaitEachGesture {
                     awaitFirstDown(requireUnconsumed = false)
                     do {
@@ -288,7 +297,7 @@ private fun ZoomablePage(
                                 if (b != null) {
                                     offset = clampPan(offset.x + pan.x, offset.y + pan.y, ns,
                                                       size.width.toFloat(), size.height.toFloat(),
-                                                      b.width, b.height)
+                                                      b.width, b.height, fit, rotation)
                                 }
                             } else {
                                 offset = Offset.Zero
@@ -299,7 +308,7 @@ private fun ZoomablePage(
                     } while (event.changes.any { it.pressed })
                 }
             }
-            .pointerInput(page, rtl) {
+            .pointerInput(page, rtl, fit, rotation) {
                 detectTapGestures(
                     onTap = { pos ->
                         val third = size.width / 3f
@@ -315,7 +324,7 @@ private fun ZoomablePage(
                         offset = if (scale == 1f || b == null) Offset.Zero
                                  else clampPan(offset.x, offset.y, scale,
                                                size.width.toFloat(), size.height.toFloat(),
-                                               b.width, b.height)
+                                               b.width, b.height, fit, rotation)
                     },
                 )
             },
@@ -325,16 +334,36 @@ private fun ZoomablePage(
             Image(
                 bitmap = bmp.asImageBitmap(),
                 contentDescription = "第 ${page + 1} 页",
-                contentScale = ContentScale.Fit,
+                // 位图被拉伸到下面 layout 给出的尺寸——该尺寸 ≡ 位图 × s（等比，
+                // 保证在 layout 内），故 FillBounds 的拉伸不失真。
+                contentScale = ContentScale.FillBounds,
                 modifier = Modifier
-                    .fillMaxSize()
+                    // v0.4.3 自算布局（方案乙）：适配模式 × 旋转语义在此统一计算
+                    //（唯一公式源 fitScale）——组件尺寸即目标绘制尺寸，不经过
+                    // ContentScale 自定义路线，与 graphicsLayer 旋转无交互歧义。
+                    .layout { measurable, constraints ->
+                        val bb = bmpState.value
+                        val vw = constraints.maxWidth.toFloat()
+                        val vh = constraints.maxHeight.toFloat()
+                        var w = constraints.maxWidth
+                        var h = constraints.maxHeight
+                        if (bb != null && bb.width > 0 && bb.height > 0) {
+                            val s = fitScale(fit, rotation, vw, vh,
+                                             bb.width.toFloat(), bb.height.toFloat())
+                            w = (bb.width * s).roundToInt().coerceAtLeast(1)
+                            h = (bb.height * s).roundToInt().coerceAtLeast(1)
+                        }
+                        val p = measurable.measure(Constraints.fixed(w, h))
+                        layout(w, h) { p.place(0, 0) }
+                    }
                     .graphicsLayer {
                         scaleX = scale
                         scaleY = scale
                         translationX = offset.x
                         translationY = offset.y
                         rotationZ = rotation.toFloat()
-                    },
+                    }
+                    .clipToBounds(),
             )
         } else {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -349,17 +378,40 @@ private fun ZoomablePage(
 }
 
 /**
+ * v0.4.3 适配模式（ReaderPrefs.fit）：0 整页 / 1 宽度 / 2 高度 / 3 原始。
+ * 视觉坐标系：rotation∈{90,270} 时页面"视觉宽高"与位图宽高互换——
+ * "宽度适配"在旋转后 = 视觉宽度撑满（渲染布局与 clampPan 共用本公式，单一真相源，
+ * 杜绝两处数学漂移）。
+ */
+private fun visualDims(iw: Float, ih: Float, rot: Int): Pair<Float, Float> =
+    if (rot % 180 != 0) ih to iw else iw to ih
+
+private fun fitScale(mode: Int, rot: Int, vw: Float, vh: Float, iw: Float, ih: Float): Float {
+    if (mode == 3 || iw <= 0f || ih <= 0f) return 1f      // 原始 1:1
+    val (sw, sh) = visualDims(iw, ih, rot)
+    if (sw <= 0f || sh <= 0f) return 1f
+    return when (mode) {
+        1 -> vw / sw                                      // 宽度：视觉宽撑满
+        2 -> vh / sh                                      // 高度：视觉高撑满
+        else -> minOf(vw / sw, vh / sh)                   // 整页（旋转时按视觉几何）
+    }
+}
+
+/**
  * v0.3.6 缩放平移限幅（修复"放大后只能往一个方向平移"）：
  * graphicsLayer 默认以【中心】为变换原点 → 可平移范围必须关于 0 **对称**；
- * 且边界要按【图片实际显示尺寸】（ContentScale.Fit 之后的宽高）算，不能拿容器尺寸。
+ * 且边界要按【图片实际显示尺寸】算——v0.4.3 起 = fitScale(模式, 旋转) 后的视觉尺寸
+ *（平移在 graphicsLayer 外层作用于屏幕坐标，故按视觉几何限幅）。
  * 旧实现 `coerceIn(-容器×(ns−1), 0)` 两条都错：单边区间 + 幅值 2×（少除 2），
  * 表现为放大后只能看图片右/下侧，左/上侧永远到不了，且反方向可越界露底。
  */
 private fun clampPan(nx: Float, ny: Float, ns: Float,
-                     vw: Float, vh: Float, iw: Int, ih: Int): Offset {
-    val fit = minOf(vw / iw, vh / ih)                 // 与 ContentScale.Fit 一致
-    val halfX = maxOf(0f, (iw * fit * ns - vw) / 2f)  // 图片溢出视口部分的一半
-    val halfY = maxOf(0f, (ih * fit * ns - vh) / 2f)
+                     vw: Float, vh: Float, iw: Int, ih: Int,
+                     mode: Int, rot: Int): Offset {
+    val f = fitScale(mode, rot, vw, vh, iw.toFloat(), ih.toFloat())
+    val (sw, sh) = visualDims(iw.toFloat(), ih.toFloat(), rot)
+    val halfX = maxOf(0f, (sw * f * ns - vw) / 2f)   // 图片溢出视口部分的一半
+    val halfY = maxOf(0f, (sh * f * ns - vh) / 2f)
     return Offset(nx.coerceIn(-halfX, halfX), ny.coerceIn(-halfY, halfY))
 }
 

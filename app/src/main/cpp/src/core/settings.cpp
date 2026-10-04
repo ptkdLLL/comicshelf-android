@@ -1,5 +1,6 @@
 #include "core/settings.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -28,12 +29,20 @@ void Settings::load(const std::string& utf8_path) {
 }
 
 bool Settings::save() const {
-    std::ofstream out(path_, std::ios::binary | std::ios::trunc);
-    if (!out) return false;
-    out << "# ComicShelf settings\n";
-    for (const auto& kv : map_)
-        out << kv.first << '=' << kv.second << '\n';
-    return true;
+    // v0.4.3 原子写：先写同目录临时文件再 rename——config 内含 SMB 凭据，
+    // 直接 trunc 覆盖写若中途中断会留下半截文件（凭据丢失需重输）。
+    // rename 在同一文件系统内是原子替换；失败时原文件保持不变。
+    const std::string tmp = path_ + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out << "# ComicShelf settings\n";
+        for (const auto& kv : map_)
+            out << kv.first << '=' << kv.second << '\n';
+        out.flush();
+        if (!out) return false;
+    }
+    return std::rename(tmp.c_str(), path_.c_str()) == 0;
 }
 
 std::string Settings::get(const std::string& key, const std::string& def) const {

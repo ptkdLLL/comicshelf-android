@@ -485,6 +485,9 @@ class ReaderViewModel : ViewModel() {
         CsSettings.setBool("reader_rtl", p.rtl)
         CsSettings.setBool("reader_spread", p.spread)
         CsSettings.setInt("reader_bg", p.bg)
+        // v0.4.3：对齐设置页"改即存"（SettingsScreen 六处先例）——否则阅读器偏好
+        // 只活到进程结束，重启静默回默认（用户切了"宽度"却像没设置过）。
+        CsSettings.save()
     }
 
     // -------------------------------------------------------------- translate
