@@ -55,6 +55,7 @@ extern "C" void smb2_free_data(struct smb2_context* smb2, void* ptr);
 #include <dlfcn.h>
 #include <unwind.h>
 #include <sys/select.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <android/log.h>
 #include <thread>
@@ -849,7 +850,13 @@ void watchdog_loop() {
                      " 卡在「" + it.second.second + "」已 " +
                      std::to_string(it.first / 1000) + "s → 抓栈并中断(EINTR 自愈)");
         for (auto& it : stale)
-            pthread_kill(it.second.first, SIGUSR2);
+            // 登记的是 TID（见 op_begin 的 gettid()），必须用 tgkill 按 TID 定向发信号。
+            // 不能用 pthread_kill：它要求 pthread_t（不透明句柄），把 TID 传进去会被
+            // bionic 判为致命错误直接 abort（实测 Android 14 模拟器：离网黑洞下
+            // SMB connect 挂起 → 看门狗触发 → "invalid pthread_t passed to pthread_kill"
+            // → SIGABRT 整进程退出——v0.3.9 修复）。tgkill 对已退出的 TID 返回 ESRCH，
+            // 无害。
+            syscall(SYS_tgkill, getpid(), it.second.first, SIGUSR2);
     }
 }
 } // namespace
