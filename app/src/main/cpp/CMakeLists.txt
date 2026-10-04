@@ -191,6 +191,19 @@ add_library(cs_core STATIC ${CS_CORE_SOURCES})
 target_include_directories(cs_core PUBLIC "${SRC}")
 target_link_libraries(cs_core PUBLIC cs_sqlite3 cs_miniz cs_stb log)
 
+# ---------------------------------------------------------------- unrar (可选)
+# 同 webp/avif 纪律（见下条注释）：宏 + 链接必须成对。
+# 注意：set(CS_HAS_RAR) 只是 CMake 变量——archive_rar.cpp / archive.cpp 里判断的
+# 是**编译宏** #if CS_HAS_RAR，必须 target_compile_definitions 传下去；
+# 少了任何一半，RAR 会静默走 "RAR support not compiled in" 桩（历史缺口，
+# unrar 源码与 archive_rar.cpp 一直都在，仅缺这段接线）。
+if(CS_HAS_RAR)
+    target_link_libraries(cs_core PUBLIC cs_unrar)
+    target_compile_definitions(cs_core PUBLIC CS_HAS_RAR=1)
+else()
+    target_compile_definitions(cs_core PUBLIC CS_HAS_RAR=0)
+endif()
+
 # ---------------------------------------------------------------- 图像解码后端
 # 注意：libwebp / libavif 的 add_subdirectory 只“编库”，启用必须同时
 #   target_compile_definitions（宏——源码里是 #if CS_HAS_WEBP 判断）
