@@ -5,6 +5,10 @@
 //    dispatcher without racing LibraryManager state;
 //  * page reads / OCR long jobs run on the core ThreadPool, never blocking
 //    the caller beyond the mutex hold time.
+//  * EXCEPTION (v0.4.1): AutoSync 的 start()/stop() 含 SMB 网络操作（离线黑洞
+//    下每条连接 ~12s），只持 g_autosync_mtx、绝不持 g_bridge_mtx——否则主线程
+//    任一 JNI 调用（含首帧前的 nativeLibraries）会被堵死：这就是离线冷启动
+//    黑屏 12s 的根因。锁序恒为 g_autosync_mtx → g_bridge_mtx（无反向路径）。
 // Hot paths (paging window, cover polling, page bytes) exchange packed
 // primitive arrays instead of JSON to keep the per-call cost tiny.
 #include "core/library.h"
@@ -39,6 +43,11 @@ using namespace cs;
 namespace {
 
 std::mutex g_bridge_mtx;
+
+// v0.4.1：只用于串行化 AutoSync 生命周期（start/stop 含 SMB 网络，黑洞下 ~12s）。
+// AutoSync 自带内部锁，实例所有权唯一（g_core.autosync），本锁保证"取指针+使用"
+// 与销毁互斥。锁序恒为 g_autosync_mtx → g_bridge_mtx。
+std::mutex g_autosync_mtx;
 
 struct Core {
     std::unique_ptr<ThreadPool> pool;
@@ -218,16 +227,26 @@ Java_com_comicshelf_app_core_NativeBridge_nativeStart(JNIEnv* env, jobject, jstr
 
 JNIEXPORT void JNICALL
 Java_com_comicshelf_app_core_NativeBridge_nativeStop(JNIEnv*, jobject) {
-    std::lock_guard<std::mutex> lk(g_bridge_mtx);
-    if (!g_core.started) return;
-    g_readers.clear();
-    g_core.translator.reset();
-    if (g_core.autosync) { g_core.autosync->stop(); g_core.autosync.reset(); }
-    g_core.lib.reset(); // joins the scanner + drains the pool
-    g_core.pool.reset();
-    g_core.settings.reset();
-    g_core.started = false;
-    log_close();
+    // autosync 的 stop()（含 worker join）必须在 g_bridge_mtx 之外执行，
+    // 且必须先于 lib.reset() 完成——worker 持有 lib_ 引用（锁序 op → bridge）。
+    std::unique_ptr<AutoSync> dead;
+    {
+        std::lock_guard<std::mutex> al(g_autosync_mtx);
+        std::lock_guard<std::mutex> lk(g_bridge_mtx);
+        if (!g_core.started) return;
+        g_readers.clear();
+        g_core.translator.reset();
+        dead = std::move(g_core.autosync);   // 摘出：阻止 stop 期间的新访问
+    }
+    if (dead) dead->stop();                  // 只持 op 锁；析构时幂等再调一次
+    {
+        std::lock_guard<std::mutex> lk(g_bridge_mtx);
+        g_core.lib.reset(); // joins the scanner + drains the pool
+        g_core.pool.reset();
+        g_core.settings.reset();
+        g_core.started = false;
+        log_close();
+    }
 }
 
 // ---------------------------------------------------------------- settings
@@ -373,16 +392,32 @@ Java_com_comicshelf_app_core_NativeBridge_nativeSmbProbe(JNIEnv* env, jobject, j
 // 实时同步（SMB2 CHANGE_NOTIFY）：为所有 SMB 书库建立/停止监视
 JNIEXPORT jstring JNICALL
 Java_com_comicshelf_app_core_NativeBridge_nativeAutoSync(JNIEnv* env, jobject, jboolean on) {
-    std::lock_guard<std::mutex> lk(g_bridge_mtx);
-    if (!g_core.lib) return from_std(env, "未初始化");
+    // start()/stop() 含 SMB 网络（离线 12s/库）：只持 g_autosync_mtx，
+    // 指针管理在 g_bridge_mtx 内完成后立即释放（锁序 op → bridge）。
     if (on == JNI_TRUE) {
-        if (!g_core.autosync) g_core.autosync = std::make_unique<AutoSync>(*g_core.lib);
-        g_core.autosync->start();
-        return from_std(env, g_core.autosync->supported()
-                                 ? ("实时同步已启用（" + std::to_string(g_core.autosync->watchers()) + " 个书库）")
+        std::lock_guard<std::mutex> al(g_autosync_mtx);
+        AutoSync* as = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_bridge_mtx);
+            if (!g_core.lib) return from_std(env, "未初始化");
+            if (!g_core.autosync) g_core.autosync = std::make_unique<AutoSync>(*g_core.lib);
+            as = g_core.autosync.get();
+        }
+        as->start();                                     // 慢操作：不持 g_bridge_mtx
+        const bool sup = as->supported();
+        const int n = as->watchers();
+        return from_std(env, sup ? ("实时同步已启用（" + std::to_string(n) + " 个书库）")
                                  : "服务器不支持实时变更通知（将回退为手动扫描）");
     }
-    if (g_core.autosync) { g_core.autosync->stop(); g_core.autosync.reset(); }
+    {
+        std::lock_guard<std::mutex> al(g_autosync_mtx);
+        std::unique_ptr<AutoSync> dead;
+        {
+            std::lock_guard<std::mutex> lk(g_bridge_mtx);
+            dead = std::move(g_core.autosync);
+        }
+        if (dead) dead->stop();                          // 慢操作：不持 g_bridge_mtx
+    }
     return from_std(env, "实时同步已停止");
 }
 
@@ -390,17 +425,23 @@ Java_com_comicshelf_app_core_NativeBridge_nativeAutoSync(JNIEnv* env, jobject, j
 JNIEXPORT jstring JNICALL
 Java_com_comicshelf_app_core_NativeBridge_nativeAutoSyncStatus(JNIEnv* env, jobject,
                                                               jboolean recheck) {
-    std::lock_guard<std::mutex> lk(g_bridge_mtx);
-    if (!g_core.lib) return from_std(env, "未初始化");
-    if (recheck == JNI_TRUE) {
-        if (!g_core.autosync) g_core.autosync = std::make_unique<AutoSync>(*g_core.lib);
-        g_core.autosync->start();
-    } else if (!g_core.autosync) {
-        return from_std(env, "未启用");
+    std::lock_guard<std::mutex> al(g_autosync_mtx);      // recheck 含 start()：同 nativeAutoSync
+    AutoSync* as = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_bridge_mtx);
+        if (!g_core.lib) return from_std(env, "未初始化");
+        if (recheck == JNI_TRUE) {
+            if (!g_core.autosync) g_core.autosync = std::make_unique<AutoSync>(*g_core.lib);
+            as = g_core.autosync.get();
+        } else {
+            as = g_core.autosync.get();
+            if (!as) return from_std(env, "未启用");
+        }
     }
-    const int n = g_core.autosync->alive_count();
+    if (recheck == JNI_TRUE) as->start();                // 慢操作：不持 g_bridge_mtx
+    const int n = as->alive_count();
     if (n > 0) return from_std(env, "实时同步中（" + std::to_string(n) + " 个书库）");
-    if (g_core.autosync->watchers() > 0)
+    if (as->watchers() > 0)
         return from_std(env, "服务器不支持实时变更通知：请用“重扫”或在目录上点刷新");
     return from_std(env, "没有可监视的 SMB 书库");
 }
