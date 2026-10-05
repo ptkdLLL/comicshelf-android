@@ -43,6 +43,7 @@ import kotlinx.coroutines.withContext
 fun EhSettingsSection() {
     val scope = rememberCoroutineScope()
     val phase by EhEngine.phase.collectAsState()
+    val lastError by EhEngine.lastError.collectAsState()
 
     var customDir by remember { mutableStateOf(CsSettings.get("eh_data_dir", "")) }
     var stats by remember { mutableStateOf<LongArray?>(null) }
@@ -167,6 +168,11 @@ fun EhSettingsSection() {
             Spacer(Modifier.height(8.dp))
             Text("存储占用：$sizeText", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        lastError?.let { err ->
+            Spacer(Modifier.height(6.dp))
+            Text("上次操作失败：$err", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error)
         }
         if (note.isNotEmpty()) {
             Spacer(Modifier.height(6.dp))

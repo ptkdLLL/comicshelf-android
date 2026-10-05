@@ -29,6 +29,11 @@ object EhEngine {
     var cancelRequested = false
         private set
 
+    /** 最近一次作业失败原因（UI 诚实展示；不清空旧数据的可用性） */
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError
+    fun clearLastError() { _lastError.value = null }
+
     @Volatile
     private var busy = false
 
@@ -51,6 +56,7 @@ object EhEngine {
         if (busy) return false
         busy = true
         cancelRequested = false
+        _lastError.value = null
         exec.execute {
             try {
                 block()
@@ -58,10 +64,13 @@ object EhEngine {
                 Log.i(TAG, "$name 已取消")
             } catch (t: Throwable) {
                 Log.e(TAG, "$name 失败", t)
-                _phase.value = EhPhase.Broken("$name 失败: ${t.message}")
+                // M12 失败语义：错误经 lastError 诚实展示，但不吞掉可用性
+                _lastError.value = "$name 失败: ${t.message}"
             } finally {
                 busy = false
-                if (_phase.value !is EhPhase.Broken) refresh()
+                // 作业终结统一回落到磁盘真实状态（成功/取消/失败一致；
+                // 旧数据完好时一次失败不会让入口消失）
+                _phase.value = EhMetaManager.status()
             }
         }
         return true
