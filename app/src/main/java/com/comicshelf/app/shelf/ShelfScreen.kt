@@ -125,6 +125,7 @@ import com.comicshelf.app.core.CoreDispatcher
 import com.comicshelf.app.core.CoverStore
 import com.comicshelf.app.core.DirRow
 import com.comicshelf.app.core.Json
+import com.comicshelf.app.ehmeta.EhBookTagsPanel
 import com.comicshelf.app.core.LibraryRow
 import com.comicshelf.app.core.NativeBridge
 import com.comicshelf.app.core.parseImageBundle
@@ -141,7 +142,7 @@ import kotlinx.coroutines.Dispatchers
 import org.json.JSONArray
 import org.json.JSONObject
 
-private val coverPlaceholder = Color(0xFF232830)
+internal val coverPlaceholder = Color(0xFF232830)
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -151,6 +152,8 @@ fun ShelfScreen(
     onOpenAllFilesAccess: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenBook: (Long, String, Boolean) -> Unit,
+    // S2：E-Hentai 标签检索入口（未载入数据包时传 null → 入口不渲染，G1"不载入=与现在相同"）
+    onOpenEhTags: ((Long?, String?) -> Unit)? = null,
 ) {
     val libs by vm.libraries.collectAsState()
     val query by vm.query.collectAsState()
@@ -211,6 +214,7 @@ fun ShelfScreen(
     val trJob by BookTranslateJob.state.collectAsState()
     var removeTarget by remember { mutableStateOf<LibraryRow?>(null) }
     var showTagsDialog by remember { mutableStateOf(false) }
+    var ehBookTagsFor by remember { mutableStateOf<BookCell?>(null) }   // S2：E-Hentai 标签面板
 
     // L3：一次性提示（如"刚添加的库首扫 0 本"）——消费后置空，避免重组重复弹。
     val notice by vm.notice.collectAsState()
@@ -365,6 +369,12 @@ fun ShelfScreen(
                         }) {
                             Icon(Icons.Filled.Autorenew, "重提失败封面")
                         }
+                        // S2：E-Hentai 标签检索入口（仅在数据就绪时出现）
+                        if (onOpenEhTags != null) {
+                            IconButton(onClick = { onOpenEhTags(null, null) }) {
+                                Icon(Icons.Filled.Label, "E-Hentai 标签检索")
+                            }
+                        }
                         IconButton(onClick = onOpenSettings) {
                             Icon(Icons.Filled.Settings, "设置")
                         }
@@ -515,6 +525,7 @@ fun ShelfScreen(
             onMark = { vm.setReadState(listOf(cell.id), it); contextBook = null },
             onTags = { showTagsDialog = true; contextBook = null },
             onRegenerateCover = { vm.regenerateCover(cell.id); contextBook = null },
+            onEhTags = onOpenEhTags?.let { _ -> { ehBookTagsFor = cell; contextBook = null } },
             onExportName = {
                 contextBook = null
                 scope.launch {
@@ -527,6 +538,18 @@ fun ShelfScreen(
                         Toast.makeText(ctx, "已复制书名：$name", Toast.LENGTH_SHORT).show()
                     }
                 }
+            },
+        )
+    }
+
+    // S2：书籍 E-Hentai 标签面板（点击 tag → 进入标签检索并预选）
+    ehBookTagsFor?.let { cell ->
+        EhBookTagsPanel(
+            bookId = cell.id,
+            onDismiss = { ehBookTagsFor = null },
+            onPickTag = { t ->
+                ehBookTagsFor = null
+                onOpenEhTags?.invoke(t.rid, t.nameZh ?: t.name)
             },
         )
     }
@@ -754,7 +777,7 @@ private fun ScanProgressStrip(s: ScanProgressRow, vm: ShelfViewModel) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun CoverCell(
+internal fun CoverCell(
     cell: BookCell,
     selected: Boolean,
     job: BookTranslateJob.State?,
@@ -881,7 +904,7 @@ private fun MiniBadge(icon: ImageVector, desc: String, tint: Color) {
  * 封面槽位：bmp 就绪；或 unavailable = 暂不可用（永久失败 / 瞬态失败冷却中），
  * 此时显示占位图标而非无限转圈，原生侧冷却到点后会自动重试。
  */
-private data class CoverSlot(val bmp: Bitmap? = null, val unavailable: Boolean = false)
+internal data class CoverSlot(val bmp: Bitmap? = null, val unavailable: Boolean = false)
 
 /** “重提失败封面”代际：顶部按钮触发 +1，所有可见单元格立即重新轮询。 */
 private val coverRetryGen = mutableStateOf(0)
@@ -903,7 +926,7 @@ private suspend fun pollCover(bookId: Long): Pair<Int, Bitmap?> = withContext(Co
  * 只在前台（lifecycle STARTED）轮询——退到后台即暂停，回前台自动续。
  */
 @Composable
-private fun produceCoverState(bookId: Long, lowFi: Boolean): androidx.compose.runtime.State<CoverSlot> {
+internal fun produceCoverState(bookId: Long, lowFi: Boolean): androidx.compose.runtime.State<CoverSlot> {
     val lifecycleOwner = LocalLifecycleOwner.current
     val retryGen = coverRetryGen.value  // 顶部“重提失败封面”触发本轮重启
     return produceState(
@@ -992,6 +1015,7 @@ private fun BookContextMenu(
     onMark: (Int) -> Unit,
     onTags: () -> Unit,
     onRegenerateCover: () -> Unit,
+    onEhTags: (() -> Unit)? = null,      // S2：E-Hentai 标签面板（未载入数据包时为 null → 不渲染）
     onExportName: () -> Unit,
 ) {
     var markMenu by remember { mutableStateOf(false) }
@@ -1031,6 +1055,7 @@ private fun BookContextMenu(
             SheetAction(Icons.Filled.Schedule, "标记为在读", { onMark(1) })
             SheetAction(Icons.Filled.DoneAll, "标记为读完", { onMark(2) })
             SheetAction(Icons.Filled.Label, "标签…", onTags)
+            onEhTags?.let { SheetAction(Icons.Filled.Label, "E-Hentai 标签…", it) }
             SheetAction(Icons.Filled.Image, "重新生成封面", onRegenerateCover)
             SheetAction(Icons.Filled.ContentCopy, "导出书名（复制到剪贴板）", onExportName)
         }

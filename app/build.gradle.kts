@@ -15,8 +15,8 @@ android {
         applicationId = "com.comicshelf.app"
         minSdk = 30
         targetSdk = 36
-        versionCode = 15
-        versionName = "0.4.3-android"
+        versionCode = 16
+        versionName = "0.5.0-android"
 
         externalNativeBuild {
             cmake {
@@ -50,6 +50,13 @@ android {
             applicationIdSuffix = ".t"
             isDebuggable = true
             signingConfig = signingConfigs.getByName("debug")
+        }
+        // EH 子系统开发包（S1/S2 真机驱动）：与正式包【同包名】、覆盖安装保留数据，
+        // 签名走注入式正式签名（-Pandroid.injected.signing.*），含调试驱动 receiver。
+        // 用法: gradle :app:assembleEhdev -Pandroid.injected.signing.*（见 docs/PUBLISH.md §4）
+        create("ehdev") {
+            initWith(getByName("release"))
+            isDebuggable = true
         }
     }
 
@@ -85,6 +92,19 @@ android {
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
+
+    // 调试驱动（EhDebugReceiver）源：debug 与 ehdev 两个开发形态共用；
+    // release/sidestest 不含（构建产物零污染，S4 发布验收将核对）。
+    sourceSets {
+        getByName("debug") {
+            java.srcDir("src/ehdebug/java")
+            manifest.srcFile("src/ehdebug/AndroidManifest.xml")
+        }
+        getByName("ehdev") {
+            java.srcDir("src/ehdebug/java")
+            manifest.srcFile("src/ehdebug/AndroidManifest.xml")
+        }
+    }
 }
 
 dependencies {
@@ -113,4 +133,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // S1 引擎纯函数单元自测（排序算法/EhV3 移植正确性；仅测试，不影响产物）
+    testImplementation("junit:junit:4.13.2")
 }

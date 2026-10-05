@@ -81,6 +81,9 @@ fun SettingsScreen(onBack: () -> Unit) {
             SettingsSection("翻译服务（旁车模式）") {
                 TranslateSection()
             }
+            SettingsSection("E-Hentai 数据") {
+                com.comicshelf.app.ehmeta.EhSettingsSection()
+            }
             SettingsSection("性能自检") {
                 OutlinedTextField(
                     selftestScale, { selftestScale = it },

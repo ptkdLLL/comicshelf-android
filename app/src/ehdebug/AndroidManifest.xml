@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- S1 调试驱动：仅 debug 构建注册（release/sidestest 不含） -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name="com.comicshelf.app.ehmeta.EhDebugReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.comicshelf.app.DEBUG_EH" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
