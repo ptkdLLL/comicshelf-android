@@ -56,6 +56,7 @@ App 端只认「后端地址」这一个配置项。详见 [backend/README.md](b
 ├── app/                      # 安卓应用（Kotlin + Compose + 原生 C++ 核心/JNI）
 │   └── src/main/cpp/         #   core(数据库/扫描/vfs/压缩包/图像/翻译客户端) + JNI
 ├── backend/                  # 局域网 OCR/翻译后端（Python, 一键部署）
+├── ehmeta-builder/           # E-Hentai 元数据桌面构建器（Mac/PC，Python 纯标准库）
 ├── build.gradle.kts / settings.gradle.kts
 └── third_party/…             # 见 app/src/main/cpp/third_party（Vendored 依赖）
 ```
@@ -94,6 +95,13 @@ gradle :app:assembleDebug          # 或直接用 Android Studio 打开本目录
 > 当前以**源码随包**形式分发——把 `comicshelf-android\` 整个文件夹与 `cs-deploy\`
 > 放在同一目录（或其父目录）一起拷贝即可。脚本的同目录/父目录扫描原生支持该形态，
 > 无需任何改动。
+
+## 元数据构建器（桌面，可选）
+
+见 [ehmeta-builder/README.md](ehmeta-builder/README.md)：在 Mac/PC 上构建 **E-Hentai 元数据数据库**
+（产出 `ehmeta.db.zip`，供 App 设置页导入）。手动运行、自动从公开来源取数、支持填代理端口
+（如 Clash 混合端口 `http://127.0.0.1:7897`）；纯 Python 标准库实现，含 CLI 与图形界面。
+与 App 共用同一套经对账验证的构建管线（计数/键索引与发布包**逐字节一致**）。
 
 ## 许可与致谢
 

@@ -37,3 +37,9 @@ backend/config.env
 __pycache__/
 backend/__pycache__/
 *.pyc
+
+# ---------------- ehmeta-builder 构建产物 ----------------
+ehmeta-builder/packaging/build/
+ehmeta-builder/packaging/dist/
+ehmeta-builder/packaging/build_venv/
+ehmeta-builder/packaging/*.spec
