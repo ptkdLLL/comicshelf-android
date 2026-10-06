@@ -49,6 +49,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -71,13 +72,16 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.comicshelf.app.core.BookmarkRow
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -96,7 +100,6 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
     var showTrMenu by remember { mutableStateOf(false) }
     val open by vm.open.collectAsState()
     val prefs by vm.prefs.collectAsState()
-    val rev by vm.revision.collectAsState()
     var chrome by remember { mutableStateOf(true) }
     var rotation by remember { mutableIntStateOf(0) }
     var showBookmarks by remember { mutableStateOf(false) }
@@ -110,7 +113,7 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
 
     Box(Modifier.fillMaxSize().background(bg)) {
         if (open.pageCount > 0) {
-            ReaderPager(vm, open, prefs.rtl, prefs.spread, prefs.fit, rotation, rev,
+            ReaderPager(vm, open, prefs.rtl, prefs.spread, prefs.fit, rotation,
                         onToggleChrome = { chrome = !chrome })
         } else {
             Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -183,7 +186,6 @@ private fun ReaderPager(
     spread: Boolean,
     fit: Int,
     rotation: Int,
-    rev: Int,
     onToggleChrome: () -> Unit,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -200,14 +202,23 @@ private fun ReaderPager(
             initialPageOffsetFraction = 0f,
         ) { pageCountEff }
 
+        // v0.6.0：预算快照一次/进入阅读器（availMem 漂移不重启解码，评估 G7）；
+        // cap 只随 step（双页/旋转）变化（P-R3 v2：min(48MB, BUDGET÷瞬时最大窗口页数)）。
+        val context = LocalContext.current
+        val budget = remember(open.bookId) { PageBudget.budgetBytes(context) }
+        LaunchedEffect(budget) { vm.updateBudget(budget) }   // P-R8 断言口径
+        val capBytes = remember(budget, step) {
+            PageBudget.perPageCap(budget, PageBudget.windowPages(step))
+        }
+
         // Sync external goto -> pager & persist progress.
+        // v0.3.4 的"落定必加载"真空修复由"组合项在=解码协程在"结构性接管（评估 G4/G8），
+        // 落定分支不再补发 ensurePage。
         LaunchedEffect(pager.currentPage, pager.isScrollInProgress) {
             if (!pager.isScrollInProgress) {
                 val page = pager.currentPage * step
                 if (page != vm.open.value.page) {
                     vm.goto(page)
-                } else {
-                    vm.ensurePage(page)
                 }
             }
         }
@@ -221,21 +232,25 @@ private fun ReaderPager(
         HorizontalPager(
             state = pager,
             reverseLayout = rtl,
-            beyondViewportPageCount = 2,   // compose neighbors => decode prefetch
+            beyondViewportPageCount = 2,   // compose neighbors => decode prefetch（大页模式由准入收紧，组合仍保留）
             modifier = Modifier.fillMaxSize(),
         ) { idx ->
             val first = idx * step
+            val isCurrentItem = pager.currentPage == idx   // P-R5：项作用域读取，只重组该项
             Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center) {
-                ZoomablePage(vm, open, first, fit, rotation, rev, rtl, onToggleChrome,
-                             Modifier.weight(1f))
+                ZoomablePage(vm, open, first, fit, rotation, rtl, capBytes, isCurrentItem,
+                             onToggleChrome, Modifier.weight(1f))
                 if (step == 2 && first + 1 < pageCount) {
-                    ZoomablePage(vm, open, first + 1, fit, rotation, rev, rtl, onToggleChrome,
-                                 Modifier.weight(1f))
+                    ZoomablePage(vm, open, first + 1, fit, rotation, rtl, capBytes, isCurrentItem,
+                                 onToggleChrome, Modifier.weight(1f))
                 }
             }
         }
     }
 }
+
+/** 组合项持有的页位图（书号/页号随值走——槽位复用时绝不显示他页，评估 R-E6 防御）。 */
+private class DecodedPage(val bookId: Long, val page: Int, val bmp: Bitmap)
 
 /** One zoomable page. Chrome-free; tap zones and gestures only. */
 @Composable
@@ -245,23 +260,45 @@ private fun ZoomablePage(
     page: Int,
     fit: Int,
     rotation: Int,
-    rev: Int,
     rtl: Boolean,
+    capBytes: Long,
+    isCurrent: Boolean,
     onToggleChrome: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    LaunchedEffect(page, rev) { vm.ensurePage(page) }
-
-    val original by remember(page, rev) {
-        mutableStateOf(vm.pageAt(page))
+    // P-R1：位图由本项持有——进入窗口即解码，离开窗口协程取消 → 位图自然释放（I1）。
+    // 无 LRU、无逐出：本页在组合中 ⇔ 本页位图在（P-R2 借用表只存弱引用供 VM 查询）。
+    val bookId = open.bookId
+    val decoded by produceState<DecodedPage?>(null, bookId, page, capBytes, isCurrent) {
+        if (value?.let { it.bookId == bookId && it.page == page } == true) {
+            return@produceState                    // 本页已解码（key 变化时保留位图）
+        }
+        var attempt = 0
+        while (attempt < MAX_LOAD_ATTEMPTS) {      // 取消经挂起点传播（awaitAdmission 起）
+            vm.awaitAdmission(page)                // P-R6：大页模式挂起等待放行
+            val job = async { vm.decodePageItem(bookId, page, capBytes) }
+            val b = withTimeoutOrNull(STUCK_LOAD_MS) { job.await() }
+            if (b == null) {
+                job.cancel()                       // 卡死/失败尝试弃引用（JNI 跑完即被 GC）
+            } else {
+                value = DecodedPage(bookId, page, b)
+                vm.onItemDecoded(page, b)
+                return@produceState
+            }
+            attempt++
+            if (attempt < MAX_LOAD_ATTEMPTS) delay(RETRY_DELAY_MS)
+        }
     }
+    DisposableEffect(bookId, page) { onDispose { vm.unregisterBorrowed(page) } }
+    val original = decoded?.takeIf { it.bookId == bookId && it.page == page }?.bmp
     // Translated overlay replaces the original when ready.
     val useTranslate = open.translateEnabled
-    val translated by produceState<Bitmap?>(initialValue = null, page, rev, useTranslate) {
+    val translated by produceState<Bitmap?>(initialValue = null, page, useTranslate) {
         if (useTranslate) {
+            // 评估 G5：200ms 身份轮询——常规落地/重译替换/失败恢复三态全覆盖（替代旧 revision 重启）。
             while (true) {
                 val bmp = vm.translatedAt(page)
-                if (bmp != null) { value = bmp; return@produceState }
+                if (bmp != null && bmp !== value) value = bmp
                 kotlinx.coroutines.delay(200)
             }
         }
@@ -367,9 +404,12 @@ private fun ZoomablePage(
             )
         } else {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp,
-                                         color = Color.White.copy(alpha = 0.7f))
-                Spacer(Modifier.height(6.dp))
+                // P-R5：只有可见页允许转圈（动效永不来自离屏组合页——M2 静置 ≤5fps 的直接开关）。
+                if (isCurrent) {
+                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp,
+                                             color = Color.White.copy(alpha = 0.7f))
+                    Spacer(Modifier.height(6.dp))
+                }
                 Text("第 ${page + 1} 页", fontSize = 11.sp,
                      color = Color.White.copy(alpha = 0.7f))
             }

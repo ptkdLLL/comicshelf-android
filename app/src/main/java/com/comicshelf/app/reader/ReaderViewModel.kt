@@ -3,6 +3,8 @@ package com.comicshelf.app.reader
 import android.graphics.Bitmap
 import android.util.LruCache
 import android.util.Log
+import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.comicshelf.app.core.BookmarkRow
@@ -18,6 +20,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -44,25 +47,23 @@ enum class TranslatePageState { NONE, QUEUED, BUSY, READY, FAILED }
 private const val SLOW_LOAD_MS = 1000.0
 /** 单页解码耗时 < 0.4s 计一次"快"；0.4~1.0s 为死区，不改变判定。 */
 private const val FAST_LOAD_MS = 400.0
-/** 一张 (bookId,page) 最多自动重试次数（加载失败时 bump revision 重触发）。 */
-private const val MAX_LOAD_ATTEMPTS = 2
-/** 失败计数窗口：超过 30s 未再失败则重新计数（避免长会话里旧失败永久封死该页）。 */
-private const val RETRY_WINDOW_MS = 30_000L
-/** v0.3.3：单次加载超过 20s 未返回视为卡死——允许重新排队（旧任务跑完自行清理）。 */
-private const val STUCK_LOAD_MS = 20_000L
+// MAX_LOAD_ATTEMPTS / STUCK_LOAD_MS / RETRY_DELAY_MS / 页位图预算 → ReaderPolicy.kt
+// （v0.6.0 所有权归位：常量集中，评估 G1-G8）
 
 class ReaderViewModel : ViewModel() {
 
     val open = MutableStateFlow(ReaderOpenState())
     val prefs = MutableStateFlow(ReaderPrefs())
-    /** page -> decoded original page。v0.3.3：按**字节数**封顶（160MB）。
-     *  之前是"24 张"计数封顶——巨页 28.6MB/张时可吃 690MB，实测导致整机内存紧缩。
-     *  160MB 恰好容纳大页模式的整个 Compose 窗口（±2 = 5 张 × 28.6MB）。 */
-    private val pageCache = object : LruCache<Int, Bitmap>(160 * 1024) {
-        override fun sizeOf(key: Int, value: Bitmap): Int =
-            (value.byteCount / 1024).coerceAtLeast(1)   // 防御：sizeOf 必须 >0（极小位图）
-    }
-    /** page -> translated overlay bitmap (sidecar engine, RAM only)，同样按字节封顶（64MB）。 */
+    // ---- v0.6.0 页位图所有权归位（READER_FLICKER_FIX_PLAN v2 / READER_FIX_EVAL.md）----
+    /** page -> decoded original page 的**借用表**（弱引用）。位图本体由组合项持有
+     *  （ReaderScreen 的 produceState）；本表只服务 VM 侧查询：翻译取原图 / 预取查重 / P-R8 记账。
+     *  项销毁即注销。旧 160MB LruCache 已删——"逐出 ↔ 需求"反馈回路不复存在（I1）。 */
+    private val borrowed = ConcurrentHashMap<Int, WeakReference<Bitmap>>()
+    /** P-R8 记账：自算字节（w×h×4）。byteCount 退出一切决策。 */
+    private var budgetBytes: Long = PageBudget.DEVICE_BUDGET_CAP
+    /** P-R8：page -> 最近解码时刻（判"同页 60s 二次解码"违例）。 */
+    private val decodeStamps = ConcurrentHashMap<Int, ArrayDeque<Long>>()
+    /** page -> translated overlay bitmap (sidecar engine, RAM only)，按字节封顶（64MB）。 */
     private val trCache = object : LruCache<Int, Bitmap>(64 * 1024) {
         override fun sizeOf(key: Int, value: Bitmap): Int =
             (value.byteCount / 1024).coerceAtLeast(1)
@@ -72,27 +73,23 @@ class ReaderViewModel : ViewModel() {
     /** backend 可见页渲染的去重（同一页并发触发只渲染一次）。 */
     private val trInflight = HashSet<Int>()
 
-    /** Bumped whenever a bitmap lands so subscribers re-check the caches. */
-    val revision = MutableStateFlow(0)
-
     private var pollJob: Job? = null
-    private var targetDim = 2048
+    private var targetDim = 2048   // 仅剩翻译路径（translateGetPage 返回尺寸）使用
 
     var lastFlipMs = 0.0
 
-    // ---- v0.3.2 页加载去重 / 自适应门控状态 ----
-    private class LoadAttempt(var n: Int, var at: Long)
-    /** (bookId,page) -> 本次加载的启动时刻——杜绝同一页被重组风暴重复入队（自激队列根因）。
-     *  v0.3.3：改为记时间戳，>STUCK_LOAD_MS 判卡死、允许重排（幂等去重 + 自愈兼顾）。 */
-    private val loadsInFlight = HashMap<Pair<Long, Int>, Long>()
-    /** (bookId,page) -> 失败次数（仅在解码返回 null 时累计）。 */
-    private val loadAttempts = HashMap<Pair<Long, Int>, LoadAttempt>()
+    // ---- 自适应门控状态（v0.3.2 语义原样；v0.6.0 起以"准入"为载体，P-R6）----
     /** 连续慢页达到 2 页 → 进入大页模式：只为当前页加载，不再预取邻居。 */
-    private var bigPageMode = false
+    @Volatile private var bigPageMode = false
     private var slowStreak = 0
     private var fastStreak = 0
     /** 本次开书以来已完成的加载数；前 2 页不计入门控（首开含 SMB 建连开销，不代表稳态）。 */
     private var loadsDone = 0
+    /** v0.3.3：大页模式"读一页预取下一页"的一次性放行目标（落地/goto 即清除）。 */
+    @Volatile private var allowAhead: Int? = null
+    /** 准入信号（P-R6）：bigPageMode/goto/allowAhead 变更都 bump，唤醒挂起的页项。 */
+    private val admissionTick = MutableStateFlow(0)
+    private fun bumpAdmission() { admissionTick.value++ }
     /** v0.3.3：大页模式"读一页预取下一页"的定时任务（只保留最后一个）。 */
     private var prefetchJob: Job? = null
 
@@ -122,24 +119,23 @@ class ReaderViewModel : ViewModel() {
                 if (new != null && new != cur) trStates.value = trStates.value + (vis to new)
             }
         }
-        // v0.3.4 安全网：每 5s 巡检"可见页既无缓存、又无在途加载"的真空态
-        //（= 没有任何路径会再加载它，转圈将永不结束）。根因已在 goto() 修复；
-        // 此网兜住未来任何新增"当前页变更"入口的遗漏。
+        // P-R8：不变量巡检（"无环"写进代码）——resident ≤ BUDGET、无"同页 60s 二次解码"。
+        // 违反只记日志不改行为（release 同样计数）；数据供 M1/M6 与 DAP 抽查。
         viewModelScope.launch(Dispatchers.Default) {
             while (true) {
-                delay(5000)
-                val st = open.value
-                if (st.bookId == 0L || st.pageCount <= 0) continue
-                val vis = st.page
-                if (pageAt(vis) != null) continue
-                val infl = synchronized(loadsInFlight) {
-                    loadsInFlight.entries.map { (k, v) ->
-                        "p${k.second}:${(System.currentTimeMillis() - v) / 1000}s"
-                    }
+                delay(30_000)
+                val resident = residentBytes()
+                if (resident > budgetBytes) {
+                    Log.w("Reader", "P-R8 违例: resident=${resident / 1_048_576}MB > " +
+                        "budget=${budgetBytes / 1_048_576}MB")
                 }
-                if (infl.isEmpty()) {
-                    Log.w("Reader", "真空自愈：page=$vis 无缓存且无在途（big=$bigPageMode）→ 补发 ensurePage")
-                    ensurePage(vis)
+                val cutoff = System.currentTimeMillis() - 60_000
+                decodeStamps.forEach { (p, dq) ->
+                    val n = synchronized(dq) {
+                        while (dq.isNotEmpty() && dq.first() < cutoff) dq.removeFirst()
+                        dq.size
+                    }
+                    if (n >= 3) Log.w("Reader", "P-R8 违例: page $p 60s 内解码 $n 次（≥3=风暴签名）")
                 }
             }
         }
@@ -151,6 +147,7 @@ class ReaderViewModel : ViewModel() {
         viewModelScope.launch(CoreDispatcher) {
             val info = NativeBridge.readerOpen(bookId) ?: return@launch
             resetLoadGating()
+            borrowed.clear()   // 切书防串页：旧书借用全部作废（新书页项自会重登记）
             val pageCount = info[0]
             val lastPage = info[1]
             prefs.value = ReaderPrefs(
@@ -200,21 +197,21 @@ class ReaderViewModel : ViewModel() {
             }
         }
         pollJob?.cancel()
-        synchronized(pageCache) { pageCache.evictAll() }
+        borrowed.clear()                      // 页位图归组合项所有——离开阅读器即全释放（I1）
         synchronized(trCache) { trCache.evictAll() }
         resetLoadGating()
         open.value = ReaderOpenState()
     }
 
-    /** v0.3.2：清空门控/重试状态（loadsInFlight 不清理——在途任务自行移除，避免重复触发去重空洞）。
-     *  v0.3.3：一并取消待执行的邻页预取。 */
+    /** v0.3.2：清空门控状态。v0.6.0：重试/看门狗已项内化，这里只剩大页模式条带（P-R6）。 */
     private fun resetLoadGating() {
         bigPageMode = false
         slowStreak = 0
         fastStreak = 0
         loadsDone = 0
         prefetchJob?.cancel()
-        synchronized(loadAttempts) { loadAttempts.clear() }
+        allowAhead = null
+        bumpAdmission()
     }
 
     override fun onCleared() {
@@ -225,112 +222,88 @@ class ReaderViewModel : ViewModel() {
     // ---------------------------------------------------------------- pages
 
     fun setScreenHint(width: Int, height: Int) {
-        targetDim = maxOf(width, height) * 2   // 2x for crisp pinch zoom
+        targetDim = maxOf(width, height) * 2   // 2x for crisp pinch zoom（翻译路径用；解码已改字节上限）
     }
 
-    fun pageAt(page: Int): Bitmap? = synchronized(pageCache) { pageCache.get(page) }
+    /** P-R2 借用表查询（语义与旧 pageCache.get 相同：没有就是 null）。 */
+    fun pageAt(page: Int): Bitmap? = borrowed[page]?.get()
+
+    /** P-R8/测试：当前常驻页位图自算字节（不依赖 Bitmap.byteCount）。 */
+    fun residentBytes(): Long {
+        var sum = 0L
+        borrowed.values.forEach { w ->
+            val b = w.get() ?: return@forEach
+            sum += b.width.toLong() * b.height.toLong() * 4
+        }
+        return sum
+    }
+
+    /** 预算快照（进入阅读器时由 UI 推一次；只服务 P-R8 断言口径）。 */
+    fun updateBudget(bytes: Long) { budgetBytes = bytes }
+
+    // ---- v0.6.0 页加载：项自有（P-R1）＋ 调度层准入（P-R6）----
+    // 旧 ensurePage/ensurePageInner/loadsInFlight/loadAttempts/真空自愈看门狗全部退休：
+    // 一页一项一协程（I1）——去重/卡死/重试/找活全由项的生命周期承担（评估 G3/G4/G8）。
 
     /**
-     * Loads [page] (and neighbors) if missing. Called from LaunchedEffect of
-     * every composed reader item — Compose's beyond-bounds composition acts
-     * as the prefetch window, exactly like the C++ preload of the Windows UI.
-     *
-     * v0.3.2 修复（翻页冻结根因：重组风暴 → 重复入队 → 自激队列）：
-     *  1) (bookId,page) 去重：已在途的页直接跳过，不再重复 launch；
-     *  2) 大页模式：连续 2 页 > 1.0s 后只加载当前页，不再预取邻居
-     *     （巨页包下预取会把单会话 SMB 队列堵死；连续 3 页 < 0.4s 自动退出）；
-     *  3) 失败重试上限：解码返回 null 最多 bump revision 重试 MAX_LOAD_ATTEMPTS 次，
-     *     30s 窗口后计数重置；超出则放弃并留日志（防止无限重试队列）。
-     *
-     * v0.3.3：
-     *  4) 卡死自愈：同一页在途超过 STUCK_LOAD_MS(20s) 视为卡死 → 允许重新排队
-     *     （实测巨页 114MB 分配在内存紧缩下会卡死 60s+；旧任务跑完用时间戳守卫
-     *      自行清理，不会误删新任务的在途标记）；
-     *  5) [allowAhead]：仅供"读一页预取下一页"内部通道使用（大页模式下预取 +1 页）。
+     * P-R1 解码入口：**组合项**调用。日志/计时/计数口径与旧 ensurePageInner 一致
+     * （M1 依赖 "load start page=" / "loaded in" 串，原样保留）。
+     * 取消语义：项销毁 → 本协程（或以本函数为 body 的 job）取消 → 结果丢弃（位图 GC）。
      */
-    fun ensurePage(page: Int) = ensurePageInner(page, allowAhead = false)
-
-    private fun ensurePageInner(page: Int, allowAhead: Boolean) {
-        val st = open.value
-        if (page !in 0 until st.pageCount) return
-        val key = st.bookId to page
-        if (pageAt(page) == null) {
-            // 大页模式下不给窗口外的页加载（allowAhead 通道除外：仅 +1 预取）。
-            if (bigPageMode && page != st.page && !allowAhead) {
-                maybeTranslateOnDevice(page, prefetchOnly = true)
-                return
-            }
-            val now = System.currentTimeMillis()
-            val fail = synchronized(loadAttempts) {
-                val fa = loadAttempts[key]
-                if (fa != null && now - fa.at > RETRY_WINDOW_MS) { loadAttempts.remove(key); null } else fa
-            }
-            if (fail != null && fail.n >= MAX_LOAD_ATTEMPTS) {
-                maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
-                return
-            }
-            val start = synchronized(loadsInFlight) {
-                val started = loadsInFlight[key]
-                if (started != null && now - started < STUCK_LOAD_MS) {
-                    maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
-                    return
-                }
-                if (started != null) {
-                    Log.w("Reader", "page $page 上一次加载 ${(now - started) / 1000}s 未返回，" +
-                        "视为卡死，重新排队（旧任务跑完自行清理）")
-                }
-                loadsInFlight[key] = now
-                now
-            }
-            Log.i("Reader", "load start page=$page" + (if (allowAhead) " (prefetch)" else ""))
-            viewModelScope.launch(Dispatchers.IO) {
-                val t0 = System.nanoTime()
-                var ok = false
-                try {
-                    val bmp = PageDecoder.decode(st.bookId, page, targetDim)
-                    if (bmp != null) {
-                        if (open.value.bookId == st.bookId) {      // 已切书则丢弃，避免串页
-                            synchronized(pageCache) { pageCache.put(page, bmp) }
-                            revision.value++
-                            ok = true
-                        }
-                    }
-                } catch (e: Throwable) {
-                    Log.w("Reader", "page $page load failed: $e")
-                } finally {
-                    synchronized(loadsInFlight) {
-                        // 时间戳守卫：卡死重排后旧任务的 finally 不能误删新任务的在途标记
-                        if (loadsInFlight[key] == start) loadsInFlight.remove(key)
-                    }
-                    val ms = (System.nanoTime() - t0) / 1e6
-                    lastFlipMs = ms
-                    if (ok) {
-                        Log.i("Reader", "page $page loaded in $ms ms")
-                        onLoadTiming(ms)
-                        // v0.3.3：大页模式下，用户若停在这一页读，预取下一页
-                        if (bigPageMode) scheduleNeighborPrefetch(st.bookId, page)
-                    } else {
-                        val n = synchronized(loadAttempts) {
-                            val fa = loadAttempts.getOrPut(key) { LoadAttempt(0, now) }
-                            if (now - fa.at > RETRY_WINDOW_MS) { fa.n = 0; fa.at = now }
-                            fa.n++; fa.at = System.currentTimeMillis(); fa.n
-                        }
-                        Log.w("Reader", "page $page load failed (attempt $n/$MAX_LOAD_ATTEMPTS) in $ms ms")
-                        if (n < MAX_LOAD_ATTEMPTS &&
-                            open.value.bookId == st.bookId && pageAt(page) == null) {
-                            revision.value++   // 触发订阅者重试（有上限）
-                        }
-                    }
-                }
-            }
+    suspend fun decodePageItem(bookId: Long, page: Int, maxBytes: Long): Bitmap? {
+        // P-R8 精确形（动态阶段定稿）：**在位页**重新解码 = 回路签名本体
+        //（回访是先离开窗口已注销再解码，属正常——旧 60s 计数形会误报）。
+        if (borrowed[page]?.get() != null) {
+            Log.w("Reader", "P-R8 违例: page $page 在位仍重新解码")
         }
-        maybeTranslateOnDevice(page, prefetchOnly = page != st.page)
+        val t0 = System.nanoTime()
+        Log.i("Reader", "load start page=$page")
+        var bmp: Bitmap? = null
+        try {
+            bmp = PageDecoder.decode(bookId, page, maxBytes)
+        } catch (e: Throwable) {
+            Log.w("Reader", "page $page load failed: $e")
+        }
+        val ms = (System.nanoTime() - t0) / 1e6
+        lastFlipMs = ms
+        recordDecode(page)
+        if (bmp != null) {
+            Log.i("Reader", "page $page loaded in $ms ms")
+            onLoadTiming(ms)
+        } else {
+            Log.w("Reader", "page $page load failed in $ms ms")
+        }
+        return bmp
+    }
+
+    /** P-R6 准入：大页模式只放行当前页/一次性预取目标；未放行者挂起（不占 IO、不占帧）。 */
+    suspend fun awaitAdmission(page: Int) {
+        admissionTick.first { admits(page) }
+    }
+    private fun admits(page: Int): Boolean =
+        !bigPageMode || page == open.value.page || page == allowAhead
+
+    /** P-R1 落地回调：登记借用 + 大页模式"读一页预取下一页" + 翻译触发（旧 ensurePage 尾调用语义）。 */
+    fun onItemDecoded(page: Int, bmp: Bitmap) {
+        borrowed[page] = WeakReference(bmp)
+        if (allowAhead == page) allowAhead = null
+        if (bigPageMode) scheduleNeighborPrefetch(open.value.bookId, page)
+        maybeTranslateOnDevice(page, prefetchOnly = page != open.value.page)
+    }
+
+    /** 项销毁注销借用（P-R2）。 */
+    fun unregisterBorrowed(page: Int) { borrowed.remove(page) }
+
+    /** P-R8 记账：解码时刻（60s 环形；巡检协程异步消费）。 */
+    private fun recordDecode(page: Int) {
+        val dq = decodeStamps.getOrPut(page) { ArrayDeque() }
+        synchronized(dq) { dq.addLast(System.currentTimeMillis()) }
     }
 
     /**
      * v0.3.3 大页模式"读一页预取下一页"：当前页落地 600ms 后，若用户仍停在它上面
-     * （= 在读，而非连翻走）→ 预取 +1 页（仅一页，不链式扩散——只有 +1 页真正成为
-     * 当前页时，它的落地才会再触发下一次预取）。
+     * （= 在读，而非连翻走）→ 放行 +1 页（仅一页，不链式——只有 +1 页真正成为当前页时，
+     * 它的落地才会再触发下一次预取）。v0.6.0：放行=准入信号，不再直接触发加载（P-R6）。
      */
     private fun scheduleNeighborPrefetch(bookId: Long, page: Int) {
         prefetchJob?.cancel()
@@ -340,7 +313,8 @@ class ReaderViewModel : ViewModel() {
             if (cur.bookId != bookId || cur.page != page) return@launch
             val next = page + 1
             if (next >= cur.pageCount || pageAt(next) != null) return@launch
-            ensurePageInner(next, allowAhead = true)
+            allowAhead = next
+            bumpAdmission()
         }
     }
 
@@ -353,6 +327,7 @@ class ReaderViewModel : ViewModel() {
                 slowStreak++; fastStreak = 0
                 if (!bigPageMode && slowStreak >= 2) {
                     bigPageMode = true
+                    bumpAdmission()
                     Log.i("Reader", "big-page mode ON (slowStreak=$slowStreak, last ${ms}ms): " +
                         "loading current page only, prefetch paused")
                 }
@@ -361,6 +336,7 @@ class ReaderViewModel : ViewModel() {
                 fastStreak++; slowStreak = 0
                 if (bigPageMode && fastStreak >= 3) {
                     bigPageMode = false
+                    bumpAdmission()
                     Log.i("Reader", "big-page mode OFF (fastStreak=$fastStreak, last ${ms}ms): prefetch resumed")
                 }
             }
@@ -417,7 +393,6 @@ class ReaderViewModel : ViewModel() {
                 if (result != null) {
                     synchronized(trCache) { trCache.put(page, result.bitmap) }
                     trStates.value = trStates.value + (page to TranslatePageState.READY)
-                    revision.value++
                     Log.i("Reader", "ondevice page $page translated: ${result.timings}")
                 } else {
                     Log.i("Reader", "ondevice translate no-result for page $page")
@@ -449,7 +424,6 @@ class ReaderViewModel : ViewModel() {
                     ?: return@launch
                 synchronized(trCache) { trCache.put(page, out) }
                 trStates.value = trStates.value + (page to TranslatePageState.READY)
-                revision.value++
                 Log.i("Reader", "backend page $page rendered from archive")
             } catch (t: Throwable) {
                 // 渲染/解析异常绝不允许带崩进程（2026-10-02: HARDWARE 位图崩过）
@@ -473,10 +447,11 @@ class ReaderViewModel : ViewModel() {
             }
         }
         maybeTranslateOnDevice(page, prefetchOnly = false)
-        // v0.3.4 修复（真空卡死根因）：goto 是"当前页变更"的统一入口，必须由它保证
-        // "当前页有加载在途或已缓存"这一状态不变量。此前加载触发依赖 UI 偶发事件
-        // （页项组合时或 pager 落定 else 分支），快滑场景两条都不满足 → 页永不加载。
-        ensurePage(page)
+        // v0.3.4 真空卡死修复的归位形态（P-R6）：goto 是"当前页变更"的统一入口——
+        // 它只负责 ①清一次性预取放行 ②准入信号 bump（唤醒挂起的项；isCurrent key 变化重武装失败页）。
+        // "当前页必有加载路径"由"组合项在=解码协程在"结构性成立（一页一项一协程，I1）。
+        allowAhead = null
+        bumpAdmission()
     }
 
     fun setPrefs(p: ReaderPrefs) {
@@ -492,6 +467,7 @@ class ReaderViewModel : ViewModel() {
 
     // -------------------------------------------------------------- translate
 
+    /** 翻译 overlay 查询（消费者=页项 200ms 身份轮询——评估 G5：替代旧 revision 重启三态覆盖）。 */
     fun translatedAt(page: Int): Bitmap? = synchronized(trCache) { trCache.get(page) }
 
     private fun startTranslatePolling() {
@@ -528,7 +504,6 @@ class ReaderViewModel : ViewModel() {
             val bmp = com.comicshelf.app.core.CoverStore.rgbaToBitmap(dims, px)
             if (bmp != null) {
                 synchronized(trCache) { trCache.put(page, bmp) }
-                revision.value++
                 Log.d("Reader", "translated page $page ${bmp.width}x${bmp.height} ready")
             }
         }
@@ -585,7 +560,6 @@ class ReaderViewModel : ViewModel() {
             BookTranslateJob.focus(st.bookId, st.page, fresh = true)
             synchronized(trCache) { trCache.remove(st.page) }
             trStates.value = trStates.value + (st.page to TranslatePageState.QUEUED)
-            revision.value++
             return
         }
         viewModelScope.launch(CoreDispatcher) {
@@ -594,7 +568,6 @@ class ReaderViewModel : ViewModel() {
             synchronized(trCache) { trCache.remove(st.page) }
             if (engineMode() == "ondevice") {
                 trStates.value = trStates.value + (st.page to TranslatePageState.NONE)
-                revision.value++
                 maybeTranslateOnDevice(st.page, prefetchOnly = false, force = true)
             }
         }

@@ -38,27 +38,37 @@ object PageDecoder {
     }
 
     /**
-     * Decodes page [page] of [bookId] so the longest edge is <= [targetDim].
+     * 阅读器路径（v0.6.0）：解码 page 使整页字节 ≤ [maxBytes]（上限由 ReaderPolicy 预算派生，
+     * 替代旧 targetDim+12MP 双判据——READER_FLICKER_FIX_PLAN v2 P-R3）。
      * Returns null when the page cannot be read at all.
      */
-    suspend fun decode(bookId: Long, page: Int, targetDim: Int): Bitmap? =
+    suspend fun decode(bookId: Long, page: Int, maxBytes: Long): Bitmap? =
         withContext(Dispatchers.IO) {
             val bytes = readPage(bookId, page) ?: return@withContext null
-            decodeBytes(bookId, page, bytes, targetDim)
+            decodeBytes(bookId, page, bytes,
+                        { tryDecodePlatformCapped(it, maxBytes) },
+                        nativeEdgeForCap(maxBytes))
         }
 
     /**
      * 后台整本翻译专用：经独立阅读器会话读页（不依赖 UI 是否打开该书，
-     * 也不打扰正在阅读的其他书）。解码路径与 [decode] 完全一致。
+     * 也不打扰正在阅读的其他书）。**输入与语义保持 v0.5.0 原样**（targetDim 判据 +
+     * 12MP 上限）——评估 Q9：翻译链路的解码输入是不变量，本次不改。
      */
     suspend fun decodeJob(bookId: Long, page: Int, targetDim: Int): Bitmap? =
         withContext(Dispatchers.IO) {
             val bytes = NativeBridge.jobReadPage(bookId, page) ?: return@withContext null
-            decodeBytes(bookId, page, bytes, targetDim)
+            decodeBytes(bookId, page, bytes,
+                        { tryDecodePlatform(it, targetDim) }, targetDim)
         }
 
+    /** 字节上限 → native 回退的目标边长（正方口径）：sqrt(maxBytes/4) ≈ 最长边像素。 */
+    private fun nativeEdgeForCap(maxBytes: Long): Int =
+        kotlin.math.sqrt(maxBytes / 4.0).toInt().coerceAtLeast(1)
+
     private fun decodeBytes(bookId: Long, page: Int, bytes: ByteArray,
-                            targetDim: Int): Bitmap? {
+                            platformDecode: (ByteArray) -> Bitmap?,
+                            nativeTargetDim: Int): Bitmap? {
         if (bytes.isEmpty()) {
             Log.w("PageDecoder", "readPage($bookId,$page) returned no bytes")
             return null
@@ -66,9 +76,9 @@ object PageDecoder {
         val t1 = System.nanoTime()
         var bmp: Bitmap? = null
         if (!needsNativeDecode(bytes)) {
-            bmp = tryDecodePlatform(bytes, targetDim)
+            bmp = platformDecode(bytes)
         }
-        if (bmp == null) bmp = tryDecodeNative(bytes, targetDim)
+        if (bmp == null) bmp = tryDecodeNative(bytes, nativeTargetDim)
         val tDecode = (System.nanoTime() - t1) / 1e6
         if (bmp == null) {
             Log.w("PageDecoder", "decode failed book=$bookId page=$page len=${bytes.size}")
@@ -113,6 +123,25 @@ object PageDecoder {
         CoverStore.rgbaToBitmap(dims, px)
     } catch (t: Throwable) {
         Log.d("PageDecoder", "native decode failed (${t.message})")
+        null
+    }
+
+    /** v0.6.0 阅读路径：取最小 pow2 降采样，使 w×h/sample²×4 ≤ [maxBytes]（评估 G1 的 cap 口径）。 */
+    private fun tryDecodePlatformCapped(bytes: ByteArray, maxBytes: Long): Bitmap? = try {
+        val src = ImageDecoder.createSource(bytes)
+        ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
+            val w = info.size.width.toLong()
+            val h = info.size.height.toLong()
+            var sample = 1
+            while (w * h / (sample.toLong() * sample) * 4 > maxBytes) sample *= 2
+            decoder.setTargetSampleSize(sample)
+            decoder.setTargetColorSpace(android.graphics.ColorSpace.get(android.graphics.ColorSpace.Named.SRGB))
+            if (Build.VERSION.SDK_INT >= 28) {
+                decoder.allocator = ImageDecoder.ALLOCATOR_DEFAULT // hw when possible
+            }
+        }
+    } catch (t: Throwable) {
+        Log.d("PageDecoder", "platform decode failed (${t.javaClass.simpleName}: ${t.message})")
         null
     }
 }
