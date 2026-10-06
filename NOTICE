@@ -50,3 +50,19 @@ RAR (WinRAR) 兼容的压缩器**。本项目仅将 unrar 用于解压读取。
 CTBD（`ogkalu/comic-text-and-bubble-detector`）、PaddleOCR-VL-For-Manga（`jzhang533/…`）、
 Hy-MT2（`tencent/Hy-MT2-1.8B-GGUF`）等模型**不在本仓库内**，由 `backend/fetch_models.py`
 从 HuggingFace 下载。使用请遵循各模型卡声明的许可与使用条款。
+
+## E-Hentai 元数据（可选数据包 / ehmeta-builder）
+
+App 的「E-Hentai 数据」与桌面构建器（`ehmeta-builder/`）涉及以下公开数据源：
+
+| 来源 | 内容 | 许可 / 说明 |
+|---|---|---|
+| EhTagTranslation/Database | tag 中文名 | **CC BY-NC-SA 4.0**（署名随产物写入 `meta.json.licenses`） |
+| hwei115j/exhentai_metadata（GitHub Releases） | 元数据主快照 | 见上游仓库声明 |
+| bogeyturn dumps（HuggingFace） | 全量补缺（2025-01） | 见上游仓库声明 |
+| exzhawk/ehdb（GitHub LFS） | 早期标题别名（可选源） | 见上游仓库声明 |
+
+- 数据包 `ehmeta.db.zip` 为上述公开元数据的**衍生集合**（仅图库标题/标签等元数据，**不含任何图像**），
+  按各上游许可传播；本仓库以 GPL-3.0 分发的仅为**构建与读取代码**。
+- 桌面构建器以 PyInstaller 打包分发（bootloader 例外条款）/ CPython（PSF License）——
+  仅用于 Release 附件中的 `.app` 产物。

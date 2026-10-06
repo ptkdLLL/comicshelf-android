@@ -1,19 +1,27 @@
 # ComicShelf for Android
 
-**NAS 直连的大书库漫画阅读器 + 局域网 OCR/翻译后端。**
-为日漫阅读优化：SMB 直连书库、十万级书目虚拟化滚动、RTL/双页/缩放。
-再配上**整本书后台机翻**——书库页一键启动，翻译在局域网内的电脑上跑
-（检测 → OCR → LLM），手机只需上传整页并排版，边读边出、随时停续。
+**NAS 直连的大书库漫画阅读器 · 局域网整书机翻 · 离线 E-Hentai 标签数据库。**
 
-- 📚 **大书库**：SQLite 索引 + 虚拟化分页（十万级书目流畅滚动）、增量扫描、多书库、目录树、搜索、收藏/阅读状态/标签/书签
-- 📖 **阅读器**：翻页（左右分区点击）、双页对开、RTL（日漫）、捏合缩放+双击、旋转、进度记忆、三级封面缓存
-- 🗂 **格式**：zip/cbz、rar/cbr、目录型；stb / WebP / AVIF 解码链
-- 🌐 **网络**：SMB2/SMB3 直连 NAS（多共享、多凭据）
-- 🈶 **翻译**（核心差异点）：
-  - **局域网后端**（推荐）：后端跑 CTBD 检测 + PaddleOCR-VL 识别 + Hy-MT2(llama.cpp) 翻译，手机端零算力负担
-  - **端侧 GGUF**（可选）：需自备 llama.cpp 源码，纯离线
-  - BT Sakura 机制完整移植：官方 system prompt、**两级独立阶梯**（重复检测 + 行数对齐）、逐行兜底、永不空手返回
-  - **整本书后台队列**：书架启动 → 可见页插队 → 暂停/继续/跨会话续传
+三件事，一个 App：
+
+- 📚 **大书库**：SMB 直连 NAS，SQLite 索引 + 虚拟化分页（十万级书目流畅滚动，百万级不惧）、
+  增量扫描、多书库、目录树、搜索、收藏 / 阅读状态 / 标签 / 书签、**浏览历史**（跨库最近 50 本）
+- 🈶 **整书后台机翻**：书库页一键为本册启用 → 局域网内的电脑跑 CTBD 检测 + PaddleOCR-VL 识别 +
+  Hy-MT2 翻译 → 手机只上传整页并排版，边读边出、随时停续、跨会话续传
+- 🏷 **离线 E-Hentai 标签数据库**（v0.5 起）：导入可选的元数据包（约 595MB）→
+  **348.8 万图库 / 4388 万 tag 关联**全在本地；按 tag 组合检索自己的书库（"本地命中 N 本"）、
+  按书看 EH 标签、标签页直接管理书籍——**全程离线，不依赖官方 API**
+
+## 亮点速览
+
+- **标签检索就是浏览器**：命名空间芯片 + 频次排序 + 中文名；多 tag AND 组合；结果页直接
+  打开阅读 / 翻译 / 收藏 / 标记 / 导出（长按封面呼出与书库同源的操作面板）
+- **标签面板可反向导航**：读一本书时打开「E-Hentai 标签…」，点任一 tag = 追加进检索条件
+- **匹配是本地算的**：导入数据包后自动匹配你的书库（实测 44 万本 ~1.5 分钟），此后检索毫秒级
+- **阅读器**：翻页（左右分区点击）、双页对开、RTL（日漫）、捏合缩放 + 双击、旋转、进度记忆、
+  三级封面缓存；v0.5.1 起页位图所有权归位——任何页面尺寸的书都不会出现"闪烁重刷"
+- **格式**：zip/cbz、rar/cbr、目录型；stb / WebP / AVIF 解码链
+- **网络**：SMB2/SMB3 直连（多共享、多凭据）；实时同步（CHANGE_NOTIFY）可用时自动增量
 
 ## 截图
 
@@ -25,6 +33,20 @@
 |---|---|
 | ![目录树](screenshots/03-folder-tree.jpg) | ![书籍操作](screenshots/04-book-actions.jpg) |
 
+## E-Hentai 标签数据库（v0.5 核心新增）
+
+**数据包从哪来（二选一）**：
+
+1. **桌面构建器自建（推荐）**：用仓库内 [`ehmeta-builder/`](ehmeta-builder/README.md)（Mac/PC 桌面 GUI，
+   纯 Python 标准库）→ 一键从已验证的公开来源抽取最新元数据 → 产出 `ehmeta.db.zip`；
+   支持填代理端口（如 Clash Verge 混合端口）；每期仅需下载变化的源（~567MB）
+2. **他人分发的数据包**：Release 附件提供一份构建好的 `ehmeta.db.zip`（仅元数据：标题/标签，
+   **不含任何图像**；来源与许可见 [NOTICE](NOTICE)）
+
+**导入**：把 `ehmeta.db.zip` 放到任一位置（`/sdcard/ComicShelfModels/ehmeta/`、应用外部目录/ehmeta/、
+或设置里自定义目录）→ App 设置 →「E-Hentai 数据」→ 导入（约 3 分钟）+ 自动匹配。
+设备占用约 1.7GB（元数据库 1.42GB + 键索引 98MB + 匹配结果 149MB），**完全可选、卸载即清、不影响其他功能**。
+
 ## 架构
 
 ```
@@ -34,6 +56,7 @@
 │   │   POST /ocr_page             POST /chat {system,user,…}       │
 │   ▼                                 ▼                            │
 │ 设备档案（框+原文+译文 JSON）── 离线重渲染（墨迹擦除/排版，无网络） │
+│ 本地库（library.db）：书目/进度/收藏 + EH 匹配（match.db）         │
 └───────────────┬───────────────────────────┬──────────────────────┘
                 │ LAN (Wi-Fi 或 adb reverse) │
 ┌───────────────▼───────────────────────────▼──────────────────────┐
@@ -72,6 +95,8 @@ gradle :app:assembleDebug          # 或直接用 Android Studio 打开本目录
 
 `local.properties` 需指向你的 Android SDK（`sdk.dir=…`，已被 .gitignore 忽略）。
 首次构建会编译 vendored 的 C++ 第三方库（sqlite/ncnn/aom/libavif/webp/unrar/…），耗时数分钟。
+**发布构建**：`assembleRelease` 后用 `llvm-strip --strip-debug` 处理 `lib/*.so`（去除 DWARF 中的
+构建机路径）再签名——发布纪律见 `PUBLISH.md §21`。
 
 ### 可选依赖（缺失会自动裁剪，不影响"局域网后端翻译"主线）
 
@@ -110,6 +135,9 @@ gradle :app:assembleDebug          # 或直接用 Android Studio 打开本目录
   本项目基于其 0.9 版源码移植），检测后处理链亦以其为对照；衍生作品需保持同一许可。
 - 第三方组件与其许可（ncnn / aom / libavif / libwebp / sqlite / stb / miniz / unrar / libsmb2 /
   llama.cpp / onnxruntime / AndroidX 等）见 [NOTICE](NOTICE)。
+- **E-Hentai 元数据的数据来源与署名**（tag 中文名来自
+  [EhTagTranslation](https://github.com/EhTagTranslation/Database)，**CC BY-NC-SA 4.0**；
+  其余来源见 [NOTICE](NOTICE) 与产物 `meta.json.licenses`）。
 - 模型权重（CTBD、PaddleOCR-VL-For-Manga、Hy-MT2）**不在本仓库内**，由 `backend/fetch_models.py`
   从 HuggingFace 下载；使用请遵循各模型卡声明的许可。
 
