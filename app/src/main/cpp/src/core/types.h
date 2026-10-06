@@ -85,6 +85,7 @@ enum class SortKey : int {
     Size,
     Mtime,
     Pages,
+    LastRead = 6,   // v0.5.3：浏览历史/最近阅读（book_meta.last_read_at）
 };
 
 // Live progress of a scan. Pointers to this stay valid for the scanner's life.

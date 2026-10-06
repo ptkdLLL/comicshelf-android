@@ -42,6 +42,7 @@ const char* sort_column(SortKey k) {
         case SortKey::Size: return "size";
         case SortKey::Mtime: return "mtime";
         case SortKey::Pages: return "pages";
+        case SortKey::LastRead: return "m.last_read_at";   // P-H2：浏览历史排序（有 LEFT JOIN m）
         case SortKey::Added:
         default: return "id";
     }
@@ -74,9 +75,11 @@ struct FilterBuild {
 };
 
 FilterBuild make_filter(const std::string& dir_rel, bool recursive, const std::string& search,
-                        bool fav_only = false, int read_state = -1) {
+                        bool fav_only = false, int read_state = -1, int64_t lib_id = 1) {
     FilterBuild f;
-    f.where = " WHERE lib_id=?1";
+    // P-H4：lib_id<=0 ≡ 全部库（浏览历史跨库）。省去 lib 子句时 ?1 缺号——
+    // 占位符编号仍自 ?2 起（n=2），bind_filter 对 ?1 的绑定是 SQLITE_RANGE no-op。
+    f.where = (lib_id > 0) ? " WHERE lib_id=?1" : " WHERE 1=1";
     int n = 2;
     if (!dir_rel.empty()) {
         if (recursive) {
@@ -108,6 +111,8 @@ FilterBuild make_filter(const std::string& dir_rel, bool recursive, const std::s
         f.where += " AND EXISTS(SELECT 1 FROM book_meta m WHERE m.book_id=books.id AND m.read_state=1)";
     else if (read_state == 2)
         f.where += " AND EXISTS(SELECT 1 FROM book_meta m WHERE m.book_id=books.id AND m.read_state>=2)";
+    else if (read_state == -2)   // P-H4：仅"读过"（浏览历史哨兵；UI 循环只走 -1..2）
+        f.where += " AND EXISTS(SELECT 1 FROM book_meta m WHERE m.book_id=books.id AND m.last_read_at>0)";
     f.next_index = n;
     return f;
 }
@@ -660,7 +665,7 @@ int64_t Database::count_books(int64_t lib_id, const std::string& search,
                               bool fav_only, int read_state) {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     if (!db_) return 0;
-    FilterBuild f = make_filter(dir_rel, recursive, search, fav_only, read_state);
+    FilterBuild f = make_filter(dir_rel, recursive, search, fav_only, read_state, lib_id);
     std::string sql = "SELECT COUNT(*) FROM books" + f.where;
 
     sqlite3_stmt* st = nullptr;
@@ -683,7 +688,7 @@ std::vector<Book> Database::page_books(int64_t lib_id, const std::string& search
     if (!db_ || limit <= 0) return out;
     if (offset < 0) offset = 0;
 
-    FilterBuild f = make_filter(dir_rel, recursive, search, fav_only, read_state);
+    FilterBuild f = make_filter(dir_rel, recursive, search, fav_only, read_state, lib_id);
     std::string sql = std::string("SELECT ") + kBookColumns + kBookJoin + f.where;
     sql += " ORDER BY ";
     sql += sort_column(sort);

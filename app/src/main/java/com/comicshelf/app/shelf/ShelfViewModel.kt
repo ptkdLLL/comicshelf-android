@@ -32,7 +32,8 @@ import kotlinx.coroutines.withContext
 /** Sort order mirrors cs::SortKey on the native side. */
 enum class ShelfSort(val key: Int, val label: String) {
     ADDED(0, "添加时间"), TITLE(1, "标题"), PATH(2, "路径"),
-    SIZE(3, "大小"), MTIME(4, "修改时间"), PAGES(5, "页数");
+    SIZE(3, "大小"), MTIME(4, "修改时间"), PAGES(5, "页数"),
+    LAST_READ(6, "最近阅读");
 }
 
 data class ShelfQuery(
@@ -43,7 +44,8 @@ data class ShelfQuery(
     val dirRel: String,     // "" = whole library
     val recursive: Boolean,
     val favOnly: Boolean,
-    val readState: Int,     // -1 any, 0 unread, 1 reading, 2 finished
+    val readState: Int,     // -1 any, 0 unread, 1 reading, 2 finished, -2 读过（浏览历史哨兵）
+    val history: Boolean = false,   // v0.5.3 浏览历史模式（跨库/50 帽/退出还原；见 BROWSE_HISTORY_PLAN.md）
 )
 
 /** One cell of the virtualized cover wall. */
@@ -59,6 +61,9 @@ data class ScanProgressRow(
  * 2048-row-window architecture that kept the Windows app flat at a million
  * books, now feeding LazyVerticalGrid.
  */
+/** v0.5.3 浏览历史上限（计划 P-H7；UI 文案同源引用）。 */
+internal const val HISTORY_MAX = 50L
+
 class ShelfPagingSource(private val q: ShelfQuery) : PagingSource<Long, BookCell>() {
 
     // Offset-based keys are directly jumpable (jumpingSupported) — this is what
@@ -74,14 +79,21 @@ class ShelfPagingSource(private val q: ShelfQuery) : PagingSource<Long, BookCell
         withContext(CoreDispatcher) {
             try {
                 val offset = params.key ?: 0L
-                val limit = params.loadSize
-                val total = NativeBridge.count(q.libId, q.search, q.dirRel, q.recursive,
-                                               q.favOnly, q.readState)
-                val rows = parsePageBundle(
+                val rawLimit = params.loadSize
+                val totalRaw = NativeBridge.count(q.libId, q.search, q.dirRel, q.recursive,
+                                                  q.favOnly, q.readState)
+                // v0.5.3 浏览历史：50 上限必须**同时**夹 total（placeholders 的 itemCount 源，
+                // 决定滚动条/占位）与单页 limit（P-H7 / G-H1），否则第 51 本会从占位里露出来。
+                val total = if (q.history) minOf(totalRaw, HISTORY_MAX) else totalRaw
+                val limit = if (q.history)
+                    minOf(rawLimit.toLong(), (HISTORY_MAX - offset).coerceAtLeast(0L)).toInt()
+                else rawLimit
+                val rows = if (limit <= 0) emptyList<BookCell>() else parsePageBundle(
                     NativeBridge.page(q.libId, q.search, q.sort.key, q.desc,
                                       offset, limit, q.dirRel, q.recursive, q.favOnly, q.readState))
                 android.util.Log.i("ShelfPaging",
-                    "load lib=${q.libId} off=$offset lim=$limit total=$total rows=${rows.size}")
+                    "load lib=${q.libId} off=$offset lim=$limit total=$total " +
+                    "hist=${q.history} rows=${rows.size}")
                 val next = if (offset + rows.size < total) offset + rows.size else null
                 val prev = if (offset > 0) maxOf(0L, offset - limit) else null
                 // S-2：喂给 Paging 的前后计数（placeholders 的 itemCount 推导），
@@ -151,7 +163,7 @@ class ShelfViewModel : ViewModel() {
             append(q.libId).append('|').append(q.dirRel).append('|').append(q.search)
             append('|').append(q.sort).append('|').append(q.desc)
             append('|').append(q.recursive).append('|').append(q.favOnly)
-            append('|').append(q.readState)
+            append('|').append(q.readState).append('|').append(q.history)
         }
     }
 
@@ -181,32 +193,58 @@ class ShelfViewModel : ViewModel() {
     }
 
     fun setLibrary(id: Long) {
-        query.value = query.value.copy(libId = id, dirRel = "")
+        query.value = query.value.copy(libId = id, dirRel = "", history = false)
         queryVersion.value++
     }
 
     fun setSearch(s: String) {
-        query.value = query.value.copy(search = s)
+        query.value = query.value.copy(search = s, history = false)
         queryVersion.value++
     }
 
     fun setSort(sort: ShelfSort, desc: Boolean) {
-        query.value = query.value.copy(sort = sort, desc = desc)
+        query.value = query.value.copy(sort = sort, desc = desc, history = false)
         queryVersion.value++
     }
 
     fun setDir(rel: String) {
-        query.value = query.value.copy(dirRel = rel)
+        query.value = query.value.copy(dirRel = rel, history = false)
         queryVersion.value++
     }
 
     fun setRecursive(r: Boolean) {
-        query.value = query.value.copy(recursive = r)
+        query.value = query.value.copy(recursive = r, history = false)
         queryVersion.value++
     }
 
     fun setFilters(favOnly: Boolean, readState: Int) {
-        query.value = query.value.copy(favOnly = favOnly, readState = readState)
+        query.value = query.value.copy(favOnly = favOnly, readState = readState, history = false)
+        queryVersion.value++
+    }
+
+    // ---- v0.5.3 浏览历史（计划 P-H6：进入即快照、退出即还原；任何其它参数变更自动退出）----
+
+    private var preHistory: ShelfQuery? = null
+
+    /** 进入跨库"浏览历史"：lib=-1（全部库）/按 last_read_at 倒序/仅读过/50 帽（P-H4/H7）。
+     *  recursive 必须 true：dirRel 空 + recursive=false 会被 make_filter 解释为"仅库根"，
+     *  子目录里的书会整批消失（动态阶段 G-H5 实测抓到：bb/ 下 4 本被滤）。 */
+    fun setHistory() {
+        if (query.value.history) return
+        preHistory = query.value
+        query.value = ShelfQuery(
+            libId = -1, search = "", sort = ShelfSort.LAST_READ, desc = true,
+            dirRel = "", recursive = true, favOnly = false, readState = -2, history = true)
+        queryVersion.value++
+    }
+
+    /** 退出浏览历史：原样还原进入前的查询（滚动位分账——qKey 含 history）。 */
+    fun exitHistory() {
+        if (!query.value.history) return
+        query.value = preHistory ?: query.value.copy(
+            history = false, libId = 0, sort = ShelfSort.ADDED, desc = true,
+            readState = -1, dirRel = "", search = "")
+        preHistory = null
         queryVersion.value++
     }
 

@@ -142,6 +142,7 @@ SortKey sort_from(int s) {
         case 3: return SortKey::Size;
         case 4: return SortKey::Mtime;
         case 5: return SortKey::Pages;
+        case 6: return SortKey::LastRead;
         default: return SortKey::Added;
     }
 }

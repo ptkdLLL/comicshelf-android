@@ -24,7 +24,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Autorenew
@@ -205,6 +208,10 @@ fun ShelfScreen(
 
     val drawer = rememberDrawerState(androidx.compose.material3.DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    // v0.5.3：历史模式下返回键=退出历史（抽屉开着时先关抽屉——不抢事件；计划 G-H4）
+    BackHandler(enabled = query.history && !drawer.isOpen) { vm.exitHistory() }
+    // G-H6（1080 宽实测）：顶栏 8 按钮曾把标题挤成 0——窄屏（<600dp）低频操作收进溢出菜单
+    val wide = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp >= 600
     val ctx = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var searchEdit by remember { mutableStateOf(query.search) }
@@ -240,6 +247,10 @@ fun ShelfScreen(
                         vm.setLibrary(it)
                         scope.launch { drawer.close() }
                     },
+                    onOpenHistory = {
+                        vm.setHistory()
+                        scope.launch { drawer.close() }
+                    },
                     onRescan = { vm.rescan(it) },
                     onRemove = { id -> removeTarget = libs.firstOrNull { it.id == id } },
                     onPickDir = {
@@ -256,17 +267,28 @@ fun ShelfScreen(
                     title = {
                         Column {
                             Text(
-                                if (query.dirRel.isEmpty()) "全部漫画"
-                                else query.dirRel.substringAfterLast('/'),
+                                when {
+                                    query.history -> "浏览历史"
+                                    query.dirRel.isEmpty() -> "全部漫画"
+                                    else -> query.dirRel.substringAfterLast('/')
+                                },
                                 maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 style = MaterialTheme.typography.titleMedium,
                             )
-                            libs.firstOrNull { it.id == query.libId }?.let {
+                            if (query.history) {
                                 Text(
-                                    "${it.count} 本 · ${it.name}",
+                                    "最近打开 · ≤$HISTORY_MAX 本",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
+                            } else {
+                                libs.firstOrNull { it.id == query.libId }?.let {
+                                    Text(
+                                        "${it.count} 本 · ${it.name}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                             }
                         }
                     },
@@ -276,6 +298,11 @@ fun ShelfScreen(
                         }
                     },
                     actions = {
+                        if (query.history && wide) {
+                            IconButton(onClick = { vm.exitHistory() }) {
+                                Icon(Icons.Filled.Close, "退出浏览历史")
+                            }
+                        }
                         var showSearch by remember { mutableStateOf(false) }
                         if (showSearch) {
                             OutlinedTextField(
@@ -316,13 +343,15 @@ fun ShelfScreen(
                                     onClick = {
                                         val desc = if (query.sort == s) !query.desc else
                                             s == ShelfSort.ADDED || s == ShelfSort.SIZE ||
-                                            s == ShelfSort.MTIME || s == ShelfSort.PAGES
+                                            s == ShelfSort.MTIME || s == ShelfSort.PAGES ||
+                                            s == ShelfSort.LAST_READ
                                         vm.setSort(s, desc)
                                         sortMenu = false
                                     },
                                 )
                             }
                         }
+                        if (wide) {
                         var filterMenu by remember { mutableStateOf(false) }
                         IconButton(onClick = { filterMenu = true }) {
                             Icon(Icons.Filled.Visibility, "过滤")
@@ -368,6 +397,62 @@ fun ShelfScreen(
                             }
                         }) {
                             Icon(Icons.Filled.Autorenew, "重提失败封面")
+                        }
+                        } else {
+                            // G-H6 窄屏：过滤三项 + 重扫 + 重提收进溢出菜单（功能等价，纯布局响应式）
+                            var overflow by remember { mutableStateOf(false) }
+                            IconButton(onClick = { overflow = true }) {
+                                Icon(Icons.Filled.MoreVert, "更多功能")
+                            }
+                            DropdownMenu(expanded = overflow,
+                                         onDismissRequest = { overflow = false }) {
+                                DropdownMenuItem(
+                                    text = { Text((if (query.favOnly) "● " else "○ ") + "只看收藏") },
+                                    onClick = {
+                                        vm.setFilters(!query.favOnly, query.readState)
+                                        overflow = false
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(when (query.readState) {
+                                            0 -> "● 未读"; 1 -> "● 在读"; 2 -> "● 读完"
+                                            else -> "○ 全部状态"
+                                        })
+                                    },
+                                    onClick = {
+                                        val next = query.readState + 1
+                                        vm.setFilters(query.favOnly, if (next > 2) -1 else next)
+                                        overflow = false
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text((if (query.recursive) "● " else "○ ") + "含子目录") },
+                                    onClick = { vm.setRecursive(!query.recursive); overflow = false },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("重扫本库") },
+                                    onClick = { vm.rescan(); overflow = false },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("重提失败封面") },
+                                    onClick = {
+                                        overflow = false
+                                        scope.launch {
+                                            val n = withContext(CoreDispatcher) {
+                                                NativeBridge.retryFailedCovers()
+                                            }
+                                            coverRetryGen.value++
+                                            Toast.makeText(
+                                                ctx,
+                                                if (n > 0) "已重置 $n 个失败封面，重新提取中…"
+                                                else "已重新排队可见封面",
+                                                Toast.LENGTH_SHORT,
+                                            ).show()
+                                        }
+                                    },
+                                )
+                            }
                         }
                         // S2：E-Hentai 标签检索入口（仅在数据就绪时出现）
                         if (onOpenEhTags != null) {
@@ -421,9 +506,11 @@ fun ShelfScreen(
                             Modifier.align(Alignment.Center),
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
-                            Text("没有漫画", style = MaterialTheme.typography.titleMedium)
+                            Text(if (query.history) "还没有浏览记录" else "没有漫画",
+                                 style = MaterialTheme.typography.titleMedium)
                             Text(
-                                if (libs.isEmpty()) "先添加一个书库文件夹" else "换个搜索词或目录试试",
+                                if (query.history) "打开任意一本书后会自动出现在这里"
+                                else if (libs.isEmpty()) "先添加一个书库文件夹" else "换个搜索词或目录试试",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -578,6 +665,7 @@ private fun LibraryDrawerContent(
     libs: List<LibraryRow>,
     query: ShelfQuery,
     onPickLibrary: (Long) -> Unit,
+    onOpenHistory: () -> Unit,
     onRescan: (Long) -> Unit,
     onRemove: (Long) -> Unit,
     onPickDir: (String) -> Unit,
@@ -615,6 +703,16 @@ private fun LibraryDrawerContent(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+        }
+        item(key = "history") {
+            androidx.compose.material3.NavigationDrawerItem(
+                icon = { Icon(Icons.Filled.History, null) },
+                label = { Text("浏览历史") },
+                badge = { Text("≤$HISTORY_MAX") },
+                selected = query.history,
+                onClick = onOpenHistory,
+                modifier = Modifier.padding(horizontal = 8.dp),
+            )
         }
         item(key = "hdr-dir") {
             Text(
