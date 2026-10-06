@@ -108,6 +108,15 @@ class EhTagViewModel : ViewModel() {
         recompute()
     }
 
+    /** v0.5.2 长按菜单：从 EH 标签面板点击 tag = **追加进当前检索**（已选则不动；
+     *  区别于 toggleTag 的"再点移除"语义——面板点击的意图是"看这个 tag"） */
+    fun pickTag(t: EhTagQuery.TagEntry) {
+        val sel = _ui.value.selected
+        if (sel.any { it.rid == t.rid }) return
+        _ui.value = _ui.value.copy(selected = sel + t)
+        recompute()
+    }
+
     fun clearTags() {
         _ui.value = _ui.value.copy(selected = emptyList())
         recompute()

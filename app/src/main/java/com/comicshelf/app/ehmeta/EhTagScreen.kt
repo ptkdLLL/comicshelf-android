@@ -51,6 +51,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.comicshelf.app.shelf.CoverCell
+import android.util.Log
+import android.widget.Toast
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import com.comicshelf.app.core.BookCell
+import com.comicshelf.app.core.NativeBridge
+import com.comicshelf.app.reader.BookTranslateJob
+import com.comicshelf.app.shelf.BookContextMenu
+import com.comicshelf.app.shelf.ShelfViewModel
+import com.comicshelf.app.shelf.TagsDialog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * E-Hentai tag 检索视图（S2 · 纯平行视图 —— B3 决策：不叠加现有搜索框）。
@@ -64,6 +79,7 @@ import com.comicshelf.app.shelf.CoverCell
 @Composable
 fun EhTagScreen(
     vm: EhTagViewModel,
+    shelfVm: ShelfViewModel,
     preloadRid: Long?,
     onBack: () -> Unit,
     onOpenBook: (Long, String, Boolean) -> Unit,
@@ -71,6 +87,15 @@ fun EhTagScreen(
     val ui by vm.ui.collectAsState()
     LaunchedEffect(Unit) { vm.activate() }
     LaunchedEffect(preloadRid) { vm.applyPreload(preloadRid) }
+
+    // v0.5.2 长按菜单（书库同源面板；全量动作）——docs/EH_TAG_LONGPRESS_PLAN.md
+    var contextBook by remember { mutableStateOf<BookCell?>(null) }
+    var ehBookTagsFor by remember { mutableStateOf<BookCell?>(null) }
+    var showTagsDialog by remember { mutableStateOf(false) }
+    val trJob by BookTranslateJob.state.collectAsState()
+    val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
 
     // 挑选/结果模式由 VM 持有（进阅读器返回后模式不跳变）
     var showPicker by vm.showPicker
@@ -149,10 +174,73 @@ fun EhTagScreen(
             if (showPicker) {
                 PickerArea(vm, ui, onShowResults = { showPicker = false })
             } else {
-                ResultsArea(vm, ui, onOpenBook = onOpenBook,
-                    modifier = Modifier.weight(1f).fillMaxWidth())
+                ResultsArea(
+                    vm, ui, onOpenBook = onOpenBook,
+                    onLongPress = { contextBook = it },
+                    onToggleFav = {
+                        shelfVm.toggleFavorite(it)
+                        vm.refreshLoadedRows()
+                    },
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                )
             }
         }
+    }
+
+    // ---- v0.5.2 长按菜单 / EH 面板 / 标签管理器（书库同源组件）----
+    contextBook?.let { cell ->
+        BookContextMenu(
+            cell = cell,
+            onDismiss = { contextBook = null },
+            onOpen = { onOpenBook(cell.id, cell.title, false) },
+            onOpenTranslated = { onOpenBook(cell.id, cell.title, true) },
+            onToggleTranslate = { on ->
+                shelfVm.setBookTranslate(cell.id, on, cell.pages, cell.lastPage)
+                contextBook = null
+            },
+            job = trJob.takeIf { it.bookId == cell.id },
+            translateEnabledOf = { shelfVm.bookTranslateEnabled(cell.id) },
+            onToggleFav = {
+                shelfVm.toggleFavorite(cell)
+                vm.refreshLoadedRows()
+                contextBook = null
+            },
+            onMark = {
+                shelfVm.setReadState(listOf(cell.id), it)
+                vm.refreshLoadedRows()
+                contextBook = null
+            },
+            onTags = { showTagsDialog = true; contextBook = null },
+            onRegenerateCover = { shelfVm.regenerateCover(cell.id); contextBook = null },
+            onEhTags = { ehBookTagsFor = cell; contextBook = null },
+            onExportName = {
+                contextBook = null
+                scope.launch {
+                    val name = withContext(Dispatchers.IO) { NativeBridge.bookFileName(cell.id) }
+                    if (name.isBlank()) {
+                        Toast.makeText(ctx, "导出失败：书名缺失", Toast.LENGTH_SHORT).show()
+                    } else {
+                        clipboard.setText(AnnotatedString(name))
+                        Log.i("EhTagExport", "书名已复制: $name")
+                        Toast.makeText(ctx, "已复制书名：$name", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+        )
+    }
+    ehBookTagsFor?.let { cell ->
+        EhBookTagsPanel(
+            bookId = cell.id,
+            onDismiss = { ehBookTagsFor = null },
+            onPickTag = { t ->
+                ehBookTagsFor = null
+                vm.pickTag(t)          // 追加进当前检索（已选不动）
+                showPicker = false     // 落回结果视图
+            },
+        )
+    }
+    if (showTagsDialog) {
+        TagsDialog(onDismiss = { showTagsDialog = false })
     }
 }
 
@@ -262,6 +350,8 @@ private fun ResultsArea(
     vm: EhTagViewModel,
     ui: EhTagViewModel.UiState,
     onOpenBook: (Long, String, Boolean) -> Unit,
+    onLongPress: (BookCell) -> Unit,
+    onToggleFav: (BookCell) -> Unit,
     modifier: Modifier = Modifier.fillMaxSize(),
 ) {
     when {
@@ -303,8 +393,8 @@ private fun ResultsArea(
                         job = null,
                         lowFi = false,
                         onClick = { onOpenBook(cell.id, cell.title, false) },
-                        onLongClick = {},
-                        onToggleFav = {},
+                        onLongClick = { onLongPress(cell) },
+                        onToggleFav = { onToggleFav(cell) },
                     )
                 }
                 if (ui.loadingMore) {

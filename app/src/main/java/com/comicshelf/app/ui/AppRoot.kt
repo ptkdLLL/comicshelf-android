@@ -117,6 +117,7 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
             )
             is Screen.EhTags -> EhTagScreen(
                 vm = ehTagVm,
+                shelfVm = shelfVm,
                 preloadRid = s.rid,
                 onBack = { screen = Screen.Shelf },
                 onOpenBook = { id, title, translate ->

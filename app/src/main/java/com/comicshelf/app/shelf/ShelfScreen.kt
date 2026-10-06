@@ -1001,94 +1001,7 @@ private fun SelectionBar(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun BookContextMenu(
-    cell: BookCell,
-    onDismiss: () -> Unit,
-    onOpen: () -> Unit,
-    onOpenTranslated: () -> Unit,
-    onToggleTranslate: (Boolean) -> Unit,
-    job: BookTranslateJob.State?,
-    translateEnabledOf: suspend () -> Boolean,
-    onToggleFav: () -> Unit,
-    onMark: (Int) -> Unit,
-    onTags: () -> Unit,
-    onRegenerateCover: () -> Unit,
-    onEhTags: (() -> Unit)? = null,      // S2：E-Hentai 标签面板（未载入数据包时为 null → 不渲染）
-    onExportName: () -> Unit,
-) {
-    var markMenu by remember { mutableStateOf(false) }
-    val trOn by produceState(initialValue = false, cell.id) { value = translateEnabledOf() }
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(bottom = 24.dp)) {
-            Text(
-                cell.title,
-                Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
-                style = MaterialTheme.typography.titleMedium,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
-            )
-            SheetAction(Icons.AutoMirrored.Filled.MenuBook, "打开阅读", onOpen)
-            SheetAction(Icons.Filled.Translate, "翻译并打开（本次）", onOpenTranslated)
-            SheetAction(
-                if (trOn) Icons.Filled.Translate else Icons.Outlined.Translate,
-                if (trOn) "关闭本册翻译" else "为本册启用翻译（整本后台）",
-            ) { onToggleTranslate(!trOn) }
-            job?.let { j ->
-                if (j.active) {
-                    SheetAction(Icons.Filled.Schedule, "后台翻译 ${j.done}/${j.total}" +
-                        (if (j.paused) "（已暂停）" else ""), {})
-                    SheetAction(
-                        if (j.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
-                        if (j.paused) "继续后台翻译" else "暂停后台翻译",
-                    ) {
-                        if (j.paused) BookTranslateJob.resume() else BookTranslateJob.pause()
-                        onDismiss()
-                    }
-                }
-            }
-            SheetAction(
-                if (cell.favorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                if (cell.favorite) "取消收藏" else "加入收藏",
-                onToggleFav,
-            )
-            SheetAction(Icons.Filled.Schedule, "标记为在读", { onMark(1) })
-            SheetAction(Icons.Filled.DoneAll, "标记为读完", { onMark(2) })
-            SheetAction(Icons.Filled.Label, "标签…", onTags)
-            onEhTags?.let { SheetAction(Icons.Filled.Label, "E-Hentai 标签…", it) }
-            SheetAction(Icons.Filled.Image, "重新生成封面", onRegenerateCover)
-            SheetAction(Icons.Filled.ContentCopy, "导出书名（复制到剪贴板）", onExportName)
-        }
-    }
-    if (markMenu) {
-        AlertDialog(onDismissRequest = { markMenu = false },
-            title = { Text("阅读状态") },
-            confirmButton = {},
-            text = {
-                Column {
-                    TextButton(onClick = { onMark(0); markMenu = false }) { Text("未读") }
-                    TextButton(onClick = { onMark(1); markMenu = false }) { Text("在读") }
-                    TextButton(onClick = { onMark(2); markMenu = false }) { Text("读完") }
-                }
-            })
-    }
-}
-
-@Composable
-private fun SheetAction(icon: ImageVector, label: String, action: () -> Unit) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clickable { action() }
-            .padding(horizontal = 24.dp, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(icon, null, Modifier.size(22.dp),
-             tint = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.width(16.dp))
-        Text(label, style = MaterialTheme.typography.bodyLarge)
-    }
-}
+// v0.5.2：BookContextMenu / SheetAction 已搬家至 shelf/BookContextMenu.kt（书架/标签页共用；零逻辑变更）
 
 @Composable
 private fun AddLibraryDialog(
@@ -1458,45 +1371,7 @@ private fun DirBrowserDialog(host: String, share: String, startSub: String,
     )
 }
 
-@Composable
-private fun TagsDialog(onDismiss: () -> Unit) {
-    var tags by remember { mutableStateOf<List<String>>(emptyList()) }
-    var edit by remember { mutableStateOf("") }
-    LaunchedEffect(Unit) {
-        tags = withContext(CoreDispatcher) { Json.strings(NativeBridge.allTags()) }
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("标签") },
-        text = {
-            Column {
-                tags.forEach { t ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(t, Modifier.weight(1f))
-                        TextButton(onClick = {
-                            NativeBridge.deleteTag(t)
-                            tags = tags - t
-                        }) { Text("删除") }
-                    }
-                }
-                if (tags.isEmpty()) {
-                    Text("暂无标签", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(edit, { edit = it }, Modifier.weight(1f),
-                                      label = { Text("新标签") }, singleLine = true)
-                    TextButton(onClick = {
-                        if (edit.isNotBlank()) {
-                            tags = tags + edit
-                            edit = ""
-                        }
-                    }) { Text("添加") }
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
-    )
-}
+// v0.5.2：TagsDialog 已搬家至 shelf/BookContextMenu.kt（书架/标签页共用）
 
 // ---------------------------------------------------------------- scrollbar
 
