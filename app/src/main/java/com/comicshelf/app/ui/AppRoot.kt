@@ -35,6 +35,8 @@ sealed class Screen {
 @Composable
 fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
     var screen by remember { mutableStateOf<Screen>(Screen.Shelf) }
+    // 打开阅读器的来源（关闭时回到这里；仅两个赋值点：书架 / 标签检索页）
+    var readerOrigin by remember { mutableStateOf<Screen>(Screen.Shelf) }
 
     val shelfVm: ShelfViewModel = viewModel()
     val readerVm: ReaderViewModel = viewModel()
@@ -51,7 +53,9 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
         readerVm.closeBook()
         // 刷新阅读徽标/页数；书架滚动位置由 VM 里的 gridState 保持
         shelfVm.refreshAfterRead()
-        screen = Screen.Shelf
+        // 来源是标签检索页时：等量刷新其已加载行的阅读徽标（滚动位/模式由该页 VM 状态保持）
+        if (readerOrigin is Screen.EhTags) ehTagVm.refreshLoadedRows()
+        screen = readerOrigin
     }
     val closeSettings: () -> Unit = { screen = Screen.Shelf }
     BackHandler(enabled = screen is Screen.Reader) { closeReader() }
@@ -89,6 +93,7 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
                 onOpenAllFilesAccess = onOpenAllFilesAccess,
                 onOpenSettings = { screen = Screen.Settings },
                 onOpenBook = { id, title, translate ->
+                    readerOrigin = Screen.Shelf
                     screen = Screen.Reader(id, title, translate)
                 },
                 onOpenEhTags = if (ehReady) {
@@ -115,6 +120,7 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
                 preloadRid = s.rid,
                 onBack = { screen = Screen.Shelf },
                 onOpenBook = { id, title, translate ->
+                    readerOrigin = Screen.EhTags(s.rid, s.label)   // 关闭阅读器回标签检索页
                     screen = Screen.Reader(id, title, translate)
                 },
             )

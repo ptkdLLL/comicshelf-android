@@ -18,7 +18,6 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -73,7 +72,8 @@ fun EhTagScreen(
     LaunchedEffect(Unit) { vm.activate() }
     LaunchedEffect(preloadRid) { vm.applyPreload(preloadRid) }
 
-    var showPicker by remember { mutableStateOf(true) }
+    // 挑选/结果模式由 VM 持有（进阅读器返回后模式不跳变）
+    var showPicker by vm.showPicker
     // 首个 tag 选中后自动切到结果；清空后回到挑选
     LaunchedEffect(ui.selected.size) {
         if (ui.selected.isNotEmpty()) showPicker = false
@@ -206,7 +206,7 @@ private fun PickerArea(
                 Text(ui.error ?: "无匹配标签", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
-            LazyColumn(Modifier.weight(1f)) {
+            LazyColumn(Modifier.weight(1f), state = vm.pickerListState) {
                 items(ui.picker.tags, key = { it.rid }) { t ->
                     TagRow(t, selected = ui.selected.any { it.rid == t.rid }) { vm.toggleTag(t) }
                 }
@@ -277,7 +277,7 @@ private fun ResultsArea(
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         else -> {
-            val gridState = rememberLazyGridState()
+            val gridState = vm.gridState   // VM 持有：进阅读器返回后逐像素保持
             // ⚠️ 不可在 derivedStateOf 内直接读 ui（参数值会被 remember 捕获为首帧快照）——
             // 用 snapshotFlow 监听「可见末端」与「已载行数」两个可观察量。
             LaunchedEffect(gridState, ui.rows.size, ui.resultTotal) {

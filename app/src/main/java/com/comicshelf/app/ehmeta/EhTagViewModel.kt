@@ -1,5 +1,8 @@
 package com.comicshelf.app.ehmeta
 
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.grid.LazyGridState
+import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.comicshelf.app.core.BookCell
@@ -40,6 +43,19 @@ class EhTagViewModel : ViewModel() {
     private var activated = false
 
     private val pageSize = 60
+
+    // ---------------------------------------------------------------- UI 状态（跨组合树存活）
+    // 屏幕被移出组合（进阅读器/切屏）时 remember 状态会丢；提升到 VM 后返回时
+    // 滚动位置/挑选模式原样保留。照 ShelfViewModel.gridState 既有先例（S1 起）。
+
+    /** 结果网格滚动位置 */
+    val gridState = LazyGridState()
+
+    /** 挑选区 tag 列表滚动位置 */
+    val pickerListState = LazyListState()
+
+    /** 挑选(true)/结果(false)模式；随选中状态自动切换，用户可手动回到挑选 */
+    val showPicker = mutableStateOf(true)
 
     // ---------------------------------------------------------------- 激活/字典
 
@@ -161,6 +177,28 @@ class EhTagViewModel : ViewModel() {
                 .onFailure { t ->
                     _ui.value = _ui.value.copy(loadingMore = false,
                         error = "分页读取失败: ${t.message}")
+                }
+        }
+    }
+
+    /** 从阅读器返回标签页：等量替换已加载行，刷新阅读徽标（页码/在读）。
+     *  仅当窗口未被并发扩展/重置（长度仍 == n）时替换——防丢行/串页；
+     *  失败静默（徽标刷新属尽力而为，不进 error 通道）。 */
+    fun refreshLoadedRows() {
+        val r = result ?: return
+        val n = _ui.value.rows.size
+        if (n == 0) return
+        val q = EhEngine.tagQuery() ?: return
+        viewModelScope.launch {
+            val t0 = System.currentTimeMillis()
+            runCatching { q.page(r, 0, n) }
+                .onSuccess { fresh ->
+                    android.util.Log.i("EhTagUi",
+                        "refresh n=$n got=${fresh.size} ms=${System.currentTimeMillis() - t0}")
+                    val st = _ui.value
+                    if (st.rows.size == n && fresh.size == n) {
+                        _ui.value = st.copy(rows = fresh)
+                    }
                 }
         }
     }
