@@ -19,6 +19,7 @@
 - **标签面板可反向导航**：读一本书时打开「E-Hentai 标签…」，点任一 tag = 追加进检索条件
 - **匹配是本地算的**：导入数据包后自动匹配你的书库（实测 44 万本 ~1.5 分钟），此后检索毫秒级
 - **阅读器**：翻页（左右分区点击）、双页对开、RTL（日漫）、捏合缩放 + 双击、旋转、进度记忆、
+  **切分阅读**（v0.5.5 手动开关：双页图源按中缝对半成单页，竖屏每屏更大显示面积；按册记忆）、
   三级封面缓存；v0.5.1 起页位图所有权归位——任何页面尺寸的书都不会出现"闪烁重刷"
 - **格式**：zip/cbz、rar/cbr、目录型；stb / WebP / AVIF 解码链
 - **网络**：SMB2/SMB3 直连（多共享、多凭据）；实时同步（CHANGE_NOTIFY）可用时自动增量
@@ -105,6 +106,10 @@ gradle :app:assembleDebug          # 或直接用 Android Studio 打开本目录
 | libsmb2 头/运行库（NAS 支持） | `app/src/main/cpp/third_party/libsmb2` + `jniLibs/…/libsmb2.so` | 仓库已自带 |
 | 端侧 NPU OCR（高通 QNN SDK，**专有不可再分发**） | `app/src/main/cpp/ocr/qnn_inc/`（自备） | 该路径裁剪；后端模式不受影响 |
 | 端侧离线翻译（llama.cpp，MIT） | `<repo 上级>/deps/llama.cpp` 或 `-DCS_LLAMA_SRC=` | 该路径裁剪；后端模式不受影响 |
+
+**端侧翻译 GPU 加速（可选）**：默认 CPU-only。加 `-DCS_LLAMA_VULKAN=ON` 启用 Vulkan GPU 后端
+（Android 设备 GPU 推理，如 Adreno/Mali），预期小模型（~1.8B Q4）提速 2-4×。
+在无 Vulkan 驱动的设备上运行时自动回退 CPU。
 
 ## 后端
 

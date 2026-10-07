@@ -78,6 +78,13 @@ class ReaderViewModel : ViewModel() {
 
     var lastFlipMs = 0.0
 
+    // ---- 切分阅读模式（docs/READER_SPLIT_PLAN.md P-S1/P-S6）----
+    /** 每册记忆的手动开关（CsSettings "reader_split_<bookId>"）；显示页域与 raw 域经 SplitMode 换算。 */
+    private val _splitOn = MutableStateFlow(false)
+    val splitOn: StateFlow<Boolean> = _splitOn.asStateFlow()
+    /** 源页数（raw 域）；open.pageCount 是显示页数（2N | N）。 */
+    @Volatile private var rawCount = 0
+
     // ---- 自适应门控状态（v0.3.2 语义原样；v0.6.0 起以"准入"为载体，P-R6）----
     /** 连续慢页达到 2 页 → 进入大页模式：只为当前页加载，不再预取邻居。 */
     @Volatile private var bigPageMode = false
@@ -95,11 +102,12 @@ class ReaderViewModel : ViewModel() {
 
     init {
         // backend 模式：后台队列每落档一页 → 若正是可见页则立即渲染显示
+        // （job 发的是 raw 页号，与显示页比较须换算；P-S8）
         viewModelScope.launch {
             BookTranslateJob.pageDone.collect { p ->
                 if (engineMode() != "backend") return@collect
                 val st = open.value
-                if (st.translateEnabled && p == st.page) refreshBackendPage(p)
+                if (st.translateEnabled && p == rawOfPage(st.page)) refreshBackendPage(p)
             }
         }
         // 后台队列进度 → 可见页状态（驱动"翻译中"指示器）
@@ -108,7 +116,7 @@ class ReaderViewModel : ViewModel() {
                 if (engineMode() != "backend") return@collect
                 val st = open.value
                 if (st.bookId == 0L || s.bookId != st.bookId) return@collect
-                val vis = st.page
+                val vis = rawOfPage(st.page)
                 val cur = trStates.value[vis]
                 if (cur == TranslatePageState.READY || cur == TranslatePageState.FAILED) return@collect
                 val new: TranslatePageState? = when {
@@ -130,12 +138,12 @@ class ReaderViewModel : ViewModel() {
                         "budget=${budgetBytes / 1_048_576}MB")
                 }
                 val cutoff = System.currentTimeMillis() - 60_000
-                decodeStamps.forEach { (p, dq) ->
+                decodeStamps.forEach { (k, dq) ->   // k = raw*2 + (half>=1 ? 1 : 0)（P-S6 d）
                     val n = synchronized(dq) {
                         while (dq.isNotEmpty() && dq.first() < cutoff) dq.removeFirst()
                         dq.size
                     }
-                    if (n >= 3) Log.w("Reader", "P-R8 违例: page $p 60s 内解码 $n 次（≥3=风暴签名）")
+                    if (n >= 3) Log.w("Reader", "P-R8 违例: page ${k / 2} 60s 内解码 $n 次（≥3=风暴签名）")
                 }
             }
         }
@@ -148,14 +156,21 @@ class ReaderViewModel : ViewModel() {
             val info = NativeBridge.readerOpen(bookId) ?: return@launch
             resetLoadGating()
             borrowed.clear()   // 切书防串页：旧书借用全部作废（新书页项自会重登记）
-            val pageCount = info[0]
-            val lastPage = info[1]
+            val pageCount = info[0]          // raw 源页数
+            val lastPage = info[1]           // raw 页号
             prefs.value = ReaderPrefs(
                 fit = CsSettings.int("reader_fit", 0),
                 rtl = CsSettings.bool("reader_rtl", false),
                 spread = CsSettings.bool("reader_spread", false),
                 bg = CsSettings.int("reader_bg", 0),
             )
+            // P-S1：切分开关按册读取；open.page/pageCount 全部为显示页域。
+            val split = CsSettings.bool("reader_split_$bookId", false)
+            _splitOn.value = split
+            rawCount = pageCount
+            val vCount = SplitMode.vCount(pageCount, split)
+            val rawPage = if (lastPage in 0 until pageCount) lastPage else 0
+            val vPage = if (split) rawPage * 2 else rawPage
             // 默认不翻译：只有本册被手动启用（或本次强制打开）才启动引擎。
             val wantTranslate = forceTranslate ||
                 withContext(CoreDispatcher) { NativeBridge.getBookTranslateEnabled(bookId) }
@@ -163,19 +178,17 @@ class ReaderViewModel : ViewModel() {
                 NativeBridge.translateConfigure(null, null, null, -1, -1, -1, true)
                 NativeBridge.translateOpenBook(bookId)
             }
-            open.value = ReaderOpenState(bookId, title, pageCount,
-                                         if (lastPage in 0 until pageCount) lastPage else 0,
-                                         wantTranslate)
+            open.value = ReaderOpenState(bookId, title, vCount, vPage, wantTranslate)
             if (wantTranslate) {
                 when (engineMode()) {
                     "sidecar" -> {
-                        NativeBridge.translateFocus(open.value.page)
+                        NativeBridge.translateFocus(rawPage)      // 翻译全 raw 域（P-S8）
                         startTranslatePolling()
                     }
                     "backend" -> {
                         // 整本后台翻译：打开即续传/启动（可见页在 goto 时插队）
-                        BookTranslateJob.ensureStarted(bookId, pageCount, open.value.page)
-                        refreshBackendPage(open.value.page)
+                        BookTranslateJob.ensureStarted(bookId, pageCount, rawPage)
+                        refreshBackendPage(rawPage)
                     }
                     else -> viewModelScope.launch(Dispatchers.Default) {
                         OnDeviceTranslator.ensureInit()
@@ -188,8 +201,13 @@ class ReaderViewModel : ViewModel() {
     fun closeBook() {
         val id = open.value.bookId
         if (id != 0L) {
+            // 值在派发前捕获（修 2026-10-07 系统性测试实测出的既有竞态：
+            // 协程在 CoreDispatcher 上晚于下方 `open.value = ReaderOpenState()` 执行时，
+            // 读到的 page 已是 0 → 把进度写成 0。JDWP/高负载下必现）。
+            val raw = rawOfPage(open.value.page)
+            val rawN = rawCount
             viewModelScope.launch(CoreDispatcher) {
-                NativeBridge.saveProgress(id, open.value.page, open.value.pageCount)
+                NativeBridge.saveProgress(id, raw, rawN)
                 NativeBridge.readerClose(id)
                 NativeBridge.translateCloseBook()
                 NativeBridge.translateConfigure(null, null, null, -1, -1, -1,
@@ -241,6 +259,40 @@ class ReaderViewModel : ViewModel() {
     /** 预算快照（进入阅读器时由 UI 推一次；只服务 P-R8 断言口径）。 */
     fun updateBudget(bytes: Long) { budgetBytes = bytes }
 
+    // ---------------------------------------------------------------- split mode
+
+    /** 显示页 → raw（P-S6：一切翻译/进度调用点的唯一换算式）。 */
+    fun rawOfPage(v: Int): Int = SplitMode.rawOf(v, _splitOn.value)
+
+    /** raw → 显示页首号（书签标签/跳转用）。 */
+    fun pageOfRaw(raw: Int): Int = if (_splitOn.value) raw * 2 else raw
+
+    /** 源页数（raw 域；open.pageCount 是显示页数）。 */
+    fun rawPageCount(): Int = rawCount
+
+    /**
+     * 切分阅读开关（每册记忆；P-S1/P-S7「改即存」）。
+     * 中途切换：锚定当前 raw（落地其首半），显示页域重算（I-S4 锚定不变量）。
+     */
+    fun setSplit(on: Boolean) {
+        val st = open.value
+        if (st.bookId == 0L || rawCount <= 0) return
+        if (_splitOn.value == on) return
+        val anchorRaw = SplitMode.rawOf(st.page, _splitOn.value)   // 旧映射下当前 raw
+        CsSettings.setBool("reader_split_${st.bookId}", on)
+        CsSettings.save()
+        _splitOn.value = on
+        open.value = st.copy(
+            pageCount = SplitMode.vCount(rawCount, on),
+            page = if (on) anchorRaw * 2 else anchorRaw,
+        )
+        if (st.translateEnabled && engineMode() == "sidecar") {
+            viewModelScope.launch(CoreDispatcher) { NativeBridge.translateFocus(anchorRaw) }
+        }
+        allowAhead = null
+        bumpAdmission()
+    }
+
     // ---- v0.6.0 页加载：项自有（P-R1）＋ 调度层准入（P-R6）----
     // 旧 ensurePage/ensurePageInner/loadsInFlight/loadAttempts/真空自愈看门狗全部退休：
     // 一页一项一协程（I1）——去重/卡死/重试/找活全由项的生命周期承担（评估 G3/G4/G8）。
@@ -249,11 +301,15 @@ class ReaderViewModel : ViewModel() {
      * P-R1 解码入口：**组合项**调用。日志/计时/计数口径与旧 ensurePageInner 一致
      * （M1 依赖 "load start page=" / "loaded in" 串，原样保留）。
      * 取消语义：项销毁 → 本协程（或以本函数为 body 的 job）取消 → 结果丢弃（位图 GC）。
+     * [half]（P-S3）：WHOLE=整页；0/1=切分后的半页项（同 raw 两半各解一次，语义与现状同构）。
      */
-    suspend fun decodePageItem(bookId: Long, page: Int, maxBytes: Long): Bitmap? {
+    suspend fun decodePageItem(bookId: Long, page: Int, half: Int, maxBytes: Long): Bitmap? {
         // P-R8 精确形（动态阶段定稿）：**在位页**重新解码 = 回路签名本体
         //（回访是先离开窗口已注销再解码，属正常——旧 60s 计数形会误报）。
-        if (borrowed[page]?.get() != null) {
+        // 切分开启时同 raw 的两个半页项互为"兄弟"（borrowed 按 raw 键共享），
+        // 无法区分，此检查仅在整页模式（half=WHOLE）下生效；半页项的风暴由
+        // (raw,half) 记账的 60s 计数兜底（P-S6 d）。
+        if (half == SplitMode.WHOLE && borrowed[page]?.get() != null) {
             Log.w("Reader", "P-R8 违例: page $page 在位仍重新解码")
         }
         val t0 = System.nanoTime()
@@ -266,7 +322,7 @@ class ReaderViewModel : ViewModel() {
         }
         val ms = (System.nanoTime() - t0) / 1e6
         lastFlipMs = ms
-        recordDecode(page)
+        recordDecode(page, half)
         if (bmp != null) {
             Log.i("Reader", "page $page loaded in $ms ms")
             onLoadTiming(ms)
@@ -276,27 +332,34 @@ class ReaderViewModel : ViewModel() {
         return bmp
     }
 
-    /** P-R6 准入：大页模式只放行当前页/一次性预取目标；未放行者挂起（不占 IO、不占帧）。 */
+    /** P-R6 准入：大页模式只放行当前页/一次性预取目标；未放行者挂起（不占 IO、不占帧）。
+     *  [page] 为 raw；与当前显示页比较需换算（P-S6 a）。 */
     suspend fun awaitAdmission(page: Int) {
         admissionTick.first { admits(page) }
     }
     private fun admits(page: Int): Boolean =
-        !bigPageMode || page == open.value.page || page == allowAhead
+        !bigPageMode || page == rawOfPage(open.value.page) || page == allowAhead
 
-    /** P-R1 落地回调：登记借用 + 大页模式"读一页预取下一页" + 翻译触发（旧 ensurePage 尾调用语义）。 */
+    /** P-R1 落地回调：登记借用 + 大页模式"读一页预取下一页" + 翻译触发（旧 ensurePage 尾调用语义）。
+     *  [page] 为 raw。 */
     fun onItemDecoded(page: Int, bmp: Bitmap) {
         borrowed[page] = WeakReference(bmp)
         if (allowAhead == page) allowAhead = null
         if (bigPageMode) scheduleNeighborPrefetch(open.value.bookId, page)
-        maybeTranslateOnDevice(page, prefetchOnly = page != open.value.page)
+        maybeTranslateOnDevice(page, prefetchOnly = page != rawOfPage(open.value.page))
     }
 
-    /** 项销毁注销借用（P-R2）。 */
-    fun unregisterBorrowed(page: Int) { borrowed.remove(page) }
+    /** 项销毁注销借用（P-R2）。同一 raw 的两个半页项共享键：仅清"弱引用已死"的残表项，
+     *  在位登记（兄弟项自持位图）不得误删（P-S6 e）。 */
+    fun unregisterBorrowed(page: Int) {
+        borrowed.computeIfPresent(page) { _, w -> if (w.get() == null) null else w }
+    }
 
-    /** P-R8 记账：解码时刻（60s 环形；巡检协程异步消费）。 */
-    private fun recordDecode(page: Int) {
-        val dq = decodeStamps.getOrPut(page) { ArrayDeque() }
+    /** P-R8 记账：解码时刻（60s 环形；巡检协程异步消费）。键含 half（P-S6 d）：
+     *  同 raw 的两个半页项各有独立"页"身份，避免兄弟解码触发风暴误报。 */
+    private fun recordDecode(page: Int, half: Int) {
+        val key = if (half >= 1) page * 2 + 1 else page * 2
+        val dq = decodeStamps.getOrPut(key) { ArrayDeque() }
         synchronized(dq) { dq.addLast(System.currentTimeMillis()) }
     }
 
@@ -305,14 +368,14 @@ class ReaderViewModel : ViewModel() {
      * （= 在读，而非连翻走）→ 放行 +1 页（仅一页，不链式——只有 +1 页真正成为当前页时，
      * 它的落地才会再触发下一次预取）。v0.6.0：放行=准入信号，不再直接触发加载（P-R6）。
      */
-    private fun scheduleNeighborPrefetch(bookId: Long, page: Int) {
+    private fun scheduleNeighborPrefetch(bookId: Long, page: Int) {   // page = raw
         prefetchJob?.cancel()
         prefetchJob = viewModelScope.launch(Dispatchers.IO) {
             delay(600)
             val cur = open.value
-            if (cur.bookId != bookId || cur.page != page) return@launch
+            if (cur.bookId != bookId || rawOfPage(cur.page) != page) return@launch
             val next = page + 1
-            if (next >= cur.pageCount || pageAt(next) != null) return@launch
+            if (next >= rawCount || pageAt(next) != null) return@launch   // raw 域边界（P-S6 b）
             allowAhead = next
             bumpAdmission()
         }
@@ -364,7 +427,7 @@ class ReaderViewModel : ViewModel() {
             return
         }
         if (mode != "ondevice" || !st.translateEnabled) return
-        if (page !in 0 until st.pageCount) return
+        if (page !in 0 until rawCount) return                        // raw 域边界（P-S6 c）
         val states = trStates.value
         val cur = states[page]
         // FAILED 也视为本会话终态：无文本页（插页/封面）如果允许重试，每次重组都会
@@ -372,7 +435,7 @@ class ReaderViewModel : ViewModel() {
         if (cur == TranslatePageState.READY || cur == TranslatePageState.BUSY ||
             cur == TranslatePageState.QUEUED || cur == TranslatePageState.FAILED) return
         // only translate around the visible page, not the whole prefetch window
-        if (prefetchOnly && page != st.page) return
+        if (prefetchOnly && page != rawOfPage(st.page)) return
         trStates.value = states + (page to TranslatePageState.QUEUED)
         viewModelScope.launch(Dispatchers.Default) {
             try {
@@ -436,17 +499,19 @@ class ReaderViewModel : ViewModel() {
 
     fun goto(page: Int, persist: Boolean = true) {
         val st = open.value
-        if (page !in 0 until st.pageCount) return
+        if (page !in 0 until st.pageCount) return     // page = 显示页域
+        val raw = rawOfPage(page)
         open.value = st.copy(page = page)
         if (st.translateEnabled && engineMode() == "sidecar") {
-            viewModelScope.launch(CoreDispatcher) { NativeBridge.translateFocus(page) }
+            viewModelScope.launch(CoreDispatcher) { NativeBridge.translateFocus(raw) }
         }
         if (persist && st.bookId != 0L) {
+            val rawN = rawCount
             viewModelScope.launch(CoreDispatcher) {
-                NativeBridge.saveProgress(st.bookId, page, st.pageCount)
+                NativeBridge.saveProgress(st.bookId, raw, rawN)   // 进度恒 raw（P-S8）
             }
         }
-        maybeTranslateOnDevice(page, prefetchOnly = false)
+        maybeTranslateOnDevice(raw, prefetchOnly = false)
         // v0.3.4 真空卡死修复的归位形态（P-R6）：goto 是"当前页变更"的统一入口——
         // 它只负责 ①清一次性预取放行 ②准入信号 bump（唤醒挂起的项；isCurrent key 变化重武装失败页）。
         // "当前页必有加载路径"由"组合项在=解码协程在"结构性成立（一页一项一协程，I1）。
@@ -474,11 +539,11 @@ class ReaderViewModel : ViewModel() {
         pollJob?.cancel()
         pollJob = viewModelScope.launch {
             while (open.value.translateEnabled && open.value.bookId != 0L) {
-                val page = open.value.page
-                // Poll a window around the focus page.
+                // Poll a window around the focus page（raw 域；P-S8）
+                val page = rawOfPage(open.value.page)
                 val states = HashMap<Int, TranslatePageState>()
                 for (p in (page - 1)..(page + 4)) {
-                    if (p !in 0 until open.value.pageCount) continue
+                    if (p !in 0 until rawCount) continue
                     val s = withContext(CoreDispatcher) { NativeBridge.translateState(p) }
                     states[p] = when (s) {
                         1 -> TranslatePageState.QUEUED
@@ -523,16 +588,16 @@ class ReaderViewModel : ViewModel() {
                 when (engineMode()) {
                     "sidecar" -> {
                         NativeBridge.translateOpenBook(st.bookId)
-                        NativeBridge.translateFocus(st.page)
+                        NativeBridge.translateFocus(rawOfPage(st.page))
                         startTranslatePolling()
                     }
                     "backend" -> {
-                        BookTranslateJob.ensureStarted(st.bookId, st.pageCount, st.page)
-                        refreshBackendPage(st.page)
+                        BookTranslateJob.ensureStarted(st.bookId, rawCount, rawOfPage(st.page))
+                        refreshBackendPage(rawOfPage(st.page))
                     }
                     else -> {
                         NativeBridge.translateConfigure(null, null, null, -1, -1, -1, true)
-                        maybeTranslateOnDevice(st.page, prefetchOnly = false)
+                        maybeTranslateOnDevice(rawOfPage(st.page), prefetchOnly = false)
                     }
                 }
             } else {
@@ -555,20 +620,21 @@ class ReaderViewModel : ViewModel() {
 
     fun retranslateCurrent() {
         val st = open.value
+        val raw = rawOfPage(st.page)          // 翻译全 raw 域（P-S8）
         if (engineMode() == "backend") {
             // 只重译本页（fresh=1 让服务端绕缓存），**不清整本档案**——整本进度不能丢
-            BookTranslateJob.focus(st.bookId, st.page, fresh = true)
-            synchronized(trCache) { trCache.remove(st.page) }
-            trStates.value = trStates.value + (st.page to TranslatePageState.QUEUED)
+            BookTranslateJob.focus(st.bookId, raw, fresh = true)
+            synchronized(trCache) { trCache.remove(raw) }
+            trStates.value = trStates.value + (raw to TranslatePageState.QUEUED)
             return
         }
         viewModelScope.launch(CoreDispatcher) {
             NativeBridge.clearBookArchive(st.bookId)
-            NativeBridge.translateRetranslate(st.page)
-            synchronized(trCache) { trCache.remove(st.page) }
+            NativeBridge.translateRetranslate(raw)
+            synchronized(trCache) { trCache.remove(raw) }
             if (engineMode() == "ondevice") {
-                trStates.value = trStates.value + (st.page to TranslatePageState.NONE)
-                maybeTranslateOnDevice(st.page, prefetchOnly = false, force = true)
+                trStates.value = trStates.value + (raw to TranslatePageState.NONE)
+                maybeTranslateOnDevice(raw, prefetchOnly = false, force = true)
             }
         }
     }

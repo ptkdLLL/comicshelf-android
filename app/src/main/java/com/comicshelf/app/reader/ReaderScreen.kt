@@ -1,7 +1,7 @@
 package com.comicshelf.app.reader
 
 import android.graphics.Bitmap
-import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -66,15 +66,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -100,6 +103,7 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
     var showTrMenu by remember { mutableStateOf(false) }
     val open by vm.open.collectAsState()
     val prefs by vm.prefs.collectAsState()
+    val splitOn by vm.splitOn.collectAsState()
     var chrome by remember { mutableStateOf(true) }
     var rotation by remember { mutableIntStateOf(0) }
     var showBookmarks by remember { mutableStateOf(false) }
@@ -113,7 +117,7 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
 
     Box(Modifier.fillMaxSize().background(bg)) {
         if (open.pageCount > 0) {
-            ReaderPager(vm, open, prefs.rtl, prefs.spread, prefs.fit, rotation,
+            ReaderPager(vm, open, prefs.rtl, prefs.spread, prefs.fit, rotation, splitOn,
                         onToggleChrome = { chrome = !chrome })
         } else {
             Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -146,7 +150,7 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
         // Translate status chip while pages are being processed.
         if (open.translateEnabled) {
             val trStates by vm.trStates.collectAsState()
-            val st = trStates[open.page]
+            val st = trStates[vm.rawOfPage(open.page)]   // trStates 键 = raw（P-S8）
             if (st == TranslatePageState.QUEUED || st == TranslatePageState.BUSY) {
                 Surface(
                     color = Color.Black.copy(alpha = 0.6f),
@@ -186,6 +190,7 @@ private fun ReaderPager(
     spread: Boolean,
     fit: Int,
     rotation: Int,
+    splitOn: Boolean,
     onToggleChrome: () -> Unit,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -238,11 +243,11 @@ private fun ReaderPager(
             val first = idx * step
             val isCurrentItem = pager.currentPage == idx   // P-R5：项作用域读取，只重组该项
             Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center) {
-                ZoomablePage(vm, open, first, fit, rotation, rtl, capBytes, isCurrentItem,
+                ZoomablePage(vm, open, first, splitOn, fit, rotation, rtl, capBytes, isCurrentItem,
                              onToggleChrome, Modifier.weight(1f))
                 if (step == 2 && first + 1 < pageCount) {
-                    ZoomablePage(vm, open, first + 1, fit, rotation, rtl, capBytes, isCurrentItem,
-                                 onToggleChrome, Modifier.weight(1f))
+                    ZoomablePage(vm, open, first + 1, splitOn, fit, rotation, rtl, capBytes,
+                                 isCurrentItem, onToggleChrome, Modifier.weight(1f))
                 }
             }
         }
@@ -258,6 +263,7 @@ private fun ZoomablePage(
     vm: ReaderViewModel,
     open: ReaderOpenState,
     page: Int,
+    splitOn: Boolean,
     fit: Int,
     rotation: Int,
     rtl: Boolean,
@@ -268,36 +274,41 @@ private fun ZoomablePage(
 ) {
     // P-R1：位图由本项持有——进入窗口即解码，离开窗口协程取消 → 位图自然释放（I1）。
     // 无 LRU、无逐出：本页在组合中 ⇔ 本页位图在（P-R2 借用表只存弱引用供 VM 查询）。
+    // 切分模式（READER_SPLIT_PLAN P-S3）：项身份 = (raw, half)；位图仍是整页，
+    // 同 raw 的两个半页项各解码一次（语义与现状"翻到该页即解码"同构）。
     val bookId = open.bookId
-    val decoded by produceState<DecodedPage?>(null, bookId, page, capBytes, isCurrent) {
-        if (value?.let { it.bookId == bookId && it.page == page } == true) {
+    val raw = SplitMode.rawOf(page, splitOn)
+    val half = SplitMode.halfOf(page, splitOn)
+    val decoded by produceState<DecodedPage?>(null, bookId, raw, capBytes, isCurrent) {
+        if (value?.let { it.bookId == bookId && it.page == raw } == true) {
             return@produceState                    // 本页已解码（key 变化时保留位图）
         }
         var attempt = 0
         while (attempt < MAX_LOAD_ATTEMPTS) {      // 取消经挂起点传播（awaitAdmission 起）
-            vm.awaitAdmission(page)                // P-R6：大页模式挂起等待放行
-            val job = async { vm.decodePageItem(bookId, page, capBytes) }
+            vm.awaitAdmission(raw)                 // P-R6：大页模式挂起等待放行（raw 域）
+            val job = async { vm.decodePageItem(bookId, raw, half, capBytes) }
             val b = withTimeoutOrNull(STUCK_LOAD_MS) { job.await() }
             if (b == null) {
                 job.cancel()                       // 卡死/失败尝试弃引用（JNI 跑完即被 GC）
             } else {
-                value = DecodedPage(bookId, page, b)
-                vm.onItemDecoded(page, b)
+                value = DecodedPage(bookId, raw, b)
+                vm.onItemDecoded(raw, b)
                 return@produceState
             }
             attempt++
             if (attempt < MAX_LOAD_ATTEMPTS) delay(RETRY_DELAY_MS)
         }
     }
-    DisposableEffect(bookId, page) { onDispose { vm.unregisterBorrowed(page) } }
-    val original = decoded?.takeIf { it.bookId == bookId && it.page == page }?.bmp
-    // Translated overlay replaces the original when ready.
+    DisposableEffect(bookId, raw) { onDispose { vm.unregisterBorrowed(raw) } }
+    val original = decoded?.takeIf { it.bookId == bookId && it.page == raw }?.bmp
+    // Translated overlay replaces the original when ready（raw 键；overlay 与底图用同一
+    // 半页矩形绘制，sidecar/ondevice/backend 三引擎天然对齐，P-S4/I-S3）。
     val useTranslate = open.translateEnabled
-    val translated by produceState<Bitmap?>(initialValue = null, page, useTranslate) {
+    val translated by produceState<Bitmap?>(initialValue = null, raw, useTranslate) {
         if (useTranslate) {
             // 评估 G5：200ms 身份轮询——常规落地/重译替换/失败恢复三态全覆盖（替代旧 revision 重启）。
             while (true) {
-                val bmp = vm.translatedAt(page)
+                val bmp = vm.translatedAt(raw)
                 if (bmp != null && bmp !== value) value = bmp
                 kotlinx.coroutines.delay(200)
             }
@@ -306,10 +317,10 @@ private fun ZoomablePage(
     val bmp = if (useTranslate) translated ?: original else original
 
     // v0.4.3：适配模式/旋转也是几何输入——任一变化即重建（统一重置缩放平移）。
-    // 注意：下方两处 pointerInput 的 key 必须同步含 fit/rotation，否则手势闭包
+    // 注意：下方两处 pointerInput 的 key 必须同步含 fit/rotation（+ splitOn 同理），否则手势闭包
     // 会握旧 delegate（写旧 state、渲染读新 state 的分裂）。
-    var scale by remember(page, fit, rotation) { mutableFloatStateOf(1f) }
-    var offset by remember(page, fit, rotation) { mutableStateOf(Offset.Zero) }
+    var scale by remember(page, splitOn, fit, rotation) { mutableFloatStateOf(1f) }
+    var offset by remember(page, splitOn, fit, rotation) { mutableStateOf(Offset.Zero) }
     // 手势回调持有的是组合时的快照：位图加载完成后尺寸会变，必须取最新值
     // （v0.3.6 限幅修复需要"图片实际显示尺寸"，不能用旧闭包里的 bmp）。
     val bmpState = rememberUpdatedState(bmp)
@@ -319,7 +330,7 @@ private fun ZoomablePage(
             .fillMaxSize()
             // 缩放/平移手势只在“双指”或“已放大”时消费事件：
             // 单指拖动必须留给 HorizontalPager 翻页，否则滑动翻页会失效。
-            .pointerInput(page, fit, rotation) {
+            .pointerInput(page, splitOn, fit, rotation) {
                 awaitEachGesture {
                     awaitFirstDown(requireUnconsumed = false)
                     do {
@@ -334,7 +345,8 @@ private fun ZoomablePage(
                                 if (b != null) {
                                     offset = clampPan(offset.x + pan.x, offset.y + pan.y, ns,
                                                       size.width.toFloat(), size.height.toFloat(),
-                                                      b.width, b.height, fit, rotation)
+                                                      SplitMode.effWidth(half, rtl, b.width), b.height,
+                                                      fit, rotation)
                                 }
                             } else {
                                 offset = Offset.Zero
@@ -345,7 +357,7 @@ private fun ZoomablePage(
                     } while (event.changes.any { it.pressed })
                 }
             }
-            .pointerInput(page, rtl, fit, rotation) {
+            .pointerInput(page, splitOn, rtl, fit, rotation) {
                 detectTapGestures(
                     onTap = { pos ->
                         val third = size.width / 3f
@@ -361,23 +373,21 @@ private fun ZoomablePage(
                         offset = if (scale == 1f || b == null) Offset.Zero
                                  else clampPan(offset.x, offset.y, scale,
                                                size.width.toFloat(), size.height.toFloat(),
-                                               b.width, b.height, fit, rotation)
+                                               SplitMode.effWidth(half, rtl, b.width), b.height,
+                                               fit, rotation)
                     },
                 )
             },
         contentAlignment = Alignment.Center,
     ) {
         if (bmp != null) {
-            Image(
-                bitmap = bmp.asImageBitmap(),
-                contentDescription = "第 ${page + 1} 页",
-                // 位图被拉伸到下面 layout 给出的尺寸——该尺寸 ≡ 位图 × s（等比，
-                // 保证在 layout 内），故 FillBounds 的拉伸不失真。
-                contentScale = ContentScale.FillBounds,
+            // 切分显示（P-S4）：绘制层取半页子矩形（drawImage 四整型矩形重载）——
+            // 位图仍是整页（解码/所有权/预算不受影响）；layout 尺寸 ≡ 半页 × s（等比，无失真）。
+            Canvas(
                 modifier = Modifier
+                    .semantics { contentDescription = "第 ${page + 1} 页" }
                     // v0.4.3 自算布局（方案乙）：适配模式 × 旋转语义在此统一计算
-                    //（唯一公式源 fitScale）——组件尺寸即目标绘制尺寸，不经过
-                    // ContentScale 自定义路线，与 graphicsLayer 旋转无交互歧义。
+                    //（唯一公式源 fitScale）——组件尺寸即目标绘制尺寸，与 graphicsLayer 旋转无交互歧义。
                     .layout { measurable, constraints ->
                         val bb = bmpState.value
                         val vw = constraints.maxWidth.toFloat()
@@ -385,9 +395,10 @@ private fun ZoomablePage(
                         var w = constraints.maxWidth
                         var h = constraints.maxHeight
                         if (bb != null && bb.width > 0 && bb.height > 0) {
+                            val effW = SplitMode.effWidth(half, rtl, bb.width)
                             val s = fitScale(fit, rotation, vw, vh,
-                                             bb.width.toFloat(), bb.height.toFloat())
-                            w = (bb.width * s).roundToInt().coerceAtLeast(1)
+                                             effW.toFloat(), bb.height.toFloat())
+                            w = (effW * s).roundToInt().coerceAtLeast(1)
                             h = (bb.height * s).roundToInt().coerceAtLeast(1)
                         }
                         val p = measurable.measure(Constraints.fixed(w, h))
@@ -401,7 +412,19 @@ private fun ZoomablePage(
                         rotationZ = rotation.toFloat()
                     }
                     .clipToBounds(),
-            )
+            ) {
+                val bb = bmpState.value ?: return@Canvas
+                val (sx, sw) = SplitMode.srcXWidth(half, rtl, bb.width)
+                drawImage(
+                    image = bb.asImageBitmap(),
+                    srcOffset = IntOffset(sx, 0),
+                    srcSize = IntSize(sw, bb.height),
+                    dstOffset = IntOffset.Zero,
+                    dstSize = IntSize(size.width.roundToInt().coerceAtLeast(1),
+                                      size.height.roundToInt().coerceAtLeast(1)),
+                    filterQuality = FilterQuality.Low,
+                )
+            }
         } else {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 // P-R5：只有可见页允许转圈（动效永不来自离屏组合页——M2 静置 ≤5fps 的直接开关）。
@@ -574,6 +597,21 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                         Text(if (prefs.spread) "●开" else "关（横屏生效）")
                     }
                 }
+                // 切分阅读（P-S7）：每册记忆的手动开关；开 = 每页按正中切成两半逐半显示。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("切分阅读", Modifier.width(64.dp))
+                    val splitOn by vm.splitOn.collectAsState()
+                    TextButton(onClick = { vm.setSplit(false) }) {
+                        Text(if (!splitOn) "●关" else "关",
+                             color = if (!splitOn) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                    TextButton(onClick = { vm.setSplit(true) }) {
+                        Text(if (splitOn) "●开" else "开",
+                             color = if (splitOn) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                }
                 val open by vm.open.collectAsState()
                 if (open.translateEnabled) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -719,13 +757,13 @@ private fun BookmarksDialog(vm: ReaderViewModel, onGoto: (Int) -> Unit, onDismis
         text = {
             Column {
                 TextButton(onClick = {
-                    vm.addBookmark(open.page, "第 ${open.page + 1} 页")
+                    vm.addBookmark(vm.rawOfPage(open.page), "第 ${open.page + 1} 页")  // 存 raw，标签显示页号
                     // refresh hack: re-produce
                 }) { Text("＋ 为当前页 (${open.page + 1}) 加书签") }
                 bookmarks.forEach { bm ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { onGoto(bm.page) }) {
-                            Text(if (bm.label.isBlank()) "第 ${bm.page + 1} 页" else bm.label)
+                        TextButton(onClick = { onGoto(vm.pageOfRaw(bm.page)) }) {
+                            Text(if (bm.label.isBlank()) "第 ${vm.pageOfRaw(bm.page) + 1} 页" else bm.label)
                         }
                         Spacer(Modifier.weight(1f))
                         IconButton(onClick = { vm.removeBookmark(bm.id) }, Modifier.size(28.dp)) {

@@ -254,6 +254,13 @@ endif()
 # 作为子项目静态编入 libcomicshelf.so（单一 so，无版本错配；编译标志可控）。
 # 可选依赖：仓库不含 llama.cpp 源码时自动裁剪端侧离线翻译（局域网后端模式不受影响）。
 # 启用方式：把 llama.cpp 源码放到 <repo 上级>/deps/llama.cpp，或 -DCS_LLAMA_SRC=<路径>。
+#
+# GPU 加速（可选）：默认 CPU-only（ARM dotprod+fp16）。
+#   -DCS_LLAMA_VULKAN=ON  启用 Vulkan GPU 后端（Android 设备 GPU 推理，如 Adreno）。
+#   编译要求：Android NDK 自带 Vulkan 头/库，无需额外 SDK。在无 Vulkan 驱动的设备上
+#   运行时会自动回退 CPU（ggml 的 backend 枚举在初始化时处理）。
+#   适用场景：端侧离线翻译提速（Hy-MT2-1.8B-Q4 类小模型，预期 2-4× vs CPU）。
+set(CS_LLAMA_VULKAN OFF CACHE BOOL "llama.cpp Vulkan GPU 后端（可选）")
 set(CS_LLAMA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../deps/llama.cpp"
     CACHE PATH "llama.cpp 源码目录（可选）")
 if(EXISTS "${CS_LLAMA_SRC}/include/llama.h")
@@ -267,9 +274,23 @@ if(EXISTS "${CS_LLAMA_SRC}/include/llama.h")
     if(ANDROID_ABI STREQUAL "arm64-v8a")
         set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16+i8mm" CACHE STRING "" FORCE)
     endif()
+    if(CS_LLAMA_VULKAN)
+        # Android NDK 自带 Vulkan 头 + libvulkan.so（API 24+），llama.cpp 的 ggml-vulkan
+        # 子项目会自行 find_library(Vulkan)；此处只需开启开关并确保链接。
+        set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+        set(GGML_VULKAN_RUNTEST OFF CACHE BOOL "" FORCE)
+        set(GGML_VULKAN_SHADERS_TOOL_PATH "" CACHE STRING "" FORCE)  # 禁用运行时编译
+        message(STATUS "llama.cpp: Vulkan GPU 后端已启用（-DCS_LLAMA_VULKAN=ON）")
+    else()
+        set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    endif()
     add_subdirectory("${CS_LLAMA_SRC}" "${CMAKE_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
     set(CS_HAS_LLAMA ON)
-    message(STATUS "llama.cpp: 静态编入 (${GGML_CPU_ARM_ARCH})")
+    if(CS_LLAMA_VULKAN)
+        message(STATUS "llama.cpp: 静态编入 (${GGML_CPU_ARM_ARCH} + Vulkan GPU)")
+    else()
+        message(STATUS "llama.cpp: 静态编入 (${GGML_CPU_ARM_ARCH})")
+    endif()
 else()
     set(CS_HAS_LLAMA OFF)
     message(WARNING "llama.cpp 源码缺失（可选）：端侧离线翻译裁剪，局域网后端模式不受影响")
@@ -277,6 +298,9 @@ endif()
 
 if(CS_HAS_LLAMA)
     target_link_libraries(cs_core PUBLIC llama ggml)
+    if(CS_LLAMA_VULKAN)
+        target_link_libraries(cs_core PUBLIC Vulkan)
+    endif()
     target_include_directories(cs_core PUBLIC
         "${CS_LLAMA_SRC}/include" "${CS_LLAMA_SRC}/ggml/include")
     target_compile_definitions(cs_core PUBLIC CS_HAS_LLAMA=1)
