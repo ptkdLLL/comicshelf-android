@@ -193,38 +193,61 @@ class ShelfViewModel : ViewModel() {
     }
 
     fun setLibrary(id: Long) {
-        query.value = query.value.copy(libId = id, dirRel = "", history = false)
+        leaveHistoryRestoring()
+        query.value = query.value.copy(libId = id, dirRel = "")
         queryVersion.value++
     }
 
     fun setSearch(s: String) {
-        query.value = query.value.copy(search = s, history = false)
+        leaveHistoryRestoring()
+        query.value = query.value.copy(search = s)
         queryVersion.value++
     }
 
     fun setSort(sort: ShelfSort, desc: Boolean) {
-        query.value = query.value.copy(sort = sort, desc = desc, history = false)
+        leaveHistoryRestoring()
+        query.value = query.value.copy(sort = sort, desc = desc)
         queryVersion.value++
     }
 
     fun setDir(rel: String) {
-        query.value = query.value.copy(dirRel = rel, history = false)
+        leaveHistoryRestoring()
+        query.value = query.value.copy(dirRel = rel)
         queryVersion.value++
     }
 
     fun setRecursive(r: Boolean) {
-        query.value = query.value.copy(recursive = r, history = false)
+        leaveHistoryRestoring()
+        query.value = query.value.copy(recursive = r)
         queryVersion.value++
     }
 
     fun setFilters(favOnly: Boolean, readState: Int) {
-        query.value = query.value.copy(favOnly = favOnly, readState = readState, history = false)
+        leaveHistoryRestoring()
+        query.value = query.value.copy(favOnly = favOnly, readState = readState)
         queryVersion.value++
     }
 
-    // ---- v0.5.3 浏览历史（计划 P-H6：进入即快照、退出即还原；任何其它参数变更自动退出）----
+    // ---- v0.5.3 浏览历史（进入即快照、退出即原样还原；任何其它参数变更自动退出）----
+    // 修复（docs/BROWSE_HISTORY_FIX_PLAN.md）：原 P-H6 伪代码只在 setter 里清 history 标志、
+    // 未还原 setHistory 覆盖的哨兵字段（readState=-2 / sort=LAST_READ）→ 点书库后"只读过的"过滤
+    // 泄漏到普通视图且需冷启动才消。现改为统一"先还原快照、再应用本次变更"。
 
     private var preHistory: ShelfQuery? = null
+
+    /**
+     * 退出历史并原样还原进入前的查询（幂等；六条 setter 与 exitHistory 共用）。
+     * 消费后 preHistory 置空——避免"泄漏态再进历史"时把被污染的查询当快照（二次陷阱）。
+     * @return 是否发生了一次真实退出（供 exitHistory 决定是否 bump queryVersion）
+     */
+    private fun leaveHistoryRestoring(): Boolean {
+        if (!query.value.history) return false
+        query.value = preHistory ?: query.value.copy(
+            history = false, libId = 0, sort = ShelfSort.ADDED, desc = true,
+            readState = -1, dirRel = "", search = "")
+        preHistory = null
+        return true
+    }
 
     /** 进入跨库"浏览历史"：lib=-1（全部库）/按 last_read_at 倒序/仅读过/50 帽（P-H4/H7）。
      *  recursive 必须 true：dirRel 空 + recursive=false 会被 make_filter 解释为"仅库根"，
@@ -240,12 +263,7 @@ class ShelfViewModel : ViewModel() {
 
     /** 退出浏览历史：原样还原进入前的查询（滚动位分账——qKey 含 history）。 */
     fun exitHistory() {
-        if (!query.value.history) return
-        query.value = preHistory ?: query.value.copy(
-            history = false, libId = 0, sort = ShelfSort.ADDED, desc = true,
-            readState = -1, dirRel = "", search = "")
-        preHistory = null
-        queryVersion.value++
+        if (leaveHistoryRestoring()) queryVersion.value++
     }
 
     /** 翻译是手动、按书启用的（默认全关）。backend 模式：启用即启动整本后台翻译队列；
