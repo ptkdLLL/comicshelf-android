@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -104,6 +105,7 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
     val open by vm.open.collectAsState()
     val prefs by vm.prefs.collectAsState()
     val splitOn by vm.splitOn.collectAsState()
+    val mode by vm.mode.collectAsState()
     var chrome by remember { mutableStateOf(true) }
     var rotation by remember { mutableIntStateOf(0) }
     var showBookmarks by remember { mutableStateOf(false) }
@@ -117,8 +119,14 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
 
     Box(Modifier.fillMaxSize().background(bg)) {
         if (open.pageCount > 0) {
-            ReaderPager(vm, open, prefs.rtl, prefs.spread, prefs.fit, rotation, splitOn,
-                        onToggleChrome = { chrome = !chrome })
+            // 四容器分派（P-V3）：方向 × 连续——独立成项；页项/同步语义与 pager 同构
+            if (mode.scroll) {
+                ReaderScrollView(vm, open, mode, splitOn, prefs.fit, rotation,
+                                 onToggleChrome = { chrome = !chrome })
+            } else {
+                ReaderPager(vm, open, mode, splitOn, prefs.fit, rotation, prefs.spread,
+                            onToggleChrome = { chrome = !chrome })
+            }
         } else {
             Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                 CircularProgressIndicator()
@@ -186,19 +194,21 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
 private fun ReaderPager(
     vm: ReaderViewModel,
     open: ReaderOpenState,
-    rtl: Boolean,
-    spread: Boolean,
+    mode: ReaderMode,
+    splitOn: Boolean,
     fit: Int,
     rotation: Int,
-    splitOn: Boolean,
+    spread: Boolean,
     onToggleChrome: () -> Unit,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         LaunchedEffect(constraints.maxWidth, constraints.maxHeight) {
             vm.setScreenHint(constraints.maxWidth, constraints.maxHeight)
         }
+        val rtl = mode.rtl
+        val vertical = mode.vertical
         val landscape = maxWidth > maxHeight
-        // Two-page spread: pager items become pairs in landscape.
+        // Two-page spread: pager items become pairs in landscape（连续=关时本容器才生效，D-V7）。
         val step = if (spread && landscape) 2 else 1
         val pageCount = open.pageCount
         val pageCountEff = if (step == 2) (pageCount + 1) / 2 else pageCount
@@ -234,22 +244,32 @@ private fun ReaderPager(
             }
         }
 
-        HorizontalPager(
-            state = pager,
-            reverseLayout = rtl,
-            beyondViewportPageCount = 2,   // compose neighbors => decode prefetch（大页模式由准入收紧，组合仍保留）
-            modifier = Modifier.fillMaxSize(),
-        ) { idx ->
+        // 页内容（两种轴的 pager 共享；轴只换容器——P-V6/D-V1）
+        val pageContent: @Composable (Int) -> Unit = { idx ->
             val first = idx * step
             val isCurrentItem = pager.currentPage == idx   // P-R5：项作用域读取，只重组该项
             Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center) {
-                ZoomablePage(vm, open, first, splitOn, fit, rotation, rtl, capBytes, isCurrentItem,
-                             onToggleChrome, Modifier.weight(1f))
+                ZoomablePage(vm, open, first, splitOn, fit, rotation, rtl, vertical, capBytes,
+                             isCurrentItem, onToggleChrome, Modifier.weight(1f))
                 if (step == 2 && first + 1 < pageCount) {
-                    ZoomablePage(vm, open, first + 1, splitOn, fit, rotation, rtl, capBytes,
+                    ZoomablePage(vm, open, first + 1, splitOn, fit, rotation, rtl, vertical, capBytes,
                                  isCurrentItem, onToggleChrome, Modifier.weight(1f))
                 }
             }
+        }
+        if (vertical) {
+            VerticalPager(
+                state = pager,
+                beyondViewportPageCount = 2,   // 同上：组合即预取
+                modifier = Modifier.fillMaxSize(),
+            ) { idx -> pageContent(idx) }
+        } else {
+            HorizontalPager(
+                state = pager,
+                reverseLayout = rtl,
+                beyondViewportPageCount = 2,   // compose neighbors => decode prefetch（大页模式由准入收紧，组合仍保留）
+                modifier = Modifier.fillMaxSize(),
+            ) { idx -> pageContent(idx) }
         }
     }
 }
@@ -267,6 +287,7 @@ private fun ZoomablePage(
     fit: Int,
     rotation: Int,
     rtl: Boolean,
+    vertical: Boolean,
     capBytes: Long,
     isCurrent: Boolean,
     onToggleChrome: () -> Unit,
@@ -299,7 +320,7 @@ private fun ZoomablePage(
             if (attempt < MAX_LOAD_ATTEMPTS) delay(RETRY_DELAY_MS)
         }
     }
-    DisposableEffect(bookId, raw) { onDispose { vm.unregisterBorrowed(raw) } }
+    DisposableEffect(bookId, raw) { onDispose { vm.unregisterBorrowed(raw, decoded?.bmp) } }
     val original = decoded?.takeIf { it.bookId == bookId && it.page == raw }?.bmp
     // Translated overlay replaces the original when ready（raw 键；overlay 与底图用同一
     // 半页矩形绘制，sidecar/ondevice/backend 三引擎天然对齐，P-S4/I-S3）。
@@ -357,14 +378,24 @@ private fun ZoomablePage(
                     } while (event.changes.any { it.pressed })
                 }
             }
-            .pointerInput(page, splitOn, rtl, fit, rotation) {
+            .pointerInput(page, splitOn, rtl, vertical, fit, rotation) {
                 detectTapGestures(
                     onTap = { pos ->
-                        val third = size.width / 3f
-                        when {
-                            pos.x < third -> if (rtl) vm.goto(open.page + 1) else vm.goto(open.page - 1)
-                            pos.x > 2 * third -> if (rtl) vm.goto(open.page - 1) else vm.goto(open.page + 1)
-                            else -> onToggleChrome()
+                        if (vertical) {
+                            // 竖直轴：上/下 1/3 = 上/下一页（起点侧=上一页，P-V5）
+                            val third = size.height / 3f
+                            when {
+                                pos.y < third -> vm.goto(open.page - 1)
+                                pos.y > 2 * third -> vm.goto(open.page + 1)
+                                else -> onToggleChrome()
+                            }
+                        } else {
+                            val third = size.width / 3f
+                            when {
+                                pos.x < third -> if (rtl) vm.goto(open.page + 1) else vm.goto(open.page - 1)
+                                pos.x > 2 * third -> if (rtl) vm.goto(open.page - 1) else vm.goto(open.page + 1)
+                                else -> onToggleChrome()
+                            }
                         }
                     },
                     onDoubleTap = {
@@ -446,10 +477,10 @@ private fun ZoomablePage(
  * "宽度适配"在旋转后 = 视觉宽度撑满（渲染布局与 clampPan 共用本公式，单一真相源，
  * 杜绝两处数学漂移）。
  */
-private fun visualDims(iw: Float, ih: Float, rot: Int): Pair<Float, Float> =
+internal fun visualDims(iw: Float, ih: Float, rot: Int): Pair<Float, Float> =
     if (rot % 180 != 0) ih to iw else iw to ih
 
-private fun fitScale(mode: Int, rot: Int, vw: Float, vh: Float, iw: Float, ih: Float): Float {
+internal fun fitScale(mode: Int, rot: Int, vw: Float, vh: Float, iw: Float, ih: Float): Float {
     if (mode == 3 || iw <= 0f || ih <= 0f) return 1f      // 原始 1:1
     val (sw, sh) = visualDims(iw, ih, rot)
     if (sw <= 0f || sh <= 0f) return 1f
@@ -468,7 +499,7 @@ private fun fitScale(mode: Int, rot: Int, vw: Float, vh: Float, iw: Float, ih: F
  * 旧实现 `coerceIn(-容器×(ns−1), 0)` 两条都错：单边区间 + 幅值 2×（少除 2），
  * 表现为放大后只能看图片右/下侧，左/上侧永远到不了，且反方向可越界露底。
  */
-private fun clampPan(nx: Float, ny: Float, ns: Float,
+internal fun clampPan(nx: Float, ny: Float, ns: Float,
                      vw: Float, vh: Float, iw: Int, ih: Int,
                      mode: Int, rot: Int): Offset {
     val f = fitScale(mode, rot, vw, vh, iw.toFloat(), ih.toFloat())
@@ -582,13 +613,16 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                         }
                     }
                 }
+                // 方向（P-V2）：三档按册记忆；只管"阅读推进方向"，朝向由旋转按钮决定、与设置无关。
+                val mode by vm.mode.collectAsState()
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("方向", Modifier.width(64.dp))
-                    TextButton(onClick = { vm.setPrefs(prefs.copy(rtl = false)) }) {
-                        Text(if (!prefs.rtl) "●左→右" else "左→右")
-                    }
-                    TextButton(onClick = { vm.setPrefs(prefs.copy(rtl = true)) }) {
-                        Text(if (prefs.rtl) "●右→左" else "右→左")
+                    listOf(0 to "左→右", 1 to "右→左", 2 to "上→下").forEach { (k, label) ->
+                        TextButton(onClick = { vm.setDir(k) }) {
+                            Text(if (mode.dir == k) "●$label" else label,
+                                 color = if (mode.dir == k) MaterialTheme.colorScheme.primary
+                                 else MaterialTheme.colorScheme.onSurface)
+                        }
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -609,6 +643,20 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                     TextButton(onClick = { vm.setSplit(true) }) {
                         Text(if (splitOn) "●开" else "开",
                              color = if (splitOn) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                }
+                // 连续滚动（P-V2）：每册记忆的手动开关；开 = 该"方向"变为连续滚动（瀑布流）。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("连续滚动", Modifier.width(64.dp))
+                    TextButton(onClick = { vm.setScroll(false) }) {
+                        Text(if (!mode.scroll) "●关" else "关",
+                             color = if (!mode.scroll) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                    TextButton(onClick = { vm.setScroll(true) }) {
+                        Text(if (mode.scroll) "●开" else "开",
+                             color = if (mode.scroll) MaterialTheme.colorScheme.primary
                              else MaterialTheme.colorScheme.onSurface)
                     }
                 }

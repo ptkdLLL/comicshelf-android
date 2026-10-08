@@ -85,6 +85,13 @@ class ReaderViewModel : ViewModel() {
     /** 源页数（raw 域）；open.pageCount 是显示页数（2N | N）。 */
     @Volatile private var rawCount = 0
 
+    // ---- 连续滚动模式（docs/READER_VERTICAL_SCROLL_PLAN.md P-V1/P-V7）----
+    /** 每册记忆：方向（0/1/2）× 连续（关/开）；显示页域与按页模式同域，切换仅换容器。 */
+    private val _mode = MutableStateFlow(ReaderMode())
+    val mode: StateFlow<ReaderMode> = _mode.asStateFlow()
+    /** D-V9/P-V7 会话级页尺寸缓存（raw → w<<32|h）；连续模式页项占位高度用；开书清空。 */
+    private val pageDims = ConcurrentHashMap<Int, Long>()
+
     // ---- 自适应门控状态（v0.3.2 语义原样；v0.6.0 起以"准入"为载体，P-R6）----
     /** 连续慢页达到 2 页 → 进入大页模式：只为当前页加载，不再预取邻居。 */
     @Volatile private var bigPageMode = false
@@ -156,6 +163,7 @@ class ReaderViewModel : ViewModel() {
             val info = NativeBridge.readerOpen(bookId) ?: return@launch
             resetLoadGating()
             borrowed.clear()   // 切书防串页：旧书借用全部作废（新书页项自会重登记）
+            pageDims.clear()   // 尺寸缓存同样不跨书（P-V7）
             val pageCount = info[0]          // raw 源页数
             val lastPage = info[1]           // raw 页号
             prefs.value = ReaderPrefs(
@@ -164,6 +172,8 @@ class ReaderViewModel : ViewModel() {
                 spread = CsSettings.bool("reader_spread", false),
                 bg = CsSettings.int("reader_bg", 0),
             )
+            // P-V1：方向/连续按册解析（方向缺键回退旧全局 rtl——迁移语义，P-V9）
+            _mode.value = ReaderMode.load(bookId, prefs.value.rtl)
             // P-S1：切分开关按册读取；open.page/pageCount 全部为显示页域。
             val split = CsSettings.bool("reader_split_$bookId", false)
             _splitOn.value = split
@@ -216,6 +226,7 @@ class ReaderViewModel : ViewModel() {
         }
         pollJob?.cancel()
         borrowed.clear()                      // 页位图归组合项所有——离开阅读器即全释放（I1）
+        pageDims.clear()
         synchronized(trCache) { trCache.evictAll() }
         resetLoadGating()
         open.value = ReaderOpenState()
@@ -293,6 +304,34 @@ class ReaderViewModel : ViewModel() {
         bumpAdmission()
     }
 
+    // ---------------------------------------------------------------- continuous scroll
+
+    /** 方向切换（P-V7：本册记忆，改即存；锚定 open.page——显示页域两模式同域，无重映射）。 */
+    fun setDir(dir: Int) {
+        val st = open.value
+        if (st.bookId == 0L || dir !in ReaderMode.DIR_L2R..ReaderMode.DIR_T2B) return
+        if (_mode.value.dir == dir) return
+        CsSettings.setInt("reader_dir_${st.bookId}", dir)
+        CsSettings.save()
+        _mode.value = _mode.value.copy(dir = dir)
+    }
+
+    /** 连续滚动开关（P-V7：本册记忆，改即存；锚定 open.page）。 */
+    fun setScroll(on: Boolean) {
+        val st = open.value
+        if (st.bookId == 0L || _mode.value.scroll == on) return
+        CsSettings.setBool("reader_scroll_${st.bookId}", on)
+        CsSettings.save()
+        _mode.value = _mode.value.copy(scroll = on)
+        allowAhead = null
+        bumpAdmission()   // 准入窗口随模式变化（P-V7），唤醒挂起项重评估
+    }
+
+    /** P-V7/D-V9：已解页源尺寸（本会话）；连续模式页项占位高度用。 */
+    fun pageDimsOf(raw: Int): Pair<Int, Int>? = pageDims[raw]?.let {
+        ((it ushr 32).toInt()) to ((it and 0xFFFFFFFFL).toInt())
+    }
+
     // ---- v0.6.0 页加载：项自有（P-R1）＋ 调度层准入（P-R6）----
     // 旧 ensurePage/ensurePageInner/loadsInFlight/loadAttempts/真空自愈看门狗全部退休：
     // 一页一项一协程（I1）——去重/卡死/重试/找活全由项的生命周期承担（评估 G3/G4/G8）。
@@ -325,6 +364,7 @@ class ReaderViewModel : ViewModel() {
         recordDecode(page, half)
         if (bmp != null) {
             Log.i("Reader", "page $page loaded in $ms ms")
+            pageDims[page] = (bmp.width.toLong() shl 32) or (bmp.height.toLong() and 0xFFFFFFFFL)
             onLoadTiming(ms)
         } else {
             Log.w("Reader", "page $page load failed in $ms ms")
@@ -338,7 +378,8 @@ class ReaderViewModel : ViewModel() {
         admissionTick.first { admits(page) }
     }
     private fun admits(page: Int): Boolean =
-        !bigPageMode || page == rawOfPage(open.value.page) || page == allowAhead
+        !bigPageMode || page == rawOfPage(open.value.page) || page == allowAhead ||
+            (_mode.value.scroll && page == rawOfPage(open.value.page) + 1)   // P-V7/D-V6：连续流下页可达
 
     /** P-R1 落地回调：登记借用 + 大页模式"读一页预取下一页" + 翻译触发（旧 ensurePage 尾调用语义）。
      *  [page] 为 raw。 */
@@ -349,10 +390,15 @@ class ReaderViewModel : ViewModel() {
         maybeTranslateOnDevice(page, prefetchOnly = page != rawOfPage(open.value.page))
     }
 
-    /** 项销毁注销借用（P-R2）。同一 raw 的两个半页项共享键：仅清"弱引用已死"的残表项，
-     *  在位登记（兄弟项自持位图）不得误删（P-S6 e）。 */
-    fun unregisterBorrowed(page: Int) {
-        borrowed.computeIfPresent(page) { _, w -> if (w.get() == null) null else w }
+    /** 项销毁注销借用（P-R2/P-S6 e）。**身份判定**（READER_VERTICAL_SCROLL_PLAN 7.3-A）：
+     *  仅当登记项已死、或登记位图确系本项所持（===）时才清除——连续模式"离屏→重组合→重解码"
+     *  是常态访问（非风暴）；旧"仅清死引用"逻辑会让"在位重解"检查误报，且对兄弟项
+     *  （同 raw 两半共享键）语义更精确。 */
+    fun unregisterBorrowed(page: Int, bmp: Bitmap?) {
+        borrowed.computeIfPresent(page) { _, w ->
+            val cur = w.get()
+            if (cur == null || cur === bmp) null else w
+        }
     }
 
     /** P-R8 记账：解码时刻（60s 环形；巡检协程异步消费）。键含 half（P-S6 d）：
