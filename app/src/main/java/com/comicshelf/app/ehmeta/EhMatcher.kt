@@ -25,18 +25,22 @@ class EhMatcher {
         onProgress: (done: Long, total: Long) -> Unit,
         cancelled: () -> Boolean,
         bd: Breakdown = Breakdown(),
+        force: Boolean = false,
+        isExpunged: ((Int) -> Boolean)? = null,
     ): EhMatchStats {
         val t0 = System.currentTimeMillis()
         val probe: (String) -> Int = { s -> index.searchKey(s) }
         var total = 0L
         var newly = 0L
         var newlyMatched = 0L
+        // v2 迁移（P-M10）：force = 算法换代全量重算；合成 gid 行预载保号
+        val synthetic: Map<String, Long> = if (force) store.syntheticRows() else emptyMap()
 
         EhBookSource(libraryDb).use { src ->
             total = src.totalBooks()
             onProgress(0, total)
             val now = System.currentTimeMillis() / 1000
-            val hasExisting = store.countAll() > 0     // 空库全量匹配时免存在性查询
+            val hasExisting = store.countAll() > 0 && !force   // 空库全量匹配时免存在性查询；force 恒全量
             src.booksCursor().use { c ->
                 val paths = ArrayList<String>(2048)
                 val titles = ArrayList<String>(2048)
@@ -53,8 +57,10 @@ class EhMatcher {
                     for (i in paths.indices) {
                         val p = paths[i]
                         if (p in existing) continue
+                        val g = EhV3.match(titles[i], probe, isExpunged).toLong()
+                        if (g < 0 && synthetic.containsKey(p)) continue   // 保合成 gid 行（不覆盖为空）
                         idsToWrite.add(p)
-                        gidsToWrite.add(EhV3.match(titles[i], probe).toLong())
+                        gidsToWrite.add(g)
                     }
                     bd.matchMs += System.currentTimeMillis() - t
                     if (idsToWrite.isNotEmpty()) {

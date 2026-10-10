@@ -157,21 +157,51 @@ object EhEngine {
         EhKeysIndex(keysFile).use { idx ->
             EhMatchStore(dir).use { store ->
                 val libDb = File(AppContextHolder.app.filesDir, "data/library.db")
+                // v2 迁移（P-M9/P-M10）：算法换代 → force 全量重算（合成 gid 行保号）；已删位图改投
+                val force = store.algoVersion() != EhMetaManager.MATCH_ALGO_VERSION
                 val st = EhMatcher().run(libDb, idx, store, { done, total ->
                     setPhase(EhPhase.Matching(done, total))
-                }, { cancelRequested })
-                if (st.newlyMatched > 20_000) {
+                }, { cancelRequested }, force = force,
+                    isExpunged = EhMetaManager.expungedPredicate())
+                if (force || st.newlyMatched > 20_000) {
                     val t0 = System.currentTimeMillis()
                     runCatching { store.vacuum() }
                     Log.i(TAG, "match.db vacuum ${System.currentTimeMillis() - t0}ms")
                 }
+                runCatching { store.setAlgoVersion(EhMetaManager.MATCH_ALGO_VERSION) }
                 runCatching {
                     store.writeLocalStats(File(dir, "localstats.bin"))
                 }.onFailure { Log.w(TAG, "localstats 写入失败: ${it.message}") }
                 matchVersion++      // 本地统计失效（tag 查询层下轮自载）
                 onLog("match 完成: total=${st.total} matched=${st.matched} newly=${st.newlyMatched} " +
-                    "wall=${st.elapsedMs}ms")
+                    "force=$force wall=${st.elapsedMs}ms")
             }
+        }
+    }
+
+    /**
+     * v2 升级（幂等）：keys 版本过期 → 后台原地重建 keys.bin + force 全量重匹配。
+     * 挂点（P-M9）：设置页进入 / 标签页 activate —— 用户使用路径触发，零启动触点。
+     * 未导入/已最新时零动作；作业在 MIN_PRIORITY 单线程、可取消。
+     */
+    fun ensureUpToDate(onLog: (String) -> Unit = {}): Boolean = submit("upgrade") {
+        upgradeInner(onLog)
+    }
+
+    /** 升级核心体（调用方保证串行：submit 作业内 或 调试驱动 receiver 内）。验收驱动共用。 */
+    fun upgradeInner(onLog: (String) -> Unit) {
+        if (!EhMetaManager.keysStale()) {
+            onLog("upgrade: 无需（索引已是最新）")
+            return
+        }
+        setPhase(EhPhase.Importing("index-upgrade", 0))
+        val keys = EhMetaManager.rebuildIndex({ stage, pct ->
+            setPhase(EhPhase.Importing(stage, pct))
+        }) { cancelRequested }
+        onLog("upgrade: 索引已升级 keys=$keys")
+        refresh()
+        if (!cancelRequested) {
+            runCatching { runMatchInner(onLog) }
         }
     }
 
@@ -192,10 +222,13 @@ object EhEngine {
         EhKeysIndex(keysFile).use { idx ->
             EhMatchStore(dir).use { store ->
                 val libDb = File(AppContextHolder.app.filesDir, "data/library.db")
-                val st = EhMatcher().run(libDb, idx, store, onProgress, { cancelRequested })
-                if (st.newlyMatched > 20_000) {
+                val force = store.algoVersion() != EhMetaManager.MATCH_ALGO_VERSION
+                val st = EhMatcher().run(libDb, idx, store, onProgress, { cancelRequested },
+                    force = force, isExpunged = EhMetaManager.expungedPredicate())
+                if (force || st.newlyMatched > 20_000) {
                     runCatching { store.vacuum() }
                 }
+                runCatching { store.setAlgoVersion(EhMetaManager.MATCH_ALGO_VERSION) }
                 runCatching { store.writeLocalStats(File(dir, "localstats.bin")) }
                 matchVersion++
                 return st

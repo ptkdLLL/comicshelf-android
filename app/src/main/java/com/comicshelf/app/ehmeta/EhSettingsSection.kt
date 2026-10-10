@@ -67,6 +67,8 @@ fun EhSettingsSection() {
     }
     LaunchedEffect(phase) { refresh() }
     LaunchedEffect(Unit) { refresh() }   // 进入设置页即刷新（用户可能刚放置/删除数据包，phase 不变）
+    // v2 升级（幂等）：索引版本过期 → 后台重建 keys + 全量重匹（P-M9 挂点；未导入/最新时零动作）
+    LaunchedEffect(Unit) { EhEngine.ensureUpToDate { note = it } }
 
     val busy = phase is EhPhase.Importing || phase is EhPhase.Matching
 

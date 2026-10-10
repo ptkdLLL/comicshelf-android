@@ -111,6 +111,9 @@ class EhDebugReceiver : BroadcastReceiver() {
 
             "keysinfo" -> keysInfo()
 
+            // v2 验收驱动：版本升级（重建 keys + force 重匹配）
+            "upgrade" -> EhEngine.upgradeInner { log(it) }
+
             "v4probe" -> v4Probe()
 
             "uninstall" -> {
@@ -138,7 +141,7 @@ class EhDebugReceiver : BroadcastReceiver() {
             names.bufferedReader().useLines { lines ->
                 for (nm in lines) {
                     if (nm.isBlank()) continue
-                    val gid = EhV3.match(nm) { s -> idx.searchKey(s) }
+                    val gid = EhV3.match(nm, { s -> idx.searchKey(s) }, EhMetaManager.expungedPredicate())
                     out.append(nm).append('\t').append(gid).append('\n')
                     n++
                     if (gid >= 0) hits++

@@ -60,6 +60,8 @@ class EhTagViewModel : ViewModel() {
     // ---------------------------------------------------------------- 激活/字典
 
     fun activate() {
+        // v2 升级（幂等、后台、可取消）：keys 版本过期 → 重建 + 全量重匹走用户使用路径触发
+        EhEngine.ensureUpToDate()
         val q = EhEngine.tagQuery() ?: run {
             _ui.value = _ui.value.copy(dataReady = false, error = "未载入 E-Hentai 数据包")
             return

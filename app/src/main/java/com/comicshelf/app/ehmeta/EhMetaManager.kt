@@ -30,6 +30,12 @@ object EhMetaManager {
     const val KEYS_NAME = "keys.bin"
     private const val STATE_NAME = "import.state"
 
+    // v2 算法版本（EHENTAI_MATCH_V2_PLAN P-M8）：
+    //  1 = v1 引擎（canon 只剥空白、无骨架/改投）；2 = 骨架等价 + livepref + twopass 双守卫。
+    //  keys.version 文件与 match.db user_version 同源比对；不符 → ensureUpToDate 重建+重匹。
+    const val KEYS_VERSION_NAME = "keys.version"
+    const val MATCH_ALGO_VERSION = 2
+
     // ---------------------------------------------------------------- 目录
 
     fun ehDir(): File {
@@ -179,6 +185,8 @@ object EhMetaManager {
                 }
             }
             importStateFile().delete()
+            writeKeysVersion()          // v2：索引换代戳（与 keys 安装同窗，见 P-M8）
+            invalidateExpunged()        // 数据换代 → 已删位图失效
             // 生命周期：导入成功 → 功能启用（卸载时置 false）
             runCatching {
                 CsSettings.setBool("eh_enabled", true)
@@ -194,10 +202,95 @@ object EhMetaManager {
     /** 卸载 = 删除整个 ehmeta 目录（对既有系统零残留） */
     fun uninstall() {
         ehDir().deleteRecursively()
+        invalidateExpunged()
         runCatching {
             CsSettings.setBool("eh_enabled", false)
             CsSettings.save()
         }
+    }
+
+    // ---------------------------------------------------------------- v2 升级（P-M8/P-M9）
+
+    fun keysVersionFile(): File = File(ehDir(), KEYS_VERSION_NAME)
+
+    /** 索引版本过期？（未导入不适用 → false；keys 在而版本文件缺失/不符 → true） */
+    fun keysStale(): Boolean {
+        if (!File(ehDir(), KEYS_NAME).isFile) return false
+        val f = keysVersionFile()
+        return !f.isFile || runCatching { f.readText().trim() }.getOrDefault("") != MATCH_ALGO_VERSION.toString()
+    }
+
+    private fun writeKeysVersion() {
+        runCatching {
+            val f = keysVersionFile()
+            val tmp = File(f.parentFile, f.name + ".tmp")
+            tmp.writeText(MATCH_ALGO_VERSION.toString())
+            if (!tmp.renameTo(f)) { tmp.copyTo(f, overwrite = true); tmp.delete() }
+        }
+    }
+
+    /**
+     * v2 原地重建 keys.bin：不重解 622MB 包，从已装 ehmeta.db 重建（原子替换 keys + 版本戳）。
+     * 复用导入路径的 tmp+rename 语义：中断时旧 keys 完好。可取消。
+     */
+    fun rebuildIndex(onProgress: (String, Int) -> Unit, cancelled: () -> Boolean): Long {
+        val dir = ehDir()
+        val db = File(dir, DB_NAME)
+        if (!db.isFile) throw IllegalStateException("ehmeta.db 不存在，请先导入")
+        val tmp = File(dir, "tmp")
+        tmp.deleteRecursively()
+        tmp.mkdirs()
+        val tmpKeys = File(tmp, KEYS_NAME)
+        try {
+            val keys = EhIndexBuilder.build(db, tmpKeys, File(tmp, "chunks"), { p ->
+                val pct = if (p.totalTitles > 0L) (p.titles * 100 / p.totalTitles).toInt() else 0
+                onProgress(if (p.stage == "merge") "index-merge" else "index-upgrade", minOf(pct, 99))
+            }, cancelled)
+            onProgress("install", 99)
+            val finalKeys = File(dir, KEYS_NAME)
+            if (!tmpKeys.renameTo(finalKeys)) {
+                tmpKeys.copyTo(finalKeys, overwrite = true)
+                tmpKeys.delete()
+            }
+            writeKeysVersion()
+            onProgress("done", 100)
+            return keys
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
+    // ---------------------------------------------------------------- v2 已删位图（匹配作业用）
+
+    @Volatile
+    private var expungedBits: java.util.BitSet? = null
+
+    /** gid→已删除 谓词（懒建 BitSet 进程内缓存；失败/缺失 → null = 不启用改投，安全默认） */
+    fun expungedPredicate(): ((Int) -> Boolean)? {
+        expungedBits?.let { bits -> return { g -> g >= 0 && bits.get(g) } }
+        val bits = runCatching {
+            val dbFile = File(ehDir(), DB_NAME)
+            if (!dbFile.isFile) return null
+            val b = java.util.BitSet()
+            android.database.sqlite.SQLiteDatabase
+                .openDatabase(dbFile.path, null, android.database.sqlite.SQLiteDatabase.OPEN_READONLY)
+                .use { d ->
+                    d.rawQuery("SELECT gid FROM gallery WHERE expunged=1", null).use { c ->
+                        while (c.moveToNext()) {
+                            val g = c.getLong(0)
+                            if (g in 0..Int.MAX_VALUE.toLong()) b.set(g.toInt())
+                        }
+                    }
+                }
+            b
+        }.getOrNull() ?: return null
+        expungedBits = bits
+        return { g -> g >= 0 && bits.get(g) }
+    }
+
+    /** 数据换代（导入/卸载）后失效缓存 */
+    fun invalidateExpunged() {
+        expungedBits = null
     }
 
     /** 匹配统计（读 match.db）：[匹配行数, gid 去重数]；无 match.db 返回 null */

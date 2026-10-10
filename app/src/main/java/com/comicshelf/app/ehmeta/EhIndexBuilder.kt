@@ -15,8 +15,13 @@ import java.nio.ByteOrder
  * 设备端 keys.bin 构建（P4：不随包分发 ~100MB 不可压排序数组，导入时现建）。
  *
  * 两步法（内存友好，largeHeap 下峰值 ~50MB）：
- *  1) 流式扫 title 表生成键 → 分块（2M 键）排序（双数组快排，无符号 (hash,gid) 序）→ 落临时块；
- *  2) k 路归并 + 按 hash 去重（保留最小 gid —— 与 Mac 参考 build_keys 语义一致）。
+ *  1) 流式扫 title 表生成键 → 分块（2M 键）排序（双数组快排，无符号 (hash, 打包gid) 序）→ 落临时块；
+ *  2) k 路归并 + 按 hash 去重（v2 livepref：同 hash 内【守卫通过的键优先在架（e=0）】再取最小 gid；
+ *     非守卫键 e 恒 0 → 纯最小 gid = v1 语义）。
+ *
+ * v2 打包（EHENTAI_MATCH_V2_PLAN P-M5/P-M6）：排序键 g' = (e shl 31) or gid，
+ *  e = gallery.expunged(gid) && EhV3.runGuard(key)；比较一律【无符号】（e=0 组先于 e=1 组）；
+ *  写盘时解包（g' and 0x7FFFFFFF）。gid ∈ [0, 2^31) 断言（现 max ~4.2M、合成 9e8 均安全）。
  *
  * 输出：[u64 hash LE][u32 gid LE] × N，按【无符号】hash 升序（铁律2 的存储形态）。
  */
@@ -46,6 +51,18 @@ object EhIndexBuilder {
         db.use { d ->
             totalTitles = DatabaseUtils.longForQuery(d, "SELECT COUNT(*) FROM title", null)
             onProgress(Progress(0, totalTitles, 0, "index"))
+            // v2：已删图库标记（gid→flag）；表缺失/异常 → 全 0（= v1 行为，安全默认）
+            val expFlag: ByteArray = runCatching {
+                val maxGid = DatabaseUtils.longForQuery(d, "SELECT IFNULL(MAX(gid),0) FROM gallery", null)
+                val arr = ByteArray((maxGid + 1).coerceAtMost(1L shl 31).toInt())
+                d.rawQuery("SELECT gid FROM gallery WHERE expunged=1", null).use { c ->
+                    while (c.moveToNext()) {
+                        val eg = c.getLong(0)
+                        if (eg in 0 until arr.size.toLong()) arr[eg.toInt()] = 1
+                    }
+                }
+                arr
+            }.getOrElse { ByteArray(0) }
             d.rawQuery("SELECT gid, text FROM title", null).use { c ->
                 while (c.moveToNext()) {
                     if (cancelled()) throw EhCancelledException()
@@ -53,7 +70,9 @@ object EhIndexBuilder {
                     val text = c.getString(1)
                     for (k in EhV3.keysOf(text)) {
                         h[n] = EhV3.fnv64(k)
-                        g[n] = gid.toInt()
+                        val e = if (gid in 0 until expFlag.size.toLong() &&
+                            expFlag[gid.toInt()].toInt() == 1 && EhV3.runGuard(k)) 1 else 0
+                        g[n] = (e shl 31) or (gid.toInt() and 0x7FFFFFFF)
                         n++
                         if (n == CHUNK_KEYS) {
                             sortPairs(h, g, n)
@@ -99,7 +118,8 @@ object EhIndexBuilder {
 
     private fun less(h1: Long, g1: Int, h2: Long, g2: Int): Boolean {
         val c = java.lang.Long.compareUnsigned(h1, h2)
-        return c < 0 || (c == 0 && g1 < g2)
+        // v2：g 为打包键 (e shl 31 | gid)，一律无符号比较（e=0 组先于 e=1 组，组内最小 gid）
+        return c < 0 || (c == 0 && java.lang.Integer.compareUnsigned(g1, g2) < 0)
     }
 
     private fun swap(h: LongArray, g: IntArray, i: Int, j: Int) {
@@ -256,13 +276,13 @@ object EhIndexBuilder {
                     if (!live[i]) continue
                     if (best < 0) { best = i; bestH = hs[i]; bestG = gs[i]; continue }
                     val cc = java.lang.Long.compareUnsigned(hs[i], bestH)
-                    if (cc < 0 || (cc == 0 && gs[i] < bestG)) {
+                    if (cc < 0 || (cc == 0 && java.lang.Integer.compareUnsigned(gs[i], bestG) < 0)) {
                         best = i; bestH = hs[i]; bestG = gs[i]
                     }
                 }
                 if (!haveLast || bestH != lastH) {
                     recView.putLong(0, bestH)
-                    recView.putInt(8, bestG)
+                    recView.putInt(8, bestG and 0x7FFFFFFF)   // v2：解包（去 e 位）
                     os.write(rec, 0, 12)
                     lastH = bestH
                     haveLast = true

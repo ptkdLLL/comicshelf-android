@@ -15,9 +15,23 @@ class EhIndexBuilderSortTest {
     private fun verifySorted(h: LongArray, g: IntArray, n: Int) {
         for (i in 0 until n - 1) {
             val c = java.lang.Long.compareUnsigned(h[i], h[i + 1])
+            // v2：g 为打包键 (e shl 31 | gid)，无符号比较（EhIndexBuilder.less 同口径）
             assertTrue("乱序 @$i: h=${java.lang.Long.toUnsignedString(h[i])} > ${java.lang.Long.toUnsignedString(h[i + 1])}",
-                c < 0 || (c == 0 && g[i] <= g[i + 1]))
+                c < 0 || (c == 0 && java.lang.Integer.compareUnsigned(g[i], g[i + 1]) <= 0))
         }
+    }
+
+    @Test
+    fun packedExpungedBitOrder() {
+        // v2 打包排序：e=0 组（bit31=0）先于 e=1 组（已删且守卫通过）；组内最小 gid 在前
+        val h = LongArray(6) { 777L }
+        val g = intArrayOf(
+            0x80000005.toInt(), 5, 0x80000001.toInt(), 1, 0x80000009.toInt(), 9,
+        )
+        EhIndexBuilder.sortPairs(h, g, 6)
+        assertEquals(1, g[0]); assertEquals(5, g[1]); assertEquals(9, g[2])          // e=0 组升序
+        assertEquals(0x80000001.toInt(), g[3]); assertEquals(0x80000005.toInt(), g[4])
+        assertEquals(0x80000009.toInt(), g[5])                                       // e=1 组升序
     }
 
     @Test

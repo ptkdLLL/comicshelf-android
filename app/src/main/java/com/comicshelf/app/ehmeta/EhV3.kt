@@ -21,6 +21,17 @@ object EhV3 {
 
     private val EXTS = arrayOf(".zip", ".rar", ".7z", ".cbz", ".cbr", ".pdf", ".epub")
 
+    // ---------------------------------------------------------------- v2 常量（EHENTAI_MATCH_V2_PLAN §4/§5）
+
+    /** 骨架变体最小长度（低于此值不探查/不注册；审计标定拐点，见 REPORT 附录 C） */
+    internal const val SKEL_MIN = 8
+
+    /** runGuard：单内容串长度下限（≥2 个内容串 或 单串 ≥ 此值 → 键有信息量） */
+    internal const val GUARD_MIN_RUN = 10
+
+    /** 探查预算（v1 为 256；审计实测 256 下候选族扩展会丢 1 例，512 全量 0 损失） */
+    internal const val PROBE_BUDGET = 512
+
     /** 段：'B' = 括号组（成对、同型嵌套），'T' = 自由文本段。[a,b) 为在 base 中的位置。 */
     class Seg(val kind: Char, val text: String, val a: Int, val b: Int)
 
@@ -124,6 +135,83 @@ object EhV3 {
         return sb.toString()
     }
 
+    // ---------------------------------------------------------------- 骨架等价（v2）
+
+    /** 结构括号位图（BMP）：skel/runGuard 保留集合的组成部分（分段文法依赖，保持不变） */
+    private val BRACKET = BooleanArray(0x10000).also { a ->
+        for (c in OPENS) a[c.code] = true
+        for (c in CLOSES) a[c.code] = true
+    }
+
+    /**
+     * 内容骨架（v2 核心）：删除 Z 类(空白)/P 类(标点)/S 类(符号)/C 类 范畴字符，
+     * 保留 L/M/N 类（字母/标记/数字）与既有结构括号。**一个 Unicode 范畴谓词，零字符清单**。
+     *
+     * 依据（通用事实）：消毒器/改名器只会破坏非内容字符（字母/数字/汉字不被改写），
+     * 因此匹配应在内容骨架上做——`_ : | ? ~ 〜 ・ ☆` 等全部消杀家族被本谓词统一覆盖。
+     * 实测：语料 8,154 字符 Python(unicodedata) 与 JVM(Character.getType) 保/删判定零分歧。
+     * ⚠️ 拼音/类别常量：UPPERCASE..OTHER_LETTER=1..5, MARK=6..8, NUMBER=9..11。
+     */
+    fun skel(s: String): String {
+        if (s.isEmpty()) return s
+        val sb = StringBuilder(s.length)
+        var i = 0
+        while (i < s.length) {
+            val cp = s.codePointAt(i)
+            val n = Character.charCount(cp)
+            if (cp < 0x10000 && BRACKET[cp]) {
+                sb.append(s, i, i + n)
+            } else {
+                val t = Character.getType(cp)
+                if (t in 1..11) sb.append(s, i, i + n)
+            }
+            i += n
+        }
+        return sb.toString()
+    }
+
+    /**
+     * 替换/改投守卫 v2：≥ 2 个内容串，或【顶层（非括号内）】单串 ≥ GUARD_MIN_RUN。
+     * 拒绝泛用/退化键（`[chinese]`/`[aigenerated]`/`(c96)`/`(c58)`/`switch`），
+     * 接受标题类键（`[可老家(かろう)]原神牧場(原神)`/`[メメ50]発情警報`/顶层裸标题 `bootlegvol1`）。
+     *
+     * v1（未区分括号）被 `[aigenerated]`/`[decensored]` 类「括号内长单词」骗过 →
+     * AI 簇坍缩到 "[AI Generated] (1)" 垃圾图库（跨端对账 20 例实证，§6 迭代 v2.1）。
+     */
+    fun runGuard(key: String): Boolean {
+        var runs = 0
+        var topSingle = 0
+        var cur = 0
+        var depth = 0
+        val s = skel(key)
+        var i = 0
+        while (i < s.length) {
+            val cp = s.codePointAt(i)
+            if (cp < 0x10000 && BRACKET[cp]) {
+                val isOpen = isOpenBracket(cp)
+                if (cur > 0) {
+                    runs++
+                    if (depth == 0 && cur > topSingle) topSingle = cur
+                    cur = 0
+                }
+                if (isOpen) depth++ else if (depth > 0) depth--
+            } else {
+                cur++
+            }
+            i += Character.charCount(cp)
+        }
+        if (cur > 0) {
+            runs++
+            if (depth == 0 && cur > topSingle) topSingle = cur
+        }
+        return runs >= 2 || topSingle >= GUARD_MIN_RUN
+    }
+
+    private fun isOpenBracket(cp: Int): Boolean {
+        for (c in OPENS) if (c.code == cp) return true
+        return false
+    }
+
     fun fnv64(s: String): Long {
         var h = 0xcbf29ce484222325uL.toLong()
         for (c in s) {
@@ -160,6 +248,13 @@ object EhV3 {
             val f = forbid(k)
             if (f.isNotEmpty() && f != k) out.add(f)
         }
+        // v2 骨架变体：对现行全输出（含嵌套去尾/forbid）逐元素一次 skel（非递归）。
+        // 与金标准 keys_skel_livepref 同语义（审计逐行对齐，EHENTAI_MATCH_V2_PLAN §5 P-M3）。
+        val n0 = out.size
+        for (i in 0 until n0) {
+            val u = skel(out[i])
+            if (u.length >= SKEL_MIN && u != out[i]) out.add(u)
+        }
         return out
     }
 
@@ -182,12 +277,15 @@ object EhV3 {
     // ---------------------------------------------------------------- 查询侧匹配（bench matchBook 移植）
 
     /**
-     * 对一个原始名（书名/文件名）做匹配。
+     * 对一个原始名（书名/文件名）做匹配（v2：探查族 + 已删改投）。
      * @param probe 传入候选串，返回命中的 gid（>=0）或 -1。
+     * @param isExpunged gid→是否已删除（null = 视同全在架 → 与 v1 行为完全一致：首命中即返）。
      * @return 命中的 gid；未命中 -1。
-     * 语义与 bench 完全一致：probe(base) → [forbid] → 迭代加深丢 1..4 段 → 预算 256 probe，命中即停。
+     * 语义：每候选探查 s → forbid(s) → skel(s)[len≥SKEL_MIN]；
+     * firstAny（已删）→ 继续扫，首个「在架且 runGuard(键)」命中改投；扫完无合规 → 兜底 firstAny。
+     * 结构层（分段/枚举/丢段顺序）与 v1 逐行一致——审计纪律：等价层与结构层分离。
      */
-    fun match(raw: String, probe: (String) -> Int): Int {
+    fun match(raw: String, probe: (String) -> Int, isExpunged: ((Int) -> Boolean)? = null): Int {
         val base = canon(stripExt(raw))
         val segs = segments(base)
         val sn = segs.size
@@ -217,25 +315,35 @@ object EhV3 {
         val order = IntArray(olen) { droppable[it][1] }
 
         var emitted = 0
-        var hit = -1
+        var hitAny = -1
+        var hitLive = -1
         fun probeOne(s: String) {
-            if (hit >= 0 || s.isEmpty() || emitted >= 256) return
+            if (hitLive >= 0 || s.isEmpty() || emitted >= PROBE_BUDGET) return
             emitted++
             val g = probe(s)
-            if (g >= 0) hit = g
+            if (g < 0) return
+            if (hitAny < 0) hitAny = g
+            if (isExpunged == null) { hitLive = g; return }   // 未启用改投：v1 语义（首命中即返）
+            // Rule A（§6 v2.1 跨端对账定版）：**所有**在架命中（含首命中）须过守卫；
+            // 无一合规 → 兜底 firstAny（退化首命中保留 = v1 行为，不丢不降）
+            if (!isExpunged(g) && runGuard(s)) hitLive = g
         }
-        fun probeV(s: String) {
+        fun probeF(s: String) {
             probeOne(s)
-            if (hit < 0) {
+            if (hitLive < 0) {
                 val f = forbid(s)
                 if (f != s) probeOne(f)
             }
+            if (hitLive < 0) {
+                val u = skel(s)
+                if (u.length >= SKEL_MIN && u != s && u != forbid(s)) probeOne(u)
+            }
         }
-        probeV(base)
-        if (hit < 0 && olen > 0) {
+        probeF(base)
+        if (hitLive < 0 && olen > 0) {
             val combo = IntArray(4)
             fun rec(depth: Int, start: Int, need: Int) {
-                if (hit >= 0) return
+                if (hitLive >= 0) return
                 if (depth == need) {
                     // 铁律1：组合内段位置可能乱序 —— 先按位置排序再拼接
                     val as_ = IntArray(need)
@@ -262,20 +370,20 @@ object EhV3 {
                         if (b > last) last = b
                     }
                     sb.append(base, last, base.length)
-                    probeV(sb.toString())
+                    probeF(sb.toString())
                     return
                 }
                 for (j in start until olen) {
-                    if (hit >= 0) return
+                    if (hitLive >= 0) return
                     combo[depth] = j
                     rec(depth + 1, j + 1, need)
                 }
             }
             for (need in 1..4) {
-                if (hit >= 0) break
+                if (hitLive >= 0) break
                 rec(0, 0, need)
             }
         }
-        return hit
+        return if (hitLive >= 0) hitLive else hitAny
     }
 }

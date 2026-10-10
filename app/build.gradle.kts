@@ -15,8 +15,8 @@ android {
         applicationId = "com.comicshelf.app"
         minSdk = 30
         targetSdk = 36
-        versionCode = 22
-        versionName = "0.5.7-scroll-android"
+        versionCode = 24
+        versionName = "0.5.9-matchv2-android"
 
         externalNativeBuild {
             cmake {
@@ -104,6 +104,14 @@ android {
             java.srcDir("src/ehdebug/java")
             manifest.srcFile("src/ehdebug/AndroidManifest.xml")
         }
+    }
+}
+
+// DAP 动态验证门控（EHENTAI_MATCH_V2_PLAN §7-A2）：-PdapTest 时测试 JVM 挂 jdwp，
+// 供 mcp dap backend=java attach:5005 断点真数据夹具；默认零影响。
+tasks.withType<Test>().configureEach {
+    if (project.hasProperty("dapTest")) {
+        jvmArgs("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:5005")
     }
 }
 

@@ -97,6 +97,27 @@ class EhMatchStore(dir: File) : Closeable {
         db.execSQL("DELETE FROM matches")
     }
 
+    // ---------------------------------------------------------------- v2 迁移（EHENTAI_MATCH_V2_PLAN P-M10/M11）
+
+    /** 算法版本（match.db user_version）。0 = 旧库/新库未标；与 EhMetaManager.MATCH_ALGO_VERSION 对齐。 */
+    fun algoVersion(): Int = runCatching {
+        // PRAGMA 返回行 → 必须 rawQuery（Android 事实，见 init 注释先例）
+        db.rawQuery("PRAGMA user_version", null).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+    }.getOrDefault(0)
+
+    fun setAlgoVersion(v: Int) {
+        db.execSQL("PRAGMA user_version=$v")   // 无返回行 → execSQL 合法（Room 迁移同法）
+    }
+
+    /** 合成 gid 行（S6 试点标注，gid ≥ 9e8）：force 重匹前预载；新算法未命中时保行（用户原则：多多益善） */
+    fun syntheticRows(): HashMap<String, Long> {
+        val out = HashMap<String, Long>()
+        db.rawQuery("SELECT path, gid FROM matches WHERE gid >= 900000000", null).use { c ->
+            while (c.moveToNext()) out[c.getString(0)] = c.getLong(1)
+        }
+        return out
+    }
+
     /** 全量匹配后压缩（回收随机插入造成的页空洞；实测 220MB → ~90MB） */
     fun vacuum() {
         db.execSQL("VACUUM")
