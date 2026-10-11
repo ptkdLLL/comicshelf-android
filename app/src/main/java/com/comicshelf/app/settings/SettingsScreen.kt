@@ -37,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.comicshelf.app.core.ArchiveCache
 import com.comicshelf.app.core.CoreDispatcher
 import com.comicshelf.app.core.CsSettings
 import com.comicshelf.app.core.NativeBridge
@@ -256,6 +257,53 @@ private fun SmbSection() {
             Spacer(Modifier.width(12.dp))
             Text(status, style = MaterialTheme.typography.bodySmall,
                  color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.height(12.dp))
+        // ---- RAR 整档缓存: 占用 + 一键释放（smb:// RAR 首次打开整档落盘, 无上限）----
+        var cacheTick by remember { mutableStateOf(0) }
+        var confirmRelease by remember { mutableStateOf(false) }
+        var releaseNote by remember { mutableStateOf<String?>(null) }
+        val filesDir = remember { com.comicshelf.app.util.AppContextHolder.app.filesDir }
+        val cacheStats = remember(cacheTick) { ArchiveCache.stats(filesDir) }
+        Text("RAR 本地缓存：${cacheStats.files} 个文件 · ${fmtSize(cacheStats.bytes)}",
+             style = MaterialTheme.typography.bodySmall)
+        releaseNote?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall,
+                 color = MaterialTheme.colorScheme.primary)
+        }
+        Spacer(Modifier.height(6.dp))
+        OutlinedButton(onClick = { confirmRelease = true }) { Text("释放 RAR 缓存") }
+        if (confirmRelease) {
+            AlertDialog(
+                onDismissRequest = { confirmRelease = false },
+                title = { Text("释放 RAR 本地缓存？") },
+                text = {
+                    Column {
+                        Text("将删除 SMB 远程 RAR 的本地缓存" +
+                             "（${cacheStats.files} 个文件，${fmtSize(cacheStats.bytes)}）。",
+                             style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.height(8.dp))
+                        Text("书库、阅读进度、翻译与封面不受影响；" +
+                             "正在阅读的远程 RAR 会在再次打开时自动重新缓存。",
+                             style = MaterialTheme.typography.bodySmall,
+                             color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        scope.launch {
+                            val r = withContext(Dispatchers.IO) { ArchiveCache.release(filesDir) }
+                            withContext(Dispatchers.Main) {
+                                cacheTick++
+                                releaseNote = if (r.ok) "已释放：${r.files} 个文件（${fmtSize(r.bytes)}）"
+                                              else "部分文件未能删除（已释放 ${r.files} 个）"
+                                confirmRelease = false
+                            }
+                        }
+                    }) { Text("释放", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = { TextButton(onClick = { confirmRelease = false }) { Text("取消") } },
+            )
         }
     }
 }
@@ -557,4 +605,11 @@ private fun SettingRow(label: String, trailing: @Composable () -> Unit) {
         Text(label, Modifier.weight(1f))
         trailing()
     }
+}
+
+private fun fmtSize(b: Long): String = when {
+    b >= 1L shl 30 -> "%.2fGB".format(b / 1073741824.0)
+    b >= 1L shl 20 -> "%.0fMB".format(b / 1048576.0)
+    b >= 1L shl 10 -> "%.0fKB".format(b / 1024.0)
+    else -> "$b B"
 }
