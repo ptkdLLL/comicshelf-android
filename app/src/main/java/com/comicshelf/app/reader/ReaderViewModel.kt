@@ -74,7 +74,6 @@ class ReaderViewModel : ViewModel() {
     private val trInflight = HashSet<Int>()
 
     private var pollJob: Job? = null
-    private var targetDim = 2048   // 仅剩翻译路径（translateGetPage 返回尺寸）使用
 
     var lastFlipMs = 0.0
 
@@ -228,6 +227,7 @@ class ReaderViewModel : ViewModel() {
         borrowed.clear()                      // 页位图归组合项所有——离开阅读器即全释放（I1）
         pageDims.clear()
         synchronized(trCache) { trCache.evictAll() }
+        synchronized(renderBaseCache) { renderBaseCache.clear() }   // v2: 渲染基随书释放
         resetLoadGating()
         open.value = ReaderOpenState()
     }
@@ -251,7 +251,9 @@ class ReaderViewModel : ViewModel() {
     // ---------------------------------------------------------------- pages
 
     fun setScreenHint(width: Int, height: Int) {
-        targetDim = maxOf(width, height) * 2   // 2x for crisp pinch zoom（翻译路径用；解码已改字节上限）
+        // v2(PLAN §3.3): 渲染基已切到确定性解码（renderBaseAt，与翻译上传同规则），
+        // 屏幕尺寸不再参与翻译/渲染分辨率口径——此入口保留空转（UI 兼容），
+        // 旧 targetDim=max*2 的屏幕相关口径已废除。
     }
 
     /** P-R2 借用表查询（语义与旧 pageCache.get 相同：没有就是 null）。 */
@@ -486,8 +488,9 @@ class ReaderViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.Default) {
             try {
                 trStates.value = trStates.value + (page to TranslatePageState.BUSY)
-                val bmp = pageAt(page)
-                if (bmp == null) {
+                // v2(PLAN §3.3): 检测/渲染统一走确定性渲染基（框空间==位图空间）。
+                val base = renderBaseAt(st.bookId, page)
+                if (base == null) {
                     // 位图未就绪（切页过快 / 解码未完）——这是瞬态，不是页面的终态：
                     // 置回 NONE 留给下次触发。此前这里静默落 FAILED，把页面永久毒化
                     // （表现为"翻回该页永不翻译"，2026-10-02 修复）。
@@ -496,7 +499,7 @@ class ReaderViewModel : ViewModel() {
                     return@launch
                 }
                 val soft = try {
-                    bmp.copy(Bitmap.Config.ARGB_8888, false)
+                    base.copy(Bitmap.Config.ARGB_8888, false)
                 } catch (t: Throwable) { null }
                 val result = soft?.let { OnDeviceTranslator.translatePage(st.bookId, page, it) }
                 if (result != null) {
@@ -523,13 +526,10 @@ class ReaderViewModel : ViewModel() {
         synchronized(trInflight) { if (!trInflight.add(page)) return }   // 防并发重复渲染
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                var bmp = pageAt(page)
-                if (bmp == null) {                 // 翻页瞬间位图可能还没落缓存：稍等一次
-                    delay(400)
-                    bmp = pageAt(page)
-                }
-                if (bmp == null) return@launch
-                val out = OnDeviceTranslator.renderBackendPage(st.bookId, page, bmp)
+                // v2(PLAN §3.3): 渲染基 = 确定性解码（与翻译上传同规则）——不再用
+                // 预算解耦的 pageAt(位图)，跨设备/屏幕尺寸渲染逐字节一致。
+                val base = renderBaseAt(st.bookId, page) ?: return@launch
+                val out = OnDeviceTranslator.renderBackendPage(st.bookId, page, base)
                     ?: return@launch
                 synchronized(trCache) { trCache.put(page, out) }
                 trStates.value = trStates.value + (page to TranslatePageState.READY)
@@ -578,6 +578,20 @@ class ReaderViewModel : ViewModel() {
 
     // -------------------------------------------------------------- translate
 
+    /** v2(PLAN §3.3): 渲染基缓存（LRU 4 页；确定性解码结果，与阅读器预算位图解耦）。 */
+    private val renderBaseCache = object : LinkedHashMap<Int, Bitmap>(4, 0.75f, true) {
+        override fun removeEldestEntry(e: MutableMap.MutableEntry<Int, Bitmap>) = size > 4
+    }
+
+    /** 确定性渲染基：与翻译上传（BookTranslateJob.kPageDim=PageBudget.RENDER_BASE_DIM）
+     *  同规则解码 → 框坐标空间==渲染位图空间，跨设备/跨屏幕尺寸逐字节一致（PLAN §3.3）。 */
+    private suspend fun renderBaseAt(bookId: Long, page: Int): Bitmap? {
+        synchronized(renderBaseCache) { renderBaseCache[page] }?.let { return it }
+        val b = PageDecoder.decodeJob(bookId, page, PageBudget.RENDER_BASE_DIM) ?: return null
+        synchronized(renderBaseCache) { renderBaseCache[page] = b }
+        return b
+    }
+
     /** 翻译 overlay 查询（消费者=页项 200ms 身份轮询——评估 G5：替代旧 revision 重启三态覆盖）。 */
     fun translatedAt(page: Int): Bitmap? = synchronized(trCache) { trCache.get(page) }
 
@@ -610,7 +624,7 @@ class ReaderViewModel : ViewModel() {
 
     private fun loadTranslated(page: Int) {
         viewModelScope.launch(Dispatchers.IO) {
-            val bundle = NativeBridge.translateGetPage(page, targetDim)
+            val bundle = NativeBridge.translateGetPage(page, PageBudget.RENDER_BASE_DIM)
             val (dims, px) = parseImageBundle(bundle) ?: return@launch
             val bmp = com.comicshelf.app.core.CoverStore.rgbaToBitmap(dims, px)
             if (bmp != null) {

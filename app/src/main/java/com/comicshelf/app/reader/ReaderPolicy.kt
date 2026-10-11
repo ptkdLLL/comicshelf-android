@@ -33,6 +33,14 @@ object PageBudget {
     const val MIN_BUDGET_CAP = 96L shl 20
 
     /**
+     * v2(TRANSLATE_RENDER_V2_PLAN §3.3): 翻译上传与渲染基的**唯一确定性分辨率口径**
+     * （最长边目标, pow2 采样规则见 PageDecoder.decodeJob）。渲染渲染基与上传解码共用
+     * 同一规则 → "框坐标空间 == 渲染位图空间"，且跨设备/跨屏幕尺寸逐字节一致。
+     * （原 BookTranslateJob.kPageDim=2048 上提共享，避免双常量漂移。）
+     */
+    const val RENDER_BASE_DIM = 2048
+
+    /**
      * 瞬时最大组合页数 = (2×beyondViewportPageCount + 2) × (双页 ? 2 : 1)，beyond=2：
      * 静置 5 页（1+2+2）、滚动瞬时 6 页（2+2+2，E1/E3 实证）、横屏双页 ×2 = 12。
      */

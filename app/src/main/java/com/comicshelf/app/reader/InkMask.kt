@@ -23,9 +23,9 @@ object InkMask {
     private const val BLOCK = 11        // 局部均值窗口（BT adaptiveThreshold blockSize）
     private const val C = 2             // 阈值偏置（BT C=2）
     private const val MIN_AREA = 10     // CC 面积过滤（BT connectedComponents 面积 >10）
-    // CC 面积上限:文字笔画是"字级"连通域(64px 粗体 ≈ 2.5k 墨);灰阶网点/画面纹理
-    // 在 ±2 局部均值下全块皆墨、连成巨型 CC,整块被环带色回填 = "一坨色块"(§E7)。
-    private const val MAX_AREA = 8192
+    // v2(PLAN §4 D-2/D-3): 原 MAX_AREA=8192 丢弃巨型 CC 的防护已删除——该规则是
+    // E7 时代"环带回填"的产物; 现回填改为调和扩散(像素级, 结构上不可能采块外色),
+    // 丢弃大域只剩负面(字迹粘连块残留)。噪点过滤仅保留 MIN_AREA。
     // BT inpaint_mask_dilate=4 用的是 np.ones((4,4)) kernel（锚点居中，每边≈2px）；
     // 掩码面积对膨胀半径极敏感（字迹笔画仅 1~2px 宽），实测 4 轮 3×3=每边4px 时
     // 覆盖率 7.33% vs BT 基准 3.61%，改为每边 2px。
@@ -33,6 +33,8 @@ object InkMask {
     private const val PAD_TOP = 10      // 裁剪上扩（BT adjust_text_line_coordinates y_off=10）
     private const val TEXTURE_FRAC = 0.45f  // C=2 二值覆盖率超此值 = 纹理/网点背景
     private const val CONTRAST_C = 60   // 纹理背景改用块中位灰 ±60 为墨(黑字|10-192|=182 ✓;网点灰 144:48 ✗)
+    private const val STRONG_C = 25     // v2.2: 极性无关强边缘(局部均值偏置); 网点块占比高被门控关
+    private const val STRONG_FRAC = 0.60f  // strong 全高占比 ≥ 此值 = 网点/纹理 → 关 strong
 
     /**
      * @param rects 文字框（页面坐标，仅对将被重绘的块调用）
@@ -81,7 +83,11 @@ object InkMask {
             val bh = ry1 - ry0
             // 1) 自适应二值（暗墨 | 亮墨）
             val bin = ByteArray(bw * bh)
+            // v2.2: 极性无关的强边缘判据 |v-局部均值|>STRONG_C —— 治"深底块中位偏暗
+            // 时黑字不入 |v-bm|>60(极性翻转漏检)"(实测 #梦寐以求页右下气泡残字)。
+            val strong = ByteArray(bw * bh)
             var ones = 0
+            var strongCnt = 0
             for (y in ry0 until ry1) {
                 for (x in rx0 until rx1) {
                     val x0 = (x - half).coerceAtLeast(0)
@@ -91,14 +97,17 @@ object InkMask {
                     val m = mean(x0, y0, x1, y1)
                     val v = gray[y * w + x]
                     if (v < m - C || v > m + C) { bin[(y - ry0) * bw + (x - rx0)] = 1; ones++ }
+                    if (v < m - STRONG_C || v > m + STRONG_C) {
+                        strong[(y - ry0) * bw + (x - rx0)] = 1; strongCnt++
+                    }
                 }
             }
             // 1b) 纹理/网点背景兜底:±2 局部均值在灰阶网点上"全块皆墨"(实测 95%)。
-            // 笔画级 CC 在纹理上**不可分**(要么吞整块被环带色回填,要么字与纹理
-            // 相连被面积上限跳过→原文残留)。改为**行/列条带**级掩码:对
-            // |g-块中位|>60 的强对比墨做两轴投影切带,条数多者=文字行进轴;每条带
-            // 取其墨在两轴上的外接矩形±2~3 填掩码 —— 与 BT get_inpaint_bboxes
-            // (行矩形)同构;条带间的画面保留,配合渲染端调和填充色调自然延续(§E8)。
+            // 笔画级 CC 在纹理上**不可分**(要么吞整块,要么字与纹理相连)。改为**行/列条带**
+            // 级掩码:对 |g-块中位|>60 的强对比墨做两轴投影切带,条数多者=文字行进轴;
+            // **v2(PLAN §3.4): 每条带只把 ink2 墨迹像素本身入掩码**(旧版按条带墨迹外接
+            // 矩形±2/±3 整块填 → 整列矩形刷平盖画面)。条带间的画面保留,配合渲染端调和
+            // 填充色调自然延续(§E8); 全局 DILATE=2 补足 BT mask dilate 2 的边距。
             if (ones.toFloat() / (bw * bh) > TEXTURE_FRAC) {
                 val smp = ArrayList<Int>(4096)
                 val step = (bw * bh / 4096).coerceAtLeast(1)
@@ -139,43 +148,31 @@ object InkMask {
                 val by = bands(projY)
                 val vertical = bx.size > by.size
                 val bd = if (vertical) bx else by
+                // v2.2 门控: strong 全高占比 ≥STRONG_FRAC(网点/纹理"处处皆边") → 关,
+                // 防 E7 网点块被整片擦平; 常规文字块占比 ~0.3-0.5 → 开, 补极性盲区。
+                val useStrong = strongCnt.toFloat() / (bw * bh) < STRONG_FRAC
                 if (bd.isEmpty()) {
-                    // 兜底:投影找不到条带 → 整块入掩码(调和填充会以块边界色调延续)
+                    // 兜底:投影找不到条带 → 整块 binm∪ink2 入掩码(调和填充以块边界色延续)
                     for (i in 0 until bw * bh)
-                        if (ink2(i)) mask[(ry0 + i / bw) * w + (rx0 + i % bw)] = 1
+                        if (ink2(i) || (useStrong && strong[i] == 1.toByte()))
+                            mask[(ry0 + i / bw) * w + (rx0 + i % bw)] = 1
                     continue
                 }
                 for (bnd in bd) {
-                    // 条带内强对比墨在两轴上的外接范围(另一轴收紧,免擦整列/整行)
-                    var u0 = Int.MAX_VALUE; var u1 = Int.MIN_VALUE
-                    var v0 = Int.MAX_VALUE; var v1 = Int.MIN_VALUE
+                    // v2.1(最佳效果修订): 条带只做"定位"(ink2 稳健找文字行进区), 掩码取
+                    // **±2 自适应笔画像素 ∪ 强对比墨**(binm 敏感, 细软笔画/淡色字不漏)——
+                    // 旧版条带内只取 ink2(|Δ|>60)导致淡笔画残留; 外接矩形方案会盖画面。
+                    // 逐像素入掩码 + 全局 DILATE=2 兜边 = BT"字迹掩码+dilate 2"等效。
                     if (vertical) {
                         for (x in bnd[0]..bnd[1].coerceAtMost(bw - 1))
                             for (y in 0 until bh)
-                                if (ink2(y * bw + x)) {
-                                    if (y < u0) u0 = y
-                                    if (y > u1) u1 = y
-                                    if (x < v0) v0 = x
-                                    if (x > v1) v1 = x
-                                }
+                                if (ink2(y * bw + x) || (useStrong && strong[y * bw + x] == 1.toByte()))
+                                    mask[(ry0 + y) * w + rx0 + x] = 1
                     } else {
                         for (y in bnd[0]..bnd[1].coerceAtMost(bh - 1))
                             for (x in 0 until bw)
-                                if (ink2(y * bw + x)) {
-                                    if (y < u0) u0 = y
-                                    if (y > u1) u1 = y
-                                    if (x < v0) v0 = x
-                                    if (x > v1) v1 = x
-                                }
-                    }
-                    if (u1 <= u0 || v1 <= v0) continue
-                    val mx0 = (rx0 + v0 - 2).coerceAtLeast(rx0)
-                    val mx1 = (rx0 + v1 + 2).coerceAtLeast(mx0 + 1).coerceAtMost(rx1 - 1)
-                    val my0 = (ry0 + u0 - 3).coerceAtLeast(ry0)
-                    val my1 = (ry0 + u1 + 3).coerceAtLeast(my0 + 1).coerceAtMost(ry1 - 1)
-                    for (yy in my0..my1) {
-                        val row = yy * w
-                        for (xx in mx0..mx1) mask[row + xx] = 1
+                                if (ink2(y * bw + x) || (useStrong && strong[y * bw + x] == 1.toByte()))
+                                    mask[(ry0 + y) * w + rx0 + x] = 1
                     }
                 }
                 continue   // 纹理路径不走笔画 CC
@@ -210,7 +207,7 @@ object InkMask {
                             }
                         }
                     }
-                    if (comp.size < MIN_AREA || comp.size > MAX_AREA) continue
+                    if (comp.size < MIN_AREA) continue
                     var mnx = bw; var mny = bh; var mxx = 0; var mxy = 0
                     val pix = IntArray(comp.size)
                     for ((k, ci) in comp.withIndex()) {

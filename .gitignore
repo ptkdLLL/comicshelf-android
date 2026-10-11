@@ -43,3 +43,5 @@ ehmeta-builder/packaging/build/
 ehmeta-builder/packaging/dist/
 ehmeta-builder/packaging/build_venv/
 ehmeta-builder/packaging/*.spec
+# 真页像素夹具(含原书内容)-脱敏不入库; 数值向量(*.txt)正常入库
+app/src/test/resources/v2/*.argb

@@ -52,7 +52,7 @@ object BookTranslateJob {
             else (((total - done).coerceAtLeast(0)) * avgMs).toLong()
     }
 
-    private const val kPageDim = 2048   // 与 ReaderViewModel.targetDim 相同
+    private const val kPageDim = PageBudget.RENDER_BASE_DIM   // v2: 共享口径(PLAN §3.3)
     private const val kMaxAttempts = 2
 
     private val _state = MutableStateFlow(State())

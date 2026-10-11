@@ -256,7 +256,7 @@ object OnDeviceTranslator {
                     val det = runDetect(page)
                     val texts = toStringList(o.optJSONArray("texts"))
                     if (det.first.isEmpty() || texts.isEmpty()) return@let
-                    val bmp = render(page, det.first, texts)
+                    val bmp = render(page, det.first, texts, null, "b${bookId}p${pageIndex}")
                     if (bmp != null) {
                         Log.i("OnDeviceTr", "archive hit, ${(System.nanoTime()-t0)/1e6} ms")
                         return@withContext Result(bmp, texts, texts, det.second)
@@ -468,7 +468,7 @@ object OnDeviceTranslator {
                 val url = CsSettings.get("llm_url", "")
                 if (url.isBlank()) {
                     Log.w("OnDeviceTr", "llm_url not configured; showing source text")
-                    val bmp = render(page, boxes, sources.map { it.ifEmpty { "?" } }, sources)
+                    val bmp = render(page, boxes, sources.map { it.ifEmpty { "?" } }, sources, "b${bookId}p${pageIndex}")
                     return@withContext if (bmp != null)
                         Result(bmp, sources, sources, "no-llm") else null
                 }
@@ -493,7 +493,7 @@ object OnDeviceTranslator {
             }
 
             // --- render -------------------------------------------------------------
-            val bmp = render(page, boxes, translated, sources)
+            val bmp = render(page, boxes, translated, sources, "b${bookId}p${pageIndex}")
             if (bmp == null) return@withContext null
 
             withContext(CoreDispatcher) {
@@ -707,7 +707,7 @@ object OnDeviceTranslator {
 
     /** Inpaints detected regions and typesets the translated lines. */
     private fun render(page: Bitmap, boxes: List<Box>, texts: List<String>,
-                       srcs: List<String>? = null): Bitmap? {
+                       srcs: List<String>? = null, tag: String = ""): Bitmap? {
         if (boxes.size != texts.size) return null
         // HARDWARE 位图不支持 getPixels()（InkMask 需要）——统一先拷软件副本。
         // 阅读器缓存页/队列解码页都可能是 HARDWARE（2026-10-02：backend 可见页渲染
@@ -716,6 +716,10 @@ object OnDeviceTranslator {
             page.copy(Bitmap.Config.ARGB_8888, false) else page
         val out = base.copy(Bitmap.Config.ARGB_8888, true)
         val canvas = Canvas(out)
+        var erasedSnap: Bitmap? = null
+        val dbgOn = runCatching {
+            java.io.File("/sdcard/ComicShelfModels/v2dbg.flag").exists()
+        }.getOrDefault(false)
         val inkMode = runCatching { CsSettings.bool("render_ink_mask", true) }
             .getOrDefault(true)
         var inkRes: InkMask.Result? = null
@@ -813,6 +817,7 @@ object OnDeviceTranslator {
                     }
                 }
                 out.setPixels(buf, 0, w, 0, 0, w, h)
+                if (dbgOn) erasedSnap = out.copy(Bitmap.Config.ARGB_8888, false)   // v2.1 取证
                 // 调试 dump（排查"擦除失效"）：before/after 落盘供像素级对比。
                 // 默认关（每次渲染写 2×2.5MB）；排查时开 render_ink_debug。
                 runCatching {
@@ -850,21 +855,29 @@ object OnDeviceTranslator {
             val srcLines = srcs?.getOrNull(i)?.let {
                 if (it.isBlank()) 0 else it.count { c -> c == '\n' } + 1
             } ?: 0
-            val (vert, cell, slots) = measureType(base, rect, b.vertical, srcLines)
+            var srcTxt = srcs?.getOrNull(i).orEmpty()
+            var (vert, cell, slots) = measureType(base, rect, b.vertical, srcLines)
+            // v2.1: 字号上界修正——密排小字块(投影融合)实测 cell 虚高, 用原文
+            // 有效字符数估计 √(框面积/字数)≈每字方格边长; 只缩不放(BT resize_ratio<=1)。
+            val srcChars = srcTxt.count { !it.isWhitespace() }
+            if (srcChars >= 2) {
+                val areaCell = kotlin.math.sqrt((rect.width() * rect.height()) / srcChars)
+                cell = minOf(cell, areaCell.coerceIn(10f, 64f))
+            }
             val spec = chooseInk(base, out, inkRes?.mask, rect)
             // 动态字号适配(§E10):仅当译文在**原文实测字号**下装不下(需要比原文更多
             // 空间)时,向周边平坦留白扩张可用域再重拟合;原文观感内装得下的框保持
             // 原位不动(已验收页面的排版不受影响)。
             val needMore = if (vert) {
-                val perCol = ((rect.height() - 6f) / (cell * 1.06f)).toInt().coerceAtLeast(1)
+                val perCol = ((rect.height() - 6f) / (cell * PITCH_EM)).toInt().coerceAtLeast(1)
                 val cols = (text.length + perCol - 1) / perCol
                 val avail = if (slots.isNotEmpty()) slots.size
-                            else ((rect.width() - 6f) / (cell * 1.06f)).toInt().coerceAtLeast(1)
+                            else ((rect.width() - 6f) / (cell * PITCH_EM)).toInt().coerceAtLeast(1)
                 cols > avail
             } else {
                 val cpl = (rect.width() / cell).toInt().coerceAtLeast(1)
                 val lines = (text.length + cpl - 1) / cpl
-                lines * cell * 1.05f > rect.height()
+                lines * cell * LINE_SPACING > rect.height()
             }
             val area = if (needMore) expandRect(base, rect, allRects) else rect
             val grew = area.width() > rect.width() + 0.5f ||
@@ -879,6 +892,18 @@ object OnDeviceTranslator {
                     " ${(area.width() + 0.5f).toInt()}x${(area.height() + 0.5f).toInt()}]"
                  else "") +
                 " size=${"%.1f".format(size)}")
+        }
+        // v2.1 取证: flag 文件存在 → dump <tag>_erased/final.png(本机渲染评估)
+        if (dbgOn && tag.isNotEmpty()) runCatching {
+            val d = java.io.File("/sdcard/ComicShelfModels/v2dbg").apply { mkdirs() }
+            erasedSnap?.let { e ->
+                d.resolve(tag + "_erased.png").outputStream().use {
+                    e.compress(Bitmap.CompressFormat.PNG, 95, it)
+                }
+            }
+            d.resolve(tag + "_final.png").outputStream().use {
+                out.compress(Bitmap.CompressFormat.PNG, 95, it)
+            }
         }
         return out
     }
@@ -920,7 +945,6 @@ object OnDeviceTranslator {
         val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             color = spec.color
             this.textSize = size
-            isFakeBoldText = true
         }
         var layout: StaticLayout
         // 逐 1px 精确搜索"最大可容纳字号"(旧 0.85 连乘 8 次不收敛会**直接不画**,
@@ -930,47 +954,80 @@ object OnDeviceTranslator {
             layout = StaticLayout.Builder
                 .obtain(text, 0, text.length, paint, boxW.toInt())
                 .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
-                .setLineSpacing(0f, 1.05f)
+                .setLineSpacing(0f, LINE_SPACING)
                 .build()
             if (layout.height <= boxH) {
+                // P0-B: BT 字号收缩 size/(1+sw)(描边补偿, mainwindow.py L1404-1406)——
+                // 布局按原搜索尺寸判定装得下, 绘制用收缩后字号+0.2em 描边, 仍在框内。
+                val fs = if (spec.strokeOn) size / (1f + STROKE_WIDTH_EM) else size
                 canvas.save()
                 canvas.translate(r.left + (boxW - layout.width) / 2f,
                                  r.top + (boxH - layout.height) / 2f)
-                if (spec.busy) {          // 压图文字:同排版细描边(块中位色)保可读
-                    val hp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = spec.halo
-                        textSize = size
-                        isFakeBoldText = true
-                        style = Paint.Style.STROKE
-                        strokeWidth = (size * 0.09f).coerceAtLeast(1f)
+                if (spec.strokeOn) {   // 描边系统: 全块确定 0.2em(BT setTextOutline 双 pass 等价)
+                    val fp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = spec.color
+                        textSize = fs
                     }
-                    StaticLayout.Builder
-                        .obtain(text, 0, text.length, hp, boxW.toInt())
+                    val sp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = spec.stroke
+                        textSize = fs
+                        style = Paint.Style.STROKE
+                        strokeWidth = (fs * STROKE_WIDTH_EM).coerceAtLeast(1f)
+                    }
+                    val sl = StaticLayout.Builder
+                        .obtain(text, 0, text.length, sp, boxW.toInt())
                         .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
-                        .setLineSpacing(0f, 1.05f)
+                        .setLineSpacing(0f, LINE_SPACING)
+                        .build()
+                    sl.draw(canvas)
+                    val fl = StaticLayout.Builder
+                        .obtain(text, 0, text.length, fp, boxW.toInt())
+                        .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
+                        .setLineSpacing(0f, LINE_SPACING)
+                        .build()
+                    fl.draw(canvas)
+                } else {
+                    paint.textSize = fs
+                    StaticLayout.Builder
+                        .obtain(text, 0, text.length, paint, boxW.toInt())
+                        .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
+                        .setLineSpacing(0f, LINE_SPACING)
                         .build().draw(canvas)
                 }
-                layout.draw(canvas)
                 canvas.restore()
-                return size
+                return fs
             }
             size -= 1f
         }
         // 兜底:9px 仍画(裁剪到框内)
-        paint.textSize = 9f
+        val fs9 = if (spec.strokeOn) 9f / (1f + STROKE_WIDTH_EM) else 9f
+        paint.textSize = fs9
         layout = StaticLayout.Builder
             .obtain(text, 0, text.length, paint, boxW.toInt())
             .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
-            .setLineSpacing(0f, 1.05f)
+            .setLineSpacing(0f, LINE_SPACING)
             .build()
         canvas.save()
         canvas.clipRect(r)
         canvas.translate(r.left + (boxW - layout.width) / 2f,
                          r.top + (boxH - layout.height) / 2f)
+        if (spec.strokeOn) {
+            val sp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = spec.stroke
+                textSize = fs9
+                style = Paint.Style.STROKE
+                strokeWidth = (fs9 * STROKE_WIDTH_EM).coerceAtLeast(1f)
+            }
+            StaticLayout.Builder
+                .obtain(text, 0, text.length, sp, boxW.toInt())
+                .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
+                .setLineSpacing(0f, LINE_SPACING)
+                .build().draw(canvas)
+        }
         layout.draw(canvas)
         canvas.restore()
         Log.w("OnDeviceTr", "H fallback 9px clip (box=${boxW.toInt()}x${boxH.toInt()})")
-        return 9f
+        return fs9
     }
 
     /**
@@ -987,8 +1044,8 @@ object OnDeviceTranslator {
         val availW = (r.width() - pad * 2f).coerceAtLeast(8f)
         val availH = (r.height() - pad * 2f).coerceAtLeast(8f)
         val n = text.length
-        fun perCol(c: Float) = (availH / (c * 1.06f)).toInt().coerceAtLeast(1)
-        fun freeCols(c: Float) = (availW / (c * 1.06f)).toInt().coerceAtLeast(1)
+        fun perCol(c: Float) = (availH / (c * PITCH_EM)).toInt().coerceAtLeast(1)
+        fun freeCols(c: Float) = (availW / (c * PITCH_EM)).toInt().coerceAtLeast(1)
         var useSlots = slots.isNotEmpty()
         fun fits(c: Float) =
             (n + perCol(c) - 1) / perCol(c) <= (if (useSlots) slots.size else freeCols(c))
@@ -1003,7 +1060,7 @@ object OnDeviceTranslator {
         fun fitWith(want: Boolean): Float {
             useSlots = want
             var f = cellTarget.coerceIn(9f, 64f)
-            if (want && slots.size >= 2) f = minOf(f, minPitch() / 1.06f)
+            if (want && slots.size >= 2) f = minOf(f, minPitch() / PITCH_EM)
             while (f > 9.5f && !fits(f)) f -= 1f
             return f
         }
@@ -1014,24 +1071,26 @@ object OnDeviceTranslator {
         // §E10: 经"需时扩张"的块(原文装不下→已获额外留白)允许字号上探铺满,
         // 封顶 1.5×原文实测、列栅距、单列可用宽 —— 短译文不再缩在气泡一角。
         if (grow) {
-            val up = minOf(cellTarget * 1.5f,
-                           if (useSlots && slots.size >= 2) minPitch() / 1.06f else 64f,
+            val up = minOf(cellTarget,   // v2.1: BT resize_ratio<=1, 不再上探放大
+                           if (useSlots && slots.size >= 2) minPitch() / PITCH_EM else 64f,
                            availW).coerceAtMost(64f)
             while (c + 1f <= up && fits(c + 1f)) c += 1f
         }
+        // P0-B: BT 字号收缩 c/(1+sw)(描边补偿, mainwindow.py L1404-1406);
+        // 收缩后仍装得下(小于拟合值), 列距/行距/绘制统一下游消费同一 c。
+        if (spec.strokeOn) c = c / (1f + STROKE_WIDTH_EM)
         val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             color = spec.color
             textSize = c
-            isFakeBoldText = true
         }
-        val haloPaint = if (spec.busy) TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = spec.halo
+        // 描边系统: 全块确定 0.2em(BT QTextCharFormat.setTextOutline 等价, PLAN §3.2)
+        val strokePaint = if (spec.strokeOn) TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = spec.stroke
             textSize = c
-            isFakeBoldText = true
             style = Paint.Style.STROKE
-            strokeWidth = (c * 0.09f).coerceAtLeast(1f)
+            strokeWidth = (c * STROKE_WIDTH_EM).coerceAtLeast(1f)
         } else null
-        val pitch = c * 1.06f
+        val pitch = c * PITCH_EM
         val pc = perCol(c)
         val mc = if (useSlots) slots.size else freeCols(c)
         var idx = 0
@@ -1054,8 +1113,8 @@ object OnDeviceTranslator {
                 var dy = 0f
                 if (ch in "、。，．,.") { dx = c * 0.22f; dy = -c * 0.30f }  // 竖排标点居右上
                 val w = paint.measureText(ch.toString())
-                if (haloPaint != null)
-                    canvas.drawText(ch.toString(), cx - w / 2f + dx, y + dy, haloPaint)
+                if (strokePaint != null)
+                    canvas.drawText(ch.toString(), cx - w / 2f + dx, y + dy, strokePaint)
                 canvas.drawText(ch.toString(), cx - w / 2f + dx, y + dy, paint)
                 k2++
                 y += pitch
@@ -1218,8 +1277,39 @@ object OnDeviceTranslator {
         return out
     }
 
-    /** 译文配色:color=文字色;halo=描边色(文字色反色);busy=是否加描边。 */
-    class InkSpec(val color: Int, val halo: Int, val busy: Boolean)
+    /** 译文配色/描边(v2, BT 机制移植):
+     *  color=文字色(BT 等效 Otsu 估计, 非黑优先); stroke=描边色; strokeOn=描边开关。 */
+    class InkSpec(val color: Int, val stroke: Int, val strokeOn: Boolean)
+
+    // ---- 描边系统常量(v2.1 最佳效果设计):
+    //  描边=对比极(暗字白描边/亮字黑描边), 恒开——构造上杜绝"同亮度描边糊团";
+    //  白描边在亮气泡不可见(零副作用), 在残墨/断线上提供分离。宽度 0.15em(BT 0.2em
+    //  在 12~16px 字号上正反各半≈3px, 是糊团主因; 0.15em 保清晰)。 ----
+    private const val STROKE_WIDTH_EM = 0.15f
+    private const val STROKE_COLOR_BLACK = 0xFF000000.toInt()
+    private const val STROKE_COLOR_WHITE = 0xFFFFFFFF.toInt()
+    // v2.1: 行/字距 = BT line_spacing 1.2 / letter_spacing 1.15 的中值口径(1.15em);
+    // 原 1.06em 过密, 与描边叠加时相邻字相触。
+    private const val PITCH_EM = 1.15f
+    private const val LINE_SPACING = 1.15f
+
+    // (v2 备注: otsuThreshold / estimateFillColorFromPixels 等纯函数已移至 InkV2.kt —
+    //  本类初始化链触达 native 库, 单测需无依赖入口; 对照测试见 RenderInkV2Test。)
+
+    /** 框内像素 → InkV2.estimateFillColorFromPixels。
+     *  契约同 InkV2(@return 0xFFRRGGBB 不透明, 失败 -1; 判存 `!= -1`)。块过小(<4px 边) → -1。 */
+    private fun estimateFillColor(page: Bitmap, r: RectF): Int {
+        val x0 = r.left.toInt().coerceIn(0, page.width - 2)
+        val y0 = r.top.toInt().coerceIn(0, page.height - 2)
+        val x1 = r.right.toInt().coerceIn(x0 + 2, page.width)
+        val y1 = r.bottom.toInt().coerceIn(y0 + 2, page.height)
+        val w = x1 - x0
+        val h = y1 - y0
+        if (w < 4 || h < 4) return -1
+        val px = IntArray(w * h)
+        Bitmap.createBitmap(page, x0, y0, w, h).getPixels(px, 0, w, 0, 0, w, h)
+        return InkV2.estimateFillColorFromPixels(px, px.size)
+    }
 
     /**
      * WCAG 相对亮度 / 对比度 —— 配色决策的量化标准(Kimi 方案,§E9)。
@@ -1240,72 +1330,18 @@ object OnDeviceTranslator {
         return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
     }
 
-    /**
-     * 原文主色(**候选色之一**,不直接使用):|灰-块中位|>40 为墨,量化 32 级取
-     * **众数簇**均值——多彩字的中位是"泥色",主簇才是原文字色(§E5)。无墨返回 -1。
-     */
-    private fun dominantInk(page: Bitmap, r: RectF): Int {
-        val x0 = r.left.toInt().coerceIn(0, page.width - 2)
-        val y0 = r.top.toInt().coerceIn(0, page.height - 2)
-        val x1 = r.right.toInt().coerceIn(x0 + 2, page.width)
-        val y1 = r.bottom.toInt().coerceIn(y0 + 2, page.height)
-        val w = x1 - x0
-        val h = y1 - y0
-        if (w < 8 || h < 8) return -1
-        val px = IntArray(w * h)
-        Bitmap.createBitmap(page, x0, y0, w, h).getPixels(px, 0, w, 0, 0, w, h)
-        val n = px.size
-        val gray = IntArray(n)
-        for (i in 0 until n)
-            gray[i] = ((px[i] shr 16 and 0xFF) * 77 + (px[i] shr 8 and 0xFF) * 150 +
-                       (px[i] and 0xFF) * 29) shr 8
-        val gs = gray.copyOf().also { it.sort() }
-        val bg = gs[n / 2]
-        val packed = LongArray(n)
-        var m = 0
-        for (i in 0 until n) {
-            val d = gray[i] - bg
-            if (d > 40 || d < -40) {
-                val key = ((px[i] shr 16 and 0xFF) / 32 shl 12) or
-                          ((px[i] shr 8 and 0xFF) / 32 shl 6) or
-                          (px[i] and 0xFF) / 32
-                packed[m++] = key.toLong() shl 24 or i.toLong()
-            }
-        }
-        if (m == 0) return -1
-        java.util.Arrays.sort(packed, 0, m)
-        val minCnt = (m / 20).coerceAtLeast(16)
-        var bestLen = 0
-        var bestSt = 0
-        var st = 0
-        var k = 1
-        while (k <= m) {
-            if (k == m || (packed[k] shr 24) != (packed[st] shr 24)) {
-                if (k - st > bestLen && k - st >= minCnt) { bestLen = k - st; bestSt = st }
-                st = k
-            }
-            k++
-        }
-        if (bestLen == 0) return -1
-        var rs = 0L
-        var gsum = 0L
-        var bsum = 0L
-        for (j in bestSt until bestSt + bestLen) {
-            val i = (packed[j] and 0xFFFFFF).toInt()
-            rs += px[i] shr 16 and 0xFF
-            gsum += px[i] shr 8 and 0xFF
-            bsum += px[i] and 0xFF
-        }
-        return Color.rgb((rs / bestLen).toInt(), (gsum / bestLen).toInt(),
-                         (bsum / bestLen).toInt())
-    }
+    // (v2 变更: 原 dominantInk"众数簇"竞选已废弃 — BT 等效 Otsu 填充色估计替代,
+    //  见 estimateFillColorFromPixels。)
 
     /**
-     * 配色决策(Kimi/WCAG,§E9)：
-     *  bg = **填充后**、框内掩码区的中位色(修图结果本身——不采样原文字、不越出块);
-     *  文字色 = 候选 {黑,白,近黑(20),近白(245),原文主色} 中 **CR 最大且 ≥4.5** 者,
-     *  全不达标则按 bg 亮度退回黑/白(bgL>0.5 → 黑);
-     *  halo = **文字色反色**(白字黑描边=万能解);busy(框内掩码占比>25% 或 CR<4.5)。
+     * 配色决策 v2(BT 机制移植):
+     *  文字色 = BT 主链 **Otsu 填充色估计**(estimateFillColor, 非黑优先语义内嵌于
+     *  30<Σrgb<700 的纯黑/白排除) — 对齐用户补丁 detected_colors→主色 的**有效成分**
+     *  (citi mit48px.py _sample_fill_from_mask + mainwindow.py 主色选择);
+     *  估计失败 → 黑(BT 同: 保持缺省);
+     *  护栏(超集, PLAN §4 A-4): 估计色与底 WCAG CR<2 时退黑白保可读;
+     *  bg = 填充后、框内掩码区中位色(保留原采样口径, 仅供护栏);
+     *  stroke/strokeOn = 由 STROKE_WIDTH_EM 常量决定(描边系统见 typeset/typesetVertical)。
      */
     private fun chooseInk(page: Bitmap, filled: Bitmap, mask: ByteArray?, r: RectF): InkSpec {
         val x0 = r.left.toInt().coerceIn(0, filled.width - 1)
@@ -1314,21 +1350,19 @@ object OnDeviceTranslator {
         val y1 = r.bottom.toInt().coerceIn(y0 + 1, filled.height)
         val w = x1 - x0
         val h = y1 - y0
-        if (w < 4 || h < 4) return InkSpec(Color.BLACK, Color.WHITE, false)
+        if (w < 4 || h < 4) return InkSpec(Color.BLACK, STROKE_COLOR_WHITE, true)
         val fpx = IntArray(w * h)
         Bitmap.createBitmap(filled, x0, y0, w, h).getPixels(fpx, 0, w, 0, 0, w, h)
         val fw = filled.width
         val samples = ArrayList<Int>(4096)
-        var mk = 0
         val all = w * h
         val stride = (all / 4096).coerceAtLeast(1)
         var i = 0
         while (i < all) {
             val mi = (y0 + i / w) * fw + (x0 + i % w)
-            if (mask != null && mask[mi] != 0.toByte()) { mk++; samples.add(fpx[i]) }
+            if (mask != null && mask[mi] != 0.toByte()) samples.add(fpx[i])
             i += stride
         }
-        val sampled = (all + stride - 1) / stride
         // 无掩码像素(未擦除)→ bg 取整框中位
         if (samples.isEmpty()) {
             i = 0
@@ -1336,25 +1370,18 @@ object OnDeviceTranslator {
         }
         samples.sort()
         val bg = samples[samples.size / 2]
-        // 候选集(Kimi:黑白优先 + 原图主色作候选)
-        val black = Color.BLACK
-        val white = Color.WHITE
-        val cands = intArrayOf(black, white, Color.rgb(20, 20, 20), Color.rgb(245, 245, 245))
-        val orig = dominantInk(page, r)
-        var best = -1
-        var bestCr = -1.0
-        for (c in cands) {
-            val cr = wcagCr(c, bg)
-            if (cr >= 4.5 && cr > bestCr) { bestCr = cr; best = c }
+        // ---- BT 主链: Otsu 填充色估计; 失败 → 黑 ----
+        // 契约: 成功 = 不透明 ARGB 0xFFRRGGBB(Int 有符号恒负), 失败 = -1; 判存 `!= -1`
+        // (v2.2 曾用 `>= 0` — 与值域相交为空 → 恒假 → 全黑; 根因记录 R1)
+        val est = estimateFillColor(page, r)
+        var color = if (est != -1) est else Color.BLACK            // 估计失败→黑（BT 同）
+        // ---- 护栏(超集): 估计色与底不可读 → 退黑白 ----
+        if (wcagCr(color, bg) < 2.0) {
+            color = if (wcagL(bg) > 0.5) Color.BLACK else Color.WHITE
         }
-        if (orig >= 0) {
-            val cr = wcagCr(orig, bg)
-            if (cr >= 4.5 && cr > bestCr) { bestCr = cr; best = orig }
-        }
-        if (best < 0) best = if (wcagL(bg) > 0.5) black else white
-        val halo = if (wcagL(best) > 0.5) Color.BLACK else Color.WHITE
-        val busy = (sampled > 0 && mk.toFloat() / sampled > 0.25f) || bestCr < 4.5
-        return InkSpec(best, halo, busy)
+        // ---- v2.1 描边: 对比极恒开(暗字白描边/亮字黑描边; 见常量区注释) ----
+        val stroke = if (wcagL(color) > 0.5) STROKE_COLOR_BLACK else STROKE_COLOR_WHITE
+        return InkSpec(color, stroke, true)
     }
 
     /**
@@ -1676,7 +1703,7 @@ object OnDeviceTranslator {
      */
     suspend fun renderBackendPage(bookId: Long, pageIndex: Int, page: Bitmap): Bitmap? {
         val (boxes, srcs, dsts) = loadBackendArchive(bookId, pageIndex) ?: return null
-        return render(page, boxes, dsts, srcs)
+        return render(page, boxes, dsts, srcs, "b${bookId}p${pageIndex}")
     }
 
     /** backend 传输: POST /chat → 服务转发 llama-server(OpenAI 兼容)。阻塞调用, 需在 IO 上下文。 */
