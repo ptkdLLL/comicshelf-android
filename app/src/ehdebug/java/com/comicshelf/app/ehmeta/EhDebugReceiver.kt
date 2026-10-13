@@ -136,13 +136,16 @@ class EhDebugReceiver : BroadcastReceiver() {
         var n = 0
         val outFile = File(dumpDir(), "matchnames.tsv")
         outFile.writeText("")
+        val gids = runCatching { EhGidIndex(File(dir, "ehmeta.db")) }.getOrNull()
         EhKeysIndex(keysFile).use { idx ->
             val out = StringBuilder(1 shl 20)
             names.bufferedReader().useLines { lines ->
                 for (nm in lines) {
                     if (nm.isBlank()) continue
                     val gid = EhV3.match(nm, { s -> idx.searchKey(s) }, EhMetaManager.expungedPredicate())
-                    out.append(nm).append('\t').append(gid).append('\n')
+                    val cand = EhV3.gidFromName(nm)
+                    val direct = if (cand > 0 && gids != null && gids.exists(cand)) cand else -1
+                    out.append(nm).append('\t').append(gid).append('\t').append(direct).append('\n')
                     n++
                     if (gid >= 0) hits++
                     if (out.length > (1 shl 20)) {
@@ -153,6 +156,7 @@ class EhDebugReceiver : BroadcastReceiver() {
             }
             outFile.appendText(out.toString())
         }
+        runCatching { gids?.close() }
         log("matchnames: $hits/$n = ${"%.1f".format(hits * 100.0 / n)}% 耗时=${(System.currentTimeMillis() - t0) / 1000}s")
     }
 

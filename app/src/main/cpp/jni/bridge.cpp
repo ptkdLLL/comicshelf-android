@@ -287,6 +287,7 @@ Java_com_comicshelf_app_core_NativeBridge_nativeLibraries(JNIEnv* env, jobject) 
         o.set("name", l.name);
         o.set("count", l.book_count);
         o.set("lastScan", l.last_scan);
+        o.set("mode", l.mode);
         arr.push_back(o);
     }
     return from_std(env, arr.dump());
@@ -294,10 +295,10 @@ Java_com_comicshelf_app_core_NativeBridge_nativeLibraries(JNIEnv* env, jobject) 
 
 JNIEXPORT jlong JNICALL
 Java_com_comicshelf_app_core_NativeBridge_nativeAddLibrary(JNIEnv* env, jobject, jstring root,
-                                                            jboolean scan) {
+                                                            jboolean scan, jint mode) {
     std::lock_guard<std::mutex> lk(g_bridge_mtx);
     if (!g_core.lib) return 0;
-    return g_core.lib->add_library_root(to_std(env, root), scan == JNI_TRUE);
+    return g_core.lib->add_library_root(to_std(env, root), scan == JNI_TRUE, (int)mode);
 }
 
 JNIEXPORT void JNICALL

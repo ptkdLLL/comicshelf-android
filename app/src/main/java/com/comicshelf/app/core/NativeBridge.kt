@@ -26,7 +26,7 @@ object NativeBridge {
     // ---- libraries --------------------------------------------------------
     /** JSON: [{id, root, name, count, lastScan}] */
     fun libraries(): String = nativeLibraries()
-    fun addLibrary(root: String, scan: Boolean): Long = nativeAddLibrary(root, scan)
+    fun addLibrary(root: String, scan: Boolean, mode: Int = 0): Long = nativeAddLibrary(root, scan, mode)
     fun removeLibrary(id: Long) = nativeRemoveLibrary(id)
     fun renameLibrary(id: Long, name: String): Boolean = nativeRenameLibrary(id, name)
     /** [books, folders, maxDepth] or null */
@@ -245,7 +245,7 @@ object NativeBridge {
     private external fun nativeSettingsSet(key: String, value: String)
     private external fun nativeSettingsSave()
     private external fun nativeLibraries(): String
-    private external fun nativeAddLibrary(root: String, scan: Boolean): Long
+    private external fun nativeAddLibrary(root: String, scan: Boolean, mode: Int): Long
     private external fun nativeRemoveLibrary(id: Long)
     private external fun nativeRenameLibrary(id: Long, name: String): Boolean
     private external fun nativeLibraryStats(id: Long): LongArray?

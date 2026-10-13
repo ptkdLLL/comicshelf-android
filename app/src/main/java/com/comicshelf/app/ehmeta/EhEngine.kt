@@ -159,10 +159,12 @@ object EhEngine {
                 val libDb = File(AppContextHolder.app.filesDir, "data/library.db")
                 // v2 迁移（P-M9/P-M10）：算法换代 → force 全量重算（合成 gid 行保号）；已删位图改投
                 val force = store.algoVersion() != EhMetaManager.MATCH_ALGO_VERSION
+                val gids = runCatching { EhGidIndex(File(dir, "ehmeta.db")) }.getOrNull()
                 val st = EhMatcher().run(libDb, idx, store, { done, total ->
                     setPhase(EhPhase.Matching(done, total))
                 }, { cancelRequested }, force = force,
-                    isExpunged = EhMetaManager.expungedPredicate())
+                    isExpunged = EhMetaManager.expungedPredicate(), gids = gids)
+                runCatching { gids?.close() }
                 if (force || st.newlyMatched > 20_000) {
                     val t0 = System.currentTimeMillis()
                     runCatching { store.vacuum() }
@@ -223,8 +225,10 @@ object EhEngine {
             EhMatchStore(dir).use { store ->
                 val libDb = File(AppContextHolder.app.filesDir, "data/library.db")
                 val force = store.algoVersion() != EhMetaManager.MATCH_ALGO_VERSION
+                val gids = runCatching { EhGidIndex(File(dir, "ehmeta.db")) }.getOrNull()
                 val st = EhMatcher().run(libDb, idx, store, onProgress, { cancelRequested },
-                    force = force, isExpunged = EhMetaManager.expungedPredicate())
+                    force = force, isExpunged = EhMetaManager.expungedPredicate(), gids = gids)
+                runCatching { gids?.close() }
                 if (force || st.newlyMatched > 20_000) {
                     runCatching { store.vacuum() }
                 }

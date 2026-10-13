@@ -27,6 +27,7 @@ class EhMatcher {
         bd: Breakdown = Breakdown(),
         force: Boolean = false,
         isExpunged: ((Int) -> Boolean)? = null,
+        gids: EhGidIndex? = null,
     ): EhMatchStats {
         val t0 = System.currentTimeMillis()
         val probe: (String) -> Int = { s -> index.searchKey(s) }
@@ -38,12 +39,15 @@ class EhMatcher {
 
         EhBookSource(libraryDb).use { src ->
             total = src.totalBooks()
+            // L2 隔离门控：仅 mode=1（EH 档）库启用 gid 直配；通用档库匹配管线逐行不变。
+            val ehIds: Set<Long> = if (gids != null) src.ehModeLibIds() else emptySet()
             onProgress(0, total)
             val now = System.currentTimeMillis() / 1000
             val hasExisting = store.countAll() > 0 && !force   // 空库全量匹配时免存在性查询；force 恒全量
             src.booksCursor().use { c ->
                 val paths = ArrayList<String>(2048)
                 val titles = ArrayList<String>(2048)
+                val libIds = ArrayList<Long>(2048)
                 var done = 0L
 
                 fun flush() {
@@ -57,7 +61,14 @@ class EhMatcher {
                     for (i in paths.indices) {
                         val p = paths[i]
                         if (p in existing) continue
-                        val g = EhV3.match(titles[i], probe, isExpunged).toLong()
+                        val g = if (gids != null && libIds[i] in ehIds) {
+                            // EH 档库：名称 gid 直取（存在性校验通过即身份匹配，否则回退 v3）
+                            val cand = EhV3.gidFromName(titles[i])
+                            if (cand > 0 && gids.exists(cand)) cand.toLong()
+                            else EhV3.match(titles[i], probe, isExpunged).toLong()
+                        } else {
+                            EhV3.match(titles[i], probe, isExpunged).toLong()   // 通用档：与现状逐字一致
+                        }
                         if (g < 0 && synthetic.containsKey(p)) continue   // 保合成 gid 行（不覆盖为空）
                         idsToWrite.add(p)
                         gidsToWrite.add(g)
@@ -82,6 +93,7 @@ class EhMatcher {
                     }
                     paths.clear()
                     titles.clear()
+                    libIds.clear()
                 }
 
                 var t = System.currentTimeMillis()
@@ -92,6 +104,7 @@ class EhMatcher {
                     }
                     paths.add(c.getString(2))
                     titles.add(c.getString(3))
+                    libIds.add(c.getLong(1))
                     done++
                     if (paths.size >= 2048) {
                         bd.readMs += System.currentTimeMillis() - t

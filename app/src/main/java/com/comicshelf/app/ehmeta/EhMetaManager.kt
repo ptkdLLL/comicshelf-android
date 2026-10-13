@@ -34,7 +34,7 @@ object EhMetaManager {
     //  1 = v1 引擎（canon 只剥空白、无骨架/改投）；2 = 骨架等价 + livepref + twopass 双守卫。
     //  keys.version 文件与 match.db user_version 同源比对；不符 → ensureUpToDate 重建+重匹。
     const val KEYS_VERSION_NAME = "keys.version"
-    const val MATCH_ALGO_VERSION = 2
+    const val MATCH_ALGO_VERSION = 3   // v3：EH 档 gid 直配（存量 match.db 需 force 重算）
 
     // ---------------------------------------------------------------- 目录
 

@@ -25,6 +25,7 @@ struct ScanOptions {
     int workers = 0;        // 0 = 自动
     bool full = true;       // true=完整扫描（全局清理）；false=子树刷新
     std::string start_rel;  // 库根相对路径（'' = 库根），full=false 时生效
+    int mode = kScanModeDefault;  // ScanMode：0=通用目录（现状）；1=彩e/E-Hentai 下载目录
 };
 
 class Scanner {

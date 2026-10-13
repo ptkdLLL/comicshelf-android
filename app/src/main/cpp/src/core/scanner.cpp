@@ -259,6 +259,8 @@ void Scanner::run(int64_t lib_id, std::string root, ScanOptions opt) {
 
         bool has_image = false;
         std::vector<std::string> subdirs;
+        // EH 档（mode=1）专用延迟容器；通用档恒为空、不进入任何新分支。
+        std::vector<const vfs::DirEntry*> eh_archives;
         for (const auto& e : entries) {
             if (is_excluded_name(e.name)) continue;
             if (e.st.is_dir) {
@@ -268,19 +270,42 @@ void Scanner::run(int64_t lib_id, std::string root, ScanOptions opt) {
             if (!e.st.is_file) continue;
             const std::string ext = lower_ext_str(e.name);
             if (paths::is_archive_ext(ext)) {
-                Book b;
-                b.lib_id = lib_id;
-                b.path = vfs->full_path(join_rel(dir, e.name));
-                b.rel_dir = lib_rel_of(base, dir);
-                b.kind = BookKind::Archive;
-                b.title = stem_str(e.name);
-                b.ext = ext;
-                b.size = (int64_t)e.st.size;
-                b.mtime = e.st.mtime;
-                bw.publish(std::move(b));
+                if (opt.mode == kScanModeEhDownloads) {
+                    eh_archives.push_back(&e);               // 仅 EH 档：延迟下发
+                } else {
+                    Book b;                                  // 通用档：与现状逐字一致
+                    b.lib_id = lib_id;
+                    b.path = vfs->full_path(join_rel(dir, e.name));
+                    b.rel_dir = lib_rel_of(base, dir);
+                    b.kind = BookKind::Archive;
+                    b.title = stem_str(e.name);
+                    b.ext = ext;
+                    b.size = (int64_t)e.st.size;
+                    b.mtime = e.st.mtime;
+                    bw.publish(std::move(b));
+                }
             } else if (paths::is_image_ext(ext)) {
                 has_image = true;
             }
+        }
+
+        // ---- EH 档（mode=1）：归档即书；"封面+归档"结构下目录不再重复成书 ----
+        if (opt.mode == kScanModeEhDownloads && !eh_archives.empty()) {
+            const bool cover_struct = opt.include_folders && has_image && dir != base;
+            for (const auto* ae : eh_archives) {
+                Book b;
+                b.lib_id = lib_id;
+                b.path = vfs->full_path(join_rel(dir, ae->name));
+                b.rel_dir = lib_rel_of(base, dir);
+                b.kind = BookKind::Archive;
+                b.title = (cover_struct && eh_archives.size() == 1) ? base_name(dir)
+                                                                    : stem_str(ae->name);
+                b.ext = lower_ext_str(ae->name);
+                b.size = (int64_t)ae->st.size;
+                b.mtime = ae->st.mtime;
+                bw.publish(std::move(b));
+            }
+            if (cover_struct) return;   // 不下探；不产 Folder 书（"目录=一本书"语义等价）
         }
 
         // 直接含图片的目录 = 一本书（与旧扫描器一致：不再下探，其中的归档也不单独入库）

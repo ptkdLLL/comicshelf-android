@@ -23,7 +23,7 @@ struct UpsertResult {
 
 class Database {
 public:
-    static constexpr int kSchemaVersion = 5;
+    static constexpr int kSchemaVersion = 6;
 
     Database() = default;
     ~Database();
@@ -42,7 +42,8 @@ public:
     void migrate();
 
     // ---- libraries -------------------------------------------------------
-    int64_t add_library(const std::string& root_utf8, const std::string& name);
+    int64_t add_library(const std::string& root_utf8, const std::string& name,
+                        int mode = kScanModeDefault);
     bool remove_library(int64_t lib_id);
     std::vector<LibraryRow> libraries();
     bool get_library(int64_t lib_id, LibraryRow& out);

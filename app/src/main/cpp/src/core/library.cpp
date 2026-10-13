@@ -83,7 +83,7 @@ bool LibraryManager::init(std::string* err) {
 
 std::vector<LibraryRow> LibraryManager::libraries() { return db_.libraries(); }
 
-int64_t LibraryManager::add_library_root(const std::string& utf8_root, bool start_scan) {
+int64_t LibraryManager::add_library_root(const std::string& utf8_root, bool start_scan, int mode) {
     std::string name;
     if (vfs::is_smb_path(utf8_root)) {
         // "smb://host/share/dir" → 末级目录名（或共享名）
@@ -97,7 +97,7 @@ int64_t LibraryManager::add_library_root(const std::string& utf8_root, bool star
         name = paths::path_to_utf8(p.filename());
     }
     if (name.empty()) name = utf8_root;
-    int64_t id = db_.add_library(utf8_root, name);
+    int64_t id = db_.add_library(utf8_root, name, mode);
     if (id && start_scan) this->start_scan(id);
     return id;
 }
@@ -122,6 +122,7 @@ void LibraryManager::start_scan(int64_t lib_id) {
     opt.include_folders = settings_.get_bool("include_folders", true);
     opt.workers = (int)settings_.get_int("scan_workers", 0);
     opt.full = true;
+    opt.mode = row.mode;          // 档位随库走；旧库=0=现状
     scanner_->start(lib_id, row.root, opt);
 }
 
@@ -133,6 +134,7 @@ void LibraryManager::refresh_subtree(int64_t lib_id, const std::string& rel) {
     opt.workers = (int)settings_.get_int("scan_workers", 0);
     opt.full = false;
     opt.start_rel = rel;
+    opt.mode = row.mode;          // 档位随库走；旧库=0=现状
     scanner_->start(lib_id, row.root, opt);
 }
 

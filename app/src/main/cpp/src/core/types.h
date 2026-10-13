@@ -6,6 +6,12 @@
 
 namespace cs {
 
+// 库扫描档位（libraries.mode）。0=通用目录（现状语义，默认）；1=彩e/E-Hentai 下载目录。
+enum ScanMode : int {
+    kScanModeDefault     = 0,
+    kScanModeEhDownloads = 1,
+};
+
 enum class BookKind : int {
     Archive = 0, // .zip / .cbz / .rar / .cbr
     Folder = 1,  // a directory that directly contains image files
@@ -44,6 +50,7 @@ struct LibraryRow {
     int64_t added_at = 0;
     int64_t last_scan = 0;
     int64_t book_count = 0;
+    int mode = kScanModeDefault;   // 库扫描档位（libraries.mode）
 };
 
 // One folder in the library's directory tree (materialized in the `dirs` table).

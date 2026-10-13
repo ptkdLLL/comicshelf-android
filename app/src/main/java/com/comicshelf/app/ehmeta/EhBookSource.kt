@@ -39,6 +39,15 @@ class EhBookSource(dbFile: File) : Closeable {
     fun booksCursorByPath(): Cursor =
         db.rawQuery("SELECT id, path, title FROM books ORDER BY path", null)
 
+    /** mode=1（EH 档）的库 id 集；列缺失/异常 → 空集（=不启用直配，等价现状）。 */
+    fun ehModeLibIds(): Set<Long> = runCatching {
+        val out = HashSet<Long>()
+        db.rawQuery("SELECT id FROM libraries WHERE mode=1", null).use { c ->
+            while (c.moveToNext()) out.add(c.getLong(0))
+        }
+        out
+    }.getOrDefault(emptySet())
+
     override fun close() {
         runCatching { db.close() }
     }

@@ -257,7 +257,8 @@ CREATE TABLE IF NOT EXISTS libraries(
   root      TEXT NOT NULL UNIQUE,
   name      TEXT NOT NULL DEFAULT '',
   added_at  INTEGER NOT NULL DEFAULT 0,
-  last_scan INTEGER NOT NULL DEFAULT 0
+  last_scan INTEGER NOT NULL DEFAULT 0,
+  mode      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS books(
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -421,23 +422,30 @@ void Database::migrate() {
         exec("DROP INDEX IF EXISTS ux_books_path;");
         exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_books_lib_path ON books(lib_id, path);");
     }
+    if (v < 6) {
+        // 库扫描档位：存量库全部落 0（行为=现状，零语义变化）。
+        if (!has_column("libraries", "mode")) {
+            exec("ALTER TABLE libraries ADD COLUMN mode INTEGER NOT NULL DEFAULT 0;");
+        }
+    }
     set_user_version(kSchemaVersion);
 }
 
 // ------------------------------------------------------------------ libraries
 
-int64_t Database::add_library(const std::string& root_utf8, const std::string& name) {
+int64_t Database::add_library(const std::string& root_utf8, const std::string& name, int mode) {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     if (!db_) return 0;
     sqlite3_stmt* st = nullptr;
     int64_t id = 0;
     if (sqlite3_prepare_v2(db_,
-            "INSERT INTO libraries(root,name,added_at,last_scan) VALUES(?1,?2,?3,0) "
-            "ON CONFLICT(root) DO UPDATE SET name=excluded.name",
+            "INSERT INTO libraries(root,name,added_at,last_scan,mode) VALUES(?1,?2,?3,0,?4) "
+            "ON CONFLICT(root) DO UPDATE SET name=excluded.name, mode=excluded.mode",
             -1, &st, nullptr) == SQLITE_OK) {
         bind_text(st, 1, root_utf8);
         bind_text(st, 2, name);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)time(nullptr));
+        sqlite3_bind_int(st, 4, mode);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
@@ -505,7 +513,7 @@ std::vector<LibraryRow> Database::libraries() {
     std::vector<LibraryRow> out;
     if (!db_) return out;
     const char* sql =
-        "SELECT l.id,l.root,l.name,l.added_at,l.last_scan,"
+        "SELECT l.id,l.root,l.name,l.added_at,l.last_scan,l.mode,"
         "(SELECT COUNT(*) FROM books b WHERE b.lib_id=l.id) "
         "FROM libraries l ORDER BY l.id";
     sqlite3_stmt* st = nullptr;
@@ -517,7 +525,8 @@ std::vector<LibraryRow> Database::libraries() {
             r.name = column_text(st, 2);
             r.added_at = sqlite3_column_int64(st, 3);
             r.last_scan = sqlite3_column_int64(st, 4);
-            r.book_count = sqlite3_column_int64(st, 5);
+            r.mode = sqlite3_column_int(st, 5);
+            r.book_count = sqlite3_column_int64(st, 6);
             out.push_back(std::move(r));
         }
         sqlite3_finalize(st);
@@ -530,7 +539,7 @@ bool Database::get_library(int64_t lib_id, LibraryRow& out) {
     if (!db_) return false;
     sqlite3_stmt* st = nullptr;
     bool found = false;
-    if (sqlite3_prepare_v2(db_, "SELECT id,root,name,added_at,last_scan FROM libraries WHERE id=?1",
+    if (sqlite3_prepare_v2(db_, "SELECT id,root,name,added_at,last_scan,mode FROM libraries WHERE id=?1",
                            -1, &st, nullptr) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, lib_id);
         if (sqlite3_step(st) == SQLITE_ROW) {
@@ -539,6 +548,7 @@ bool Database::get_library(int64_t lib_id, LibraryRow& out) {
             out.name = column_text(st, 2);
             out.added_at = sqlite3_column_int64(st, 3);
             out.last_scan = sqlite3_column_int64(st, 4);
+            out.mode = sqlite3_column_int(st, 5);
             found = true;
         }
         sqlite3_finalize(st);

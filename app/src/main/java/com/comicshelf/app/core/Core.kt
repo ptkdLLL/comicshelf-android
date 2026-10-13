@@ -20,7 +20,7 @@ val PageDispatcher = Dispatchers.IO
 // ---------------------------------------------------------------- dtos
 
 data class LibraryRow(val id: Long, val root: String, val name: String,
-                      val count: Long, val lastScan: Long) {
+                      val count: Long, val lastScan: Long, val mode: Int = 0) {
     override fun toString(): String = name
 }
 
@@ -40,7 +40,7 @@ object Json {
         for (i in 0 until a.length()) {
             val o = a.getJSONObject(i)
             out.add(LibraryRow(o.getLong("id"), o.getString("root"), o.getString("name"),
-                               o.getLong("count"), o.optLong("lastScan")))
+                               o.getLong("count"), o.optLong("lastScan"), o.optInt("mode", 0)))
         }
         return out
     }

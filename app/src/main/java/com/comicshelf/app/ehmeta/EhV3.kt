@@ -276,6 +276,25 @@ object EhV3 {
 
     // ---------------------------------------------------------------- 查询侧匹配（bench matchBook 移植）
 
+    // ---------------------------------------------------------------- gid 直取（EH 档门控）
+
+    /**
+     * 名称中的 gid 直取（纯数字 或 数字+分隔符前缀；5..9 位）。
+     * 候选仍需调用方用 EhGidIndex 校验存在性（防"题内数字"误配）。
+     * @return 候选 gid 或 -1。
+     */
+    fun gidFromName(raw: String): Int {
+        val s = stripExt(raw).trim()
+        var i = 0
+        while (i < s.length && s[i].isDigit()) i++
+        if (i < 5 || i > 9) return -1
+        if (i < s.length) {
+            val c = s[i]
+            if (c != '-' && c != '_' && c != ' ' && c != '.' && c != '[' && c != '(') return -1
+        }
+        return s.substring(0, i).toIntOrNull() ?: -1
+    }
+
     /**
      * 对一个原始名（书名/文件名）做匹配（v2：探查族 + 已删改投）。
      * @param probe 传入候选串，返回命中的 gid（>=0）或 -1。

@@ -59,6 +59,20 @@ class EhV3Test {
         assertTrue("禁用字符变体", keys.contains("reゼロ"))
     }
 
+    // ---------------------------------------------------------------- gidFromName（EH 档直取）
+
+    @Test
+    fun gidFromNameForms() {
+        assertEquals(4099715, EhV3.gidFromName("4099715"))
+        assertEquals(4099715, EhV3.gidFromName("4099715-[沖葉] 水着エレン"))
+        assertEquals(4099715, EhV3.gidFromName("4099715.cbz"))
+        assertEquals(-1, EhV3.gidFromName("[沖葉] 水着エレン"))
+        assertEquals(-1, EhV3.gidFromName("2024-10-13"))    // 4 位年份不触发
+        assertEquals(-1, EhV3.gidFromName("1234567890"))    // 10 位
+        assertEquals(-1, EhV3.gidFromName("12345abc"))      // 无分隔符
+        assertEquals(12345, EhV3.gidFromName("12345 x"))    // 5 位+分隔符
+    }
+
     // ---------------------------------------------------------------- match（查询侧）
 
     private fun indexOf(titles: Map<String, Int>): (String) -> Int {

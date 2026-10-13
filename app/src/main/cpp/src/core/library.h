@@ -42,7 +42,8 @@ public:
 
     // ---- libraries -------------------------------------------------------
     std::vector<LibraryRow> libraries();
-    int64_t add_library_root(const std::string& utf8_root, bool start_scan = true);
+    int64_t add_library_root(const std::string& utf8_root, bool start_scan = true,
+                             int mode = kScanModeDefault);
     void remove_library(int64_t lib_id);
     bool update_library_name(int64_t lib_id, const std::string& name);
     bool library_stats(int64_t lib_id, int64_t& books, int64_t& folders, int& max_depth);

@@ -644,9 +644,10 @@ fun ShelfScreen(
     if (showAddLib) {
         AddLibraryDialog(
             vm = vm,
+            libs = libs,
             onDismiss = { showAddLib = false },
-            onConfirm = { path ->
-                vm.addLibrary(path)
+            onConfirm = { path, mode ->
+                vm.addLibrary(path, mode)
                 showAddLib = false
             },
         )
@@ -684,7 +685,12 @@ private fun LibraryDrawerContent(
             var actions by remember { mutableStateOf(false) }
             androidx.compose.material3.NavigationDrawerItem(
                 label = { Text(lib.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                badge = { Text(lib.count.toString()) },
+                badge = { Row {
+                    if (lib.mode == 1) {
+                        Text("彩e ", fontSize = 10.sp, color = MaterialTheme.colorScheme.primary)
+                    }
+                    Text(lib.count.toString())
+                } },
                 selected = lib.id == query.libId,
                 onClick = { onPickLibrary(lib.id) },
                 modifier = Modifier.padding(horizontal = 8.dp),
@@ -1104,8 +1110,9 @@ private fun SelectionBar(
 @Composable
 private fun AddLibraryDialog(
     vm: ShelfViewModel,
+    libs: List<LibraryRow>,
     onDismiss: () -> Unit,
-    onConfirm: (String) -> Unit,
+    onConfirm: (String, Int) -> Unit,
 ) {
     var smbMode by remember { mutableStateOf(false) }
     AlertDialog(
@@ -1121,7 +1128,7 @@ private fun AddLibraryDialog(
                                label = { Text("SMB 共享") })
                 }
                 Spacer(Modifier.height(8.dp))
-                if (!smbMode) LocalLibraryForm(onConfirm) else SmbLibraryForm(vm, onDismiss)
+                if (!smbMode) LocalLibraryForm(libs, onConfirm) else SmbLibraryForm(vm, onDismiss)
             }
         },
         confirmButton = {
@@ -1155,8 +1162,13 @@ private fun treeUriToPath(uri: Uri): String? {
 }
 
 @Composable
-private fun LocalLibraryForm(onConfirm: (String) -> Unit) {
+private fun LocalLibraryForm(libs: List<LibraryRow>, onConfirm: (String, Int) -> Unit) {
     var path by remember { mutableStateOf("/storage/emulated/0/Comics") }
+    // 目录类型（库扫描档位）：0=通用目录（默认，行为=现状）；1=彩e/E-Hentai 下载目录。
+    // L1-b 防降级：路径命中已存在库 → 自动预选该库当前档位（显式匹配，非启发式）。
+    var mode by remember(path) {
+        mutableStateOf(libs.firstOrNull { it.root == path.trim() }?.mode ?: 0)
+    }
     var err by remember { mutableStateOf("") }   // L3：内联失败反馈（区分 不存在/非目录/不可读）
     // L1：系统文件夹选择器（SAF）。只取"真实路径"交给现有扫描管道，native 零改动。
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -1201,6 +1213,15 @@ private fun LocalLibraryForm(onConfirm: (String) -> Unit) {
             TextButton(onClick = { path = p; err = "" }) { Text(p, fontSize = 12.sp) }
         }
         Spacer(Modifier.height(8.dp))
+        Text("目录类型：", style = MaterialTheme.typography.labelSmall)
+        Row {
+            FilterChip(selected = mode == 0, onClick = { mode = 0 },
+                       label = { Text("通用目录") })
+            Spacer(Modifier.width(8.dp))
+            FilterChip(selected = mode == 1, onClick = { mode = 1 },
+                       label = { Text("彩e 下载目录") })
+        }
+        Spacer(Modifier.height(8.dp))
         // L3：提交前轻校验，失败不再静默（此前路径打错毫无反应）
         Button(onClick = {
             val f = java.io.File(path.trim())
@@ -1211,7 +1232,7 @@ private fun LocalLibraryForm(onConfirm: (String) -> Unit) {
                 !f.canRead() -> "目录不可读（请检查「所有文件访问」权限）"
                 else -> ""
             }
-            if (err.isEmpty()) onConfirm(f.absolutePath)
+            if (err.isEmpty()) onConfirm(f.absolutePath, mode)
         }) { Text("添加并扫描") }
     }
 }

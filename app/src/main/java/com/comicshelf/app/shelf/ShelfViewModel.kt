@@ -288,9 +288,9 @@ class ShelfViewModel : ViewModel() {
         Json.dirs(NativeBridge.childDirs(query.value.libId, parentRel))
     }
 
-    fun addLibrary(path: String) {
+    fun addLibrary(path: String, mode: Int = 0) {
         viewModelScope.launch(CoreDispatcher) {
-            val id = NativeBridge.addLibrary(path, scan = true)
+            val id = NativeBridge.addLibrary(path, scan = true, mode = mode)
             if (id > 0) {
                 firstScanLibId = id                       // L3：等这次首扫结果
                 refreshLibraries()
