@@ -6,7 +6,7 @@ import com.comicshelf.app.core.CsSettings
  * 连续滚动模式 · 方向与模式解析（docs/READER_VERTICAL_SCROLL_PLAN.md P-V1）。
  *
  * 方向 dir = 0 左→右 / 1 右→左 / 2 上→下；连续 scroll = 关/开。
- * 每册记忆：`reader_dir_<bookId>` / `reader_scroll_<bookId>`。
+ * 按册记忆：`reader_dir_<bookId>`；连续滚动为全局键 `reader_scroll`（v0.5.13 起）。
  * **缺省口径（2026-10-11 变更，READER_MODE_DEFAULT_PLAN）**：方向缺键回退 = 旧全局
  * reader_rtl 为真→右→左（旧用户零变化），否则→**上→下**（新默认）；连续缺省 = **开**。
  * 写键只在用户于设置中改动时发生（P-V9）；本文件只读。
@@ -34,7 +34,7 @@ data class ReaderMode(
         /** 读键解析本册模式（只读，不改任何存储）。 */
         fun load(bookId: Long, legacyRtl: Boolean): ReaderMode = ReaderMode(
             dir = resolveDirKey(CsSettings.int("reader_dir_$bookId", -1), legacyRtl),
-            scroll = CsSettings.bool("reader_scroll_$bookId", true),
+            scroll = CsSettings.bool("reader_scroll", true),
         )
     }
 }

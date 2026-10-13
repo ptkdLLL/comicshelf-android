@@ -318,11 +318,11 @@ class ReaderViewModel : ViewModel() {
         _mode.value = _mode.value.copy(dir = dir)
     }
 
-    /** 连续滚动开关（P-V7：本册记忆，改即存；锚定 open.page）。 */
+    /** 连续滚动开关（全局：任意书改一次，处处生效；锚定 open.page）。 */
     fun setScroll(on: Boolean) {
         val st = open.value
         if (st.bookId == 0L || _mode.value.scroll == on) return
-        CsSettings.setBool("reader_scroll_${st.bookId}", on)
+        CsSettings.setBool("reader_scroll", on)
         CsSettings.save()
         _mode.value = _mode.value.copy(scroll = on)
         allowAhead = null
