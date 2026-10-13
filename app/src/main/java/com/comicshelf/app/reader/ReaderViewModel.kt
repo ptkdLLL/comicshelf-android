@@ -1,6 +1,7 @@
 package com.comicshelf.app.reader
 
 import android.graphics.Bitmap
+import android.graphics.drawable.Drawable
 import android.util.LruCache
 import android.util.Log
 import java.lang.ref.WeakReference
@@ -374,6 +375,21 @@ class ReaderViewModel : ViewModel() {
         return bmp
     }
 
+    // ---------------------------------------------------------------- animation (READER_ANIM_PLAN)
+
+    /** P3（动图）：页级动画标记查询（标记在 [PageDecoder.decode] 期写入，本函数无副作用）。 */
+    fun pageAnimated(raw: Int): Boolean = PageDecoder.pageAnimated(open.value.bookId, raw)
+
+    /** P7：当前显示页是否动图（重译入口守卫用）。 */
+    fun currentPageIsAnimated(): Boolean = pageAnimated(rawOfPage(open.value.page))
+
+    /** P2/P9（动图）：解码本页动画（渲染侧仅当前页调用；失败 → null 回退位图路径）。 */
+    suspend fun decodeAnimationItem(raw: Int, maxBytes: Long): Drawable? {
+        val st = open.value
+        if (st.bookId == 0L) return null
+        return runCatching { PageDecoder.decodeAnimation(st.bookId, raw, maxBytes) }.getOrNull()
+    }
+
     /** P-R6 准入：大页模式只放行当前页/一次性预取目标；未放行者挂起（不占 IO、不占帧）。
      *  [page] 为 raw；与当前显示页比较需换算（P-S6 a）。 */
     suspend fun awaitAdmission(page: Int) {
@@ -424,6 +440,7 @@ class ReaderViewModel : ViewModel() {
             if (cur.bookId != bookId || rawOfPage(cur.page) != page) return@launch
             val next = page + 1
             if (next >= rawCount || pageAt(next) != null) return@launch   // raw 域边界（P-S6 b）
+            if (pageAnimated(next)) return@launch                          // P6：动图页不预取（动画仅当前页启用）
             allowAhead = next
             bumpAdmission()
         }
@@ -470,12 +487,14 @@ class ReaderViewModel : ViewModel() {
         val mode = engineMode()
         if (mode == "backend") {
             if (!st.translateEnabled) return
+            if (pageAnimated(page)) return                               // P7：动图页永不进翻译链（渲染侧动画优先同守）
             BookTranslateJob.focus(st.bookId, page, force)
             refreshBackendPage(page)
             return
         }
         if (mode != "ondevice" || !st.translateEnabled) return
         if (page !in 0 until rawCount) return                        // raw 域边界（P-S6 c）
+        if (pageAnimated(page)) return                               // P7：动图页不触发逐页翻译
         val states = trStates.value
         val cur = states[page]
         // FAILED 也视为本会话终态：无文本页（插页/封面）如果允许重试，每次重组都会
@@ -681,6 +700,10 @@ class ReaderViewModel : ViewModel() {
     fun retranslateCurrent() {
         val st = open.value
         val raw = rawOfPage(st.page)          // 翻译全 raw 域（P-S8）
+        if (pageAnimated(raw)) {              // P7：动图页不支持翻译（UI 侧轻提示；渲染侧动画优先）
+            Log.i("Reader", "retranslate skipped: page $raw is animated")
+            return
+        }
         if (engineMode() == "backend") {
             // 只重译本页（fresh=1 让服务端绕缓存），**不清整本档案**——整本进度不能丢
             BookTranslateJob.focus(st.bookId, raw, fresh = true)

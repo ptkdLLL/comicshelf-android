@@ -1,6 +1,8 @@
 package com.comicshelf.app.reader
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.widget.Toast
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -69,7 +71,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
@@ -336,6 +340,8 @@ private fun ZoomablePage(
         }
     }
     val bmp = if (useTranslate) translated ?: original else original
+    // P3/P4/P5（动图）：首帧落地后按页级标记启用动画（仅当前页；切分/翻译互斥见 AnimSlot 注释）。
+    val anim = rememberAnimSlot(vm, bookId, raw, capBytes, isCurrent, splitOn, original)
 
     // v0.4.3：适配模式/旋转也是几何输入——任一变化即重建（统一重置缩放平移）。
     // 注意：下方两处 pointerInput 的 key 必须同步含 fit/rotation（+ splitOn 同理），否则手势闭包
@@ -445,16 +451,29 @@ private fun ZoomablePage(
                     .clipToBounds(),
             ) {
                 val bb = bmpState.value ?: return@Canvas
-                val (sx, sw) = SplitMode.srcXWidth(half, rtl, bb.width)
-                drawImage(
-                    image = bb.asImageBitmap(),
-                    srcOffset = IntOffset(sx, 0),
-                    srcSize = IntSize(sw, bb.height),
-                    dstOffset = IntOffset.Zero,
-                    dstSize = IntSize(size.width.roundToInt().coerceAtLeast(1),
-                                      size.height.roundToInt().coerceAtLeast(1)),
-                    filterQuality = FilterQuality.Low,
-                )
+                val animD = anim.state?.d
+                if (animD != null) {
+                    // P4：动图页（仅整页模式，槽门槛已保证 half==WHOLE）——同 Canvas 绘制，
+                    // 布局尺寸=目标显示尺寸，缩放/平移/旋转几何与位图路径天然一致；
+                    // tick 在 draw 层读 → 动画帧到达（invalidateDrawable）只触发重绘、不重组。
+                    anim.tick.value
+                    drawIntoCanvas { c ->
+                        animD.setBounds(0, 0, size.width.roundToInt().coerceAtLeast(1),
+                                        size.height.roundToInt().coerceAtLeast(1))
+                        animD.draw(c.nativeCanvas)
+                    }
+                } else {
+                    val (sx, sw) = SplitMode.srcXWidth(half, rtl, bb.width)
+                    drawImage(
+                        image = bb.asImageBitmap(),
+                        srcOffset = IntOffset(sx, 0),
+                        srcSize = IntSize(sw, bb.height),
+                        dstOffset = IntOffset.Zero,
+                        dstSize = IntSize(size.width.roundToInt().coerceAtLeast(1),
+                                          size.height.roundToInt().coerceAtLeast(1)),
+                        filterQuality = FilterQuality.Low,
+                    )
+                }
             }
         } else {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -587,9 +606,19 @@ private fun ReaderBottomBar(open: ReaderOpenState, vm: ReaderViewModel, onGoto: 
     }
 }
 
+/** P7（动图）：重译入口守卫——动图页不触发翻译（渲染侧动画优先同守），给轻提示不落持久状态。 */
+private fun retranslateGuarded(vm: ReaderViewModel, ctx: Context) {
+    if (vm.currentPageIsAnimated()) {
+        Toast.makeText(ctx, "动图页暂不支持翻译", Toast.LENGTH_SHORT).show()
+    } else {
+        vm.retranslateCurrent()
+    }
+}
+
 @Composable
 private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
     val prefs by vm.prefs.collectAsState()
+    val ctx = LocalContext.current
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("阅读设置") },
@@ -664,7 +693,7 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                 if (open.translateEnabled) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("翻译", Modifier.width(64.dp))
-                        TextButton(onClick = { vm.retranslateCurrent() }) { Text("重译当前页") }
+                        TextButton(onClick = { retranslateGuarded(vm, ctx) }) { Text("重译当前页") }
                     }
                 }
             }
@@ -736,6 +765,7 @@ private fun TranslateEnableDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
 private fun TranslateMenuDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
     val open by vm.open.collectAsState()
     val backend = vm.engineMode() == "backend"
+    val ctx = LocalContext.current
     if (backend) {
         val job by BookTranslateJob.state.collectAsState()
         val mine = job.bookId != 0L && job.bookId == open.bookId
@@ -764,7 +794,7 @@ private fun TranslateMenuDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                             onDismiss()
                         }) { Text(if (job.paused) "继续后台翻译" else "暂停后台翻译") }
                     }
-                    TextButton(onClick = { vm.retranslateCurrent(); onDismiss() }) {
+                    TextButton(onClick = { retranslateGuarded(vm, ctx); onDismiss() }) {
                         Text("重译本页")
                     }
                     TextButton(onClick = {
@@ -781,7 +811,7 @@ private fun TranslateMenuDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
         title = { Text("翻译") },
         text = {
             Column {
-                TextButton(onClick = { vm.retranslateCurrent(); onDismiss() }) {
+                TextButton(onClick = { retranslateGuarded(vm, ctx); onDismiss() }) {
                     Text("重译当前页")
                 }
                 TextButton(onClick = { vm.setTranslateEnabled(false, persist = true); onDismiss() }) {

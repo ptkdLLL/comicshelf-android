@@ -39,7 +39,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -205,6 +207,8 @@ private fun ScrollPageItem(
         }
     }
     val bmp = if (useTranslate) translated ?: original else original
+    // P3/P4/P5（动图）：与 ZoomablePage 同款——置顶项（isTopmost，本容器"当前页"语义）播放。
+    val anim = rememberAnimSlot(vm, bookId, raw, capBytes, isTopmost, splitOn, original)
 
     // 缩放/平移（D-V4：消费规则与 ZoomablePage 同款——未放大时单指拖动留给容器滚动）
     var scale by remember(v, splitOn, fit, rotation) { mutableFloatStateOf(1f) }
@@ -264,21 +268,32 @@ private fun ScrollPageItem(
                     .graphicsLayer { rotationZ = rotation.toFloat() },   // 旋转以 canvas 中心为原点
             ) {
                 val bb = bmpState.value ?: return@Canvas
-                val (sx, sw) = SplitMode.srcXWidth(half, rtl, bb.width)
                 val eW = SplitMode.effWidth(half, rtl, bb.width)
                 val s = fitScale(fit, rotation, vw.toFloat(), vh.toFloat(),
                                  eW.toFloat(), bb.height.toFloat())
                 val dW = (eW * s).roundToInt().coerceAtLeast(1)
                 val dH = (bb.height * s).roundToInt().coerceAtLeast(1)
-                drawImage(
-                    image = bb.asImageBitmap(),
-                    srcOffset = IntOffset(sx, 0),
-                    srcSize = IntSize(sw, bb.height),
-                    dstOffset = IntOffset(((size.width - dW) / 2f).roundToInt(),
-                                          ((size.height - dH) / 2f).roundToInt()),
-                    dstSize = IntSize(dW, dH),
-                    filterQuality = FilterQuality.Low,
-                )
+                val dx = ((size.width - dW) / 2f).roundToInt()
+                val dy = ((size.height - dH) / 2f).roundToInt()
+                val animD = anim.state?.d
+                if (animD != null) {
+                    // P4：动图页（槽门槛已保证整页模式）——可视矩形与 drawImage 同几何（D-V9）。
+                    anim.tick.value
+                    drawIntoCanvas { c ->
+                        animD.setBounds(dx, dy, dx + dW, dy + dH)
+                        animD.draw(c.nativeCanvas)
+                    }
+                } else {
+                    val (sx, sw) = SplitMode.srcXWidth(half, rtl, bb.width)
+                    drawImage(
+                        image = bb.asImageBitmap(),
+                        srcOffset = IntOffset(sx, 0),
+                        srcSize = IntSize(sw, bb.height),
+                        dstOffset = IntOffset(dx, dy),
+                        dstSize = IntSize(dW, dH),
+                        filterQuality = FilterQuality.Low,
+                    )
+                }
             }
         } else {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {

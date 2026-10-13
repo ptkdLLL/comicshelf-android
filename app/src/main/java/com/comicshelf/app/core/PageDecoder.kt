@@ -2,9 +2,11 @@ package com.comicshelf.app.core
 
 import android.graphics.Bitmap
 import android.graphics.ImageDecoder
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.util.Log
 import com.comicshelf.app.core.NativeBridge.readPage
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.max
@@ -20,6 +22,18 @@ import kotlin.math.max
  *    C++ chain (stb_image / libwebp / libavif) via nativeDecodePageRGBA.
  */
 object PageDecoder {
+
+    /**
+     * P3（READER_ANIM_PLAN）：页级动画标记（键 bookId<<32|page）。探测命中才写——
+     * 静态页永不入集，后续链路零附加分支（静态路径与改造前逐字一致，已实证）。
+     */
+    private val animPages = ConcurrentHashMap.newKeySet<Long>()
+
+    private fun animKey(bookId: Long, page: Int): Long =
+        (bookId shl 32) or (page.toLong() and 0xFFFFFFFFL)
+
+    /** 阅读器渲染侧查询：本页是否为动图（探测标记；误报由解码判型兜底，P9）。 */
+    fun pageAnimated(bookId: Long, page: Int): Boolean = animPages.contains(animKey(bookId, page))
 
     /** Sniff formats ImageDecoder does not accept (falls back to native). */
     private fun needsNativeDecode(b: ByteArray): Boolean {
@@ -45,9 +59,36 @@ object PageDecoder {
     suspend fun decode(bookId: Long, page: Int, maxBytes: Long): Bitmap? =
         withContext(Dispatchers.IO) {
             val bytes = readPage(bookId, page) ?: return@withContext null
+            // P3（动图）：页级标记——探测纯读头零分配（静态页 ns 级，实测零影响）；
+            // 首帧仍走下方原路径（渲染侧以本标记决定是否另解动画）。
+            if (PageAnim.isAnimated(bytes)) animPages.add(animKey(bookId, page))
             decodeBytes(bookId, page, bytes,
                         { tryDecodePlatformCapped(it, maxBytes) },
                         nativeEdgeForCap(maxBytes))
+        }
+
+    /**
+     * P2（动图）：解码整页动画（GIF / 动画 WebP → AnimatedImageDrawable）。
+     * 仅当前页调用（渲染侧门槛）；与静态路径同款 pow2 采样护栏；任何异常 → null
+     * （调用侧判型/回退位图，P9）。仅当 [pageAnimated] 为真时才应调用（静态页免开销）。
+     */
+    suspend fun decodeAnimation(bookId: Long, page: Int, maxBytes: Long): Drawable? =
+        withContext(Dispatchers.IO) {
+            val bytes = readPage(bookId, page) ?: return@withContext null
+            try {
+                val src = ImageDecoder.createSource(bytes)
+                ImageDecoder.decodeDrawable(src) { decoder, info, _ ->
+                    val w = info.size.width.toLong()
+                    val h = info.size.height.toLong()
+                    var sample = 1
+                    while (w * h / (sample.toLong() * sample) * 4 > maxBytes) sample *= 2
+                    decoder.setTargetSampleSize(sample)
+                }
+            } catch (t: Throwable) {
+                Log.d("PageDecoder", "anim decode failed book=$bookId page=$page " +
+                    "(${t.javaClass.simpleName}: ${t.message})")
+                null
+            }
         }
 
     /**
