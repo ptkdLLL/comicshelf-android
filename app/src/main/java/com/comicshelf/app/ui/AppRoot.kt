@@ -97,7 +97,12 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
                     screen = Screen.Reader(id, title, translate)
                 },
                 onOpenEhTags = if (ehReady) {
-                    { rid, label -> screen = Screen.EhTags(rid, label) }
+                    { rid, label ->
+                        // 预选 = 一次性导航意图，必须在点击时刻执行；不可退回 EhTagScreen 的组合副作用
+                        // （阅读器返回重进组合树会重放，把用户已删的预载 tag 加回来）
+                        ehTagVm.applyPreload(rid)
+                        screen = Screen.EhTags(rid, label)
+                    }
                 } else null,
             )
             is Screen.Reader -> {
@@ -118,7 +123,6 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
             is Screen.EhTags -> EhTagScreen(
                 vm = ehTagVm,
                 shelfVm = shelfVm,
-                preloadRid = s.rid,
                 onBack = { screen = Screen.Shelf },
                 onOpenBook = { id, title, translate ->
                     readerOrigin = Screen.EhTags(s.rid, s.label)   // 关闭阅读器回标签检索页

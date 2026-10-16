@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -24,9 +25,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bookmark
@@ -220,6 +226,9 @@ private fun ReaderPager(
             initialPage = open.page / step,
             initialPageOffsetFraction = 0f,
         ) { pageCountEff }
+        // v3（§10）：翻页动画开关——组合可见态，驱动 userScrollEnabled 与切页手势层
+        val readerPrefs by vm.prefs.collectAsState()
+        val pageAnim = readerPrefs.pageAnim
 
         // v0.6.0：预算快照一次/进入阅读器（availMem 漂移不重启解码，评估 G7）；
         // cap 只随 step（双页/旋转）变化（P-R3 v2：min(48MB, BUDGET÷瞬时最大窗口页数)）。
@@ -244,7 +253,9 @@ private fun ReaderPager(
         LaunchedEffect(open.page) {
             val idx = open.page / step
             if (idx != pager.currentPage && !pager.isScrollInProgress) {
-                pager.animateScrollToPage(idx)
+                // 动画开关（全局键 reader_page_anim）：关 = 瞬间切页；读值于决策时刻实时取
+                if (vm.prefs.value.pageAnim) pager.animateScrollToPage(idx)
+                else pager.scrollToPage(idx)
             }
         }
 
@@ -265,14 +276,18 @@ private fun ReaderPager(
             VerticalPager(
                 state = pager,
                 beyondViewportPageCount = 2,   // 同上：组合即预取
-                modifier = Modifier.fillMaxSize(),
+                userScrollEnabled = pageAnim,  // v3：关 = 禁用内建跟手/惯性/吸附
+                modifier = Modifier.fillMaxSize()
+                    .cutFlipWhenOff(pageAnim, vertical, rtl, vm),
             ) { idx -> pageContent(idx) }
         } else {
             HorizontalPager(
                 state = pager,
                 reverseLayout = rtl,
                 beyondViewportPageCount = 2,   // compose neighbors => decode prefetch（大页模式由准入收紧，组合仍保留）
-                modifier = Modifier.fillMaxSize(),
+                userScrollEnabled = pageAnim,  // v3：关 = 禁用内建跟手/惯性/吸附
+                modifier = Modifier.fillMaxSize()
+                    .cutFlipWhenOff(pageAnim, vertical, rtl, vm),
             ) { idx -> pageContent(idx) }
         }
     }
@@ -366,20 +381,27 @@ private fun ZoomablePage(
                         if (multiTouch || scale > 1f) {
                             val zoom = event.calculateZoom()
                             val pan = event.calculatePan()
-                            val ns = (scale * zoom).coerceIn(1f, 6f)
-                            if (ns != 1f) {
-                                val b = bmpState.value
-                                if (b != null) {
-                                    offset = clampPan(offset.x + pan.x, offset.y + pan.y, ns,
-                                                      size.width.toFloat(), size.height.toFloat(),
-                                                      SplitMode.effWidth(half, rtl, b.width), b.height,
-                                                      fit, rotation)
+                            val ns = accumulateZoom(scale, zoom)   // P2 死区
+                            val b = bmpState.value
+                            // P1a：仅「多指」或「确有平移空间（且已解码）」才进入平移消费；
+                            // 否则单指拖动必须留给 pager 翻页（reader_scroll_stuck 修复）
+                            val panMode = multiTouch || (ns > 1f && b != null &&
+                                hasPanRoom(ns, size.width.toFloat(), size.height.toFloat(),
+                                           SplitMode.effWidth(half, rtl, b.width), b.height, fit, rotation))
+                            if (panMode) {
+                                if (ns != 1f) {
+                                    if (b != null) {
+                                        offset = clampPan(offset.x + pan.x, offset.y + pan.y, ns,
+                                                          size.width.toFloat(), size.height.toFloat(),
+                                                          SplitMode.effWidth(half, rtl, b.width), b.height,
+                                                          fit, rotation)
+                                    }
+                                } else {
+                                    offset = Offset.Zero
                                 }
-                            } else {
-                                offset = Offset.Zero
+                                scale = ns
+                                event.changes.forEach { it.consume() }
                             }
-                            scale = ns
-                            event.changes.forEach { it.consume() }
                         }
                     } while (event.changes.any { it.pressed })
                 }
@@ -528,6 +550,35 @@ internal fun clampPan(nx: Float, ny: Float, ns: Float,
     return Offset(nx.coerceIn(-halfX, halfX), ny.coerceIn(-halfY, halfY))
 }
 
+// ---------------------------------------------------------------- 手势消费门槛（P0，读者=两处手势块）
+// 背景（reader_scroll_stuck_20261016 实机取证+复算）：掌缘 8ms 擦碰可在「抬指帧」把 zoom 算成
+// 1.000523（Compose calculateCentroidSize 语义），旧逻辑把它当真缩放存储 → scale>1f 永久成立 →
+// 该页单指拖动全被吞且无平移空间（画面纹丝不动）。修复 = P2 死区（源头）+ P1a/P1b 平移空间门槛（几何）。
+
+/** 缩放死区：<2% 的变化不是缩放（伪缩放/擦碰帧；对实测 1.000523 有 ~38× 余量）。 */
+internal const val GESTURE_ZOOM_EPS = 1.02f
+
+/** 缩放上界（原内联 6f 提为常量，手势块与单测共用同一口径）。 */
+internal const val MAX_ZOOM = 6f
+
+/** 平移空间门槛：溢出 < 对应视口维度的 5% 不算「可平移」。 */
+internal const val PAN_ROOM_FRAC = 0.05f
+
+/** 缩放累积（P2 死区唯一实现点）：coerceIn 上下界 + 死区归 1f。手势块与单测共用。 */
+internal fun accumulateZoom(scale: Float, zoom: Float): Float =
+    (scale * zoom).coerceIn(1f, MAX_ZOOM).let { if (it < GESTURE_ZOOM_EPS) 1f else it }
+
+/** 缩放 ns 下页面是否有真实平移空间（任一轴溢出 > 对应视口维度的 5%）。
+ *  与 clampPan/fitScale/visualDims 同一几何公式源（单一真相源，防两处数学漂移——
+ *  v0.3.6/v0.4.3 两次几何修复确立的纪律）。ns<=1 恒 false（「平移空间」只由缩放创造）。 */
+internal fun hasPanRoom(ns: Float, vw: Float, vh: Float, iw: Int, ih: Int, mode: Int, rot: Int): Boolean {
+    if (ns <= 1f || iw <= 0 || ih <= 0) return false
+    val f = fitScale(mode, rot, vw, vh, iw.toFloat(), ih.toFloat())
+    val (sw, sh) = visualDims(iw.toFloat(), ih.toFloat(), rot)
+    return (sw * f * ns - vw) > vw * PAN_ROOM_FRAC ||
+           (sh * f * ns - vh) > vh * PAN_ROOM_FRAC
+}
+
 // ---------------------------------------------------------------- chrome
 
 @Composable
@@ -623,7 +674,10 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
         onDismissRequest = onDismiss,
         title = { Text("阅读设置") },
         text = {
-            Column {
+            // B1：设置项增多/横屏矮屏——内容可滚动（根因修复）；指示条仅内容溢出时渲染
+            val scroll = rememberScrollState()
+            Box {
+                Column(Modifier.verticalScroll(scroll)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("适配", Modifier.width(64.dp))
                     listOf(0 to "整页", 1 to "宽度", 2 to "高度", 3 to "原始").forEach { (k, label) ->
@@ -689,6 +743,21 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                              else MaterialTheme.colorScheme.onSurface)
                     }
                 }
+                // 翻页动画（全局键 reader_page_anim）：关 = 全部翻页方式瞬时（点按/滑块/书签 + 滑动 cut）。
+                // 行形制与 切分阅读/连续滚动 对齐（双按钮 ●关/●开）——v4 对齐修正。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("翻页动画", Modifier.width(64.dp))
+                    TextButton(onClick = { vm.setPrefs(prefs.copy(pageAnim = false)) }) {
+                        Text(if (!prefs.pageAnim) "●关" else "关",
+                             color = if (!prefs.pageAnim) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                    TextButton(onClick = { vm.setPrefs(prefs.copy(pageAnim = true)) }) {
+                        Text(if (prefs.pageAnim) "●开" else "开",
+                             color = if (prefs.pageAnim) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                }
                 val open by vm.open.collectAsState()
                 if (open.translateEnabled) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -696,10 +765,44 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                         TextButton(onClick = { retranslateGuarded(vm, ctx) }) { Text("重译当前页") }
                     }
                 }
+                }
+                SettingsScrollIndicator(
+                    state = scroll,
+                    modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight(),
+                )
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
     )
+}
+
+/** 指示条几何（纯函数，单测锁定）：内容不足一屏返回 (0,0)=不显示；top 恒 0（纵向位置由组件按滚动比例算）。 */
+internal fun scrollIndicatorMetrics(viewport: Int, content: Int, track: Int, minThumb: Float): Pair<Float, Float> {
+    if (viewport <= 0 || content <= viewport) return 0f to 0f
+    val h = maxOf(minThumb, track * (viewport.toFloat() / content))
+    return 0f to h
+}
+
+/** 阅读设置对话框用：轻量纵向滚动指示条（3dp 半透明；仅内容溢出时存在）。 */
+@Composable
+private fun SettingsScrollIndicator(state: ScrollState, modifier: Modifier = Modifier) {
+    if (state.maxValue <= 0) return
+    val viewport = state.viewportSize
+    if (viewport <= 0) return
+    val content = viewport + state.maxValue
+    val minThumb = with(LocalDensity.current) { 24.dp.toPx() }
+    Canvas(modifier.width(3.dp)) {
+        val (_, h) = scrollIndicatorMetrics(viewport, content, size.height.toInt(), minThumb)
+        if (h <= 0f) return@Canvas
+        val frac = state.value.toFloat() / state.maxValue
+        val y = frac * (size.height - h)
+        drawRoundRect(
+            color = Color.White.copy(alpha = 0.35f),
+            topLeft = Offset(0f, y),
+            size = Size(size.width, h),
+            cornerRadius = CornerRadius(size.width / 2f),
+        )
+    }
 }
 
 /**

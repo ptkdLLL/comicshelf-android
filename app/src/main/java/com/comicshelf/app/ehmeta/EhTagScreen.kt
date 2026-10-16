@@ -80,13 +80,11 @@ import kotlinx.coroutines.withContext
 fun EhTagScreen(
     vm: EhTagViewModel,
     shelfVm: ShelfViewModel,
-    preloadRid: Long?,
     onBack: () -> Unit,
     onOpenBook: (Long, String, Boolean) -> Unit,
 ) {
     val ui by vm.ui.collectAsState()
     LaunchedEffect(Unit) { vm.activate() }
-    LaunchedEffect(preloadRid) { vm.applyPreload(preloadRid) }
 
     // v0.5.2 长按菜单（书库同源面板；全量动作）——docs/EH_TAG_LONGPRESS_PLAN.md
     var contextBook by remember { mutableStateOf<BookCell?>(null) }

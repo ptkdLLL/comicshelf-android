@@ -99,9 +99,11 @@ internal fun ReaderScrollView(
             }
         }
         // 外部跳转（滑块/书签/模式切换锚定）→ 列表（守卫防环）
+        // 动画开关（全局键 reader_page_anim）：关 = 瞬间跳转；读值于决策时刻实时取（无陈旧闭包）
         LaunchedEffect(open.page) {
             if (open.page != list.firstVisibleItemIndex && !list.isScrollInProgress) {
-                list.animateScrollToItem(open.page)
+                if (vm.prefs.value.pageAnim) list.animateScrollToItem(open.page)
+                else list.scrollToItem(open.page)
             }
         }
 
@@ -241,20 +243,26 @@ private fun ScrollPageItem(
                         if (multiTouch || scale > 1f) {
                             val zoom = event.calculateZoom()
                             val pan = event.calculatePan()
-                            val ns = (scale * zoom).coerceIn(1f, 6f)
-                            if (ns != 1f) {
+                            val ns = accumulateZoom(scale, zoom)   // P2 死区
+                            // P1b：本容器缩放/平移不渲染（D-V4 缺口 L1 另案）——「已放大」不可用，
+                            // 消费单指拖动只有副作用。单指拖动任何情况下留给 LazyColumn；
+                            // 捏合进行中（多指）仍阻断容器，与现状一致（reader_scroll_stuck 修复）
+                            val panMode = multiTouch
+                            if (panMode) {
                                 val b = bmpState.value
-                                if (b != null) {
-                                    offset = clampPan(offset.x + pan.x, offset.y + pan.y, ns,
-                                                      size.width.toFloat(), size.height.toFloat(),
-                                                      SplitMode.effWidth(half, rtl, b.width), b.height,
-                                                      fit, rotation)
+                                if (ns != 1f) {
+                                    if (b != null) {
+                                        offset = clampPan(offset.x + pan.x, offset.y + pan.y, ns,
+                                                          size.width.toFloat(), size.height.toFloat(),
+                                                          SplitMode.effWidth(half, rtl, b.width), b.height,
+                                                          fit, rotation)
+                                    }
+                                } else {
+                                    offset = Offset.Zero
                                 }
-                            } else {
-                                offset = Offset.Zero
+                                scale = ns
+                                event.changes.forEach { it.consume() }
                             }
-                            scale = ns
-                            event.changes.forEach { it.consume() }
                         }
                     } while (event.changes.any { it.pressed })
                 }

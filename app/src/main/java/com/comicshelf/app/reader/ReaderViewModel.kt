@@ -31,6 +31,7 @@ data class ReaderPrefs(
     val rtl: Boolean = false,
     val spread: Boolean = false,
     val bg: Int = 0,           // 0 black, 1 white, 2 gray
+    val pageAnim: Boolean = true,   // 翻页动画（全局键 reader_page_anim；缺省=开=现行为）
 )
 
 data class ReaderOpenState(
@@ -171,6 +172,7 @@ class ReaderViewModel : ViewModel() {
                 rtl = CsSettings.bool("reader_rtl", false),
                 spread = CsSettings.bool("reader_spread", false),
                 bg = CsSettings.int("reader_bg", 0),
+                pageAnim = CsSettings.bool("reader_page_anim", true),
             )
             // P-V1：方向/连续按册解析（方向缺键回退旧全局 rtl——迁移语义，P-V9）
             _mode.value = ReaderMode.load(bookId, prefs.value.rtl)
@@ -590,6 +592,7 @@ class ReaderViewModel : ViewModel() {
         CsSettings.setBool("reader_rtl", p.rtl)
         CsSettings.setBool("reader_spread", p.spread)
         CsSettings.setInt("reader_bg", p.bg)
+        CsSettings.setBool("reader_page_anim", p.pageAnim)
         // v0.4.3：对齐设置页"改即存"（SettingsScreen 六处先例）——否则阅读器偏好
         // 只活到进程结束，重启静默回默认（用户切了"宽度"却像没设置过）。
         CsSettings.save()
