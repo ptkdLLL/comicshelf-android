@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -56,6 +58,7 @@ import android.widget.Toast
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.text.AnnotatedString
 import com.comicshelf.app.core.BookCell
 import com.comicshelf.app.core.NativeBridge
@@ -64,6 +67,7 @@ import com.comicshelf.app.shelf.BookContextMenu
 import com.comicshelf.app.shelf.ShelfViewModel
 import com.comicshelf.app.shelf.TagsDialog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -94,6 +98,20 @@ fun EhTagScreen(
     val ctx = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
+
+    // 长按 tag 行 = 复制该 tag 的**原名**（不是中文显示名；决策与理由在 EhTagCopy.kt）。
+    // 与「导出书名」（:221-225）同款三件套：剪贴板写入 + Log 痕迹 + Toast 确认。
+    val onLongPressTag: (EhTagQuery.TagEntry) -> Unit = { t ->
+        val payload = tagCopyPayload(t.name, t.nameZh)
+        if (payload == null) {
+            Log.w("EhTagCopy", "skip blank tag name rid=${t.rid}")
+        } else {
+            clipboard.setText(AnnotatedString(payload.text))
+            Log.i("EhTagCopy",
+                "copied rid=${t.rid} ns=${t.ns} text=${payload.text} zh=${t.nameZh ?: "-"}")
+            Toast.makeText(ctx, payload.toast, Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // 挑选/结果模式由 VM 持有（进阅读器返回后模式不跳变）
     var showPicker by vm.showPicker
@@ -170,7 +188,8 @@ fun EhTagScreen(
             }
 
             if (showPicker) {
-                PickerArea(vm, ui, onShowResults = { showPicker = false })
+                PickerArea(vm, ui, onShowResults = { showPicker = false },
+                           onLongPressTag = onLongPressTag)
             } else {
                 ResultsArea(
                     vm, ui, onOpenBook = onOpenBook,
@@ -249,6 +268,7 @@ private fun PickerArea(
     vm: EhTagViewModel,
     ui: EhTagViewModel.UiState,
     onShowResults: () -> Unit,
+    onLongPressTag: (EhTagQuery.TagEntry) -> Unit,
 ) {
     // 命名空间清单（一次性加载；提在 LazyRow 之外——LazyListScope 内不能起协程）
     var nss by remember { mutableStateOf<List<Pair<String, Long>>>(emptyList()) }
@@ -294,7 +314,12 @@ private fun PickerArea(
         } else {
             LazyColumn(Modifier.weight(1f), state = vm.pickerListState) {
                 items(ui.picker.tags, key = { it.rid }) { t ->
-                    TagRow(t, selected = ui.selected.any { it.rid == t.rid }) { vm.toggleTag(t) }
+                    TagRow(
+                        t,
+                        selected = ui.selected.any { it.rid == t.rid },
+                        onClick = { vm.toggleTag(t) },
+                        onLongPress = { onLongPressTag(t) },
+                    )
                 }
             }
         }
@@ -310,25 +335,49 @@ private fun PickerArea(
 }
 
 @Composable
-private fun TagRow(t: EhTagQuery.TagEntry, selected: Boolean, onClick: () -> Unit) {
+private fun TagRow(
+    t: EhTagQuery.TagEntry,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onLongPress: () -> Unit,
+) {
+    // Material3 FilterChip 只暴露 onClick（12 参无 onLongClick，javap 已核）：
+    // 用它自己的互动源观测"按住时长"，达到系统长按阈值即触发一次复制。
+    // 长按成立后随后的 up 必须被抑制，否则会同时切换选中（旧行为：长按 = 点击）。
+    val interaction = remember(t.rid) { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val longPressMs = LocalViewConfiguration.current.longPressTimeoutMillis
+    var longFired by remember(t.rid) { mutableStateOf(false) }
+    LaunchedEffect(pressed) {
+        if (!pressed) return@LaunchedEffect
+        longFired = false          // 每次按下起点复位：不跨手势残留"抑制"状态
+        delay(longPressMs)         // 按住不足阈值 → 协程被 release 取消，不复制
+        longFired = true
+        onLongPress()
+    }
     Row(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        FilterChip(selected = selected, onClick = onClick, label = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(t.nameZh ?: t.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (t.nameZh != null) {
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        t.name, style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
-                    )
+        FilterChip(
+            selected = selected,
+            onClick = { if (longFired) longFired = false else onClick() },
+            interactionSource = interaction,
+            label = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(t.nameZh ?: t.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (t.nameZh != null) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            t.name, style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+                        )
+                    }
                 }
-            }
-        })
+            },
+        )
         Spacer(Modifier.width(10.dp))
         Text(
             formatCnt(t.cnt),

@@ -128,7 +128,50 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
     }
 
     Box(Modifier.fillMaxSize().background(bg)) {
-        if (open.pageCount > 0) {
+        if (open.isPdf && open.bookId != 0L && open.pageCount == 0) {
+            // PDF has a typed failure state (encrypted/corrupt/SMB offline). The
+            // old code fell through to the generic spinner and never recovered.
+            if (open.error != null) {
+                Column(
+                    Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text("PDF 打开失败", color = Color.White)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        open.error!!,
+                        color = Color.White.copy(alpha = 0.7f),
+                        fontSize = 12.sp,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    TextButton(onClick = { vm.retryOpen() }) { Text("重试") }
+                }
+            } else {
+                Column(
+                    Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    CircularProgressIndicator()
+                    Spacer(Modifier.height(12.dp))
+                    Text("打开中…", color = Color.White.copy(alpha = 0.7f))
+                }
+            }
+        } else if (open.isEpub && open.bookId != 0L && open.pageCount == 0) {
+            Column(
+                Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text("EPUB 打开失败", color = Color.White)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "文件可能损坏，或不是有效的 EPUB（ZIP/OPF 不可读）",
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 12.sp,
+                )
+            }
+        } else if (open.isEpub && open.pageCount > 0) {
+            EpubReaderScreen(vm, open)
+        } else if (open.pageCount > 0) {
             // 四容器分派（P-V3）：方向 × 连续——独立成项；页项/同步语义与 pager 同构
             if (mode.scroll) {
                 ReaderScrollView(vm, open, mode, splitOn, prefs.fit, rotation,
@@ -155,11 +198,14 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
                 onTranslate = {
                     if (open.translateEnabled) showTrMenu = true else showTrEnable = true
                 },
+                showTranslate = !open.isEpub,
                 modifier = Modifier.align(Alignment.TopCenter),
             )
-            ReaderBottomBar(open, vm,
-                            onGoto = { vm.goto(it) },
-                            modifier = Modifier.align(Alignment.BottomCenter))
+            if (open.pageCount > 0) {
+                ReaderBottomBar(open, vm,
+                                onGoto = { vm.goto(it) },
+                                modifier = Modifier.align(Alignment.BottomCenter))
+            }
         }
 
         if (showTrEnable) TranslateEnableDialog(vm) { showTrEnable = false }
@@ -326,7 +372,9 @@ private fun ZoomablePage(
         var attempt = 0
         while (attempt < MAX_LOAD_ATTEMPTS) {      // 取消经挂起点传播（awaitAdmission 起）
             vm.awaitAdmission(raw)                 // P-R6：大页模式挂起等待放行（raw 域）
-            val job = async { vm.decodePageItem(bookId, raw, half, capBytes) }
+            val job = async {
+                vm.decodePageItem(bookId, raw, half, capBytes, foreground = isCurrent)
+            }
             val b = withTimeoutOrNull(STUCK_LOAD_MS) { job.await() }
             if (b == null) {
                 job.cancel()                       // 卡死/失败尝试弃引用（JNI 跑完即被 GC）
@@ -338,6 +386,9 @@ private fun ZoomablePage(
             attempt++
             if (attempt < MAX_LOAD_ATTEMPTS) delay(RETRY_DELAY_MS)
         }
+    }
+    LaunchedEffect(isCurrent, raw) {
+        if (isCurrent) vm.noteVisiblePage(raw)
     }
     DisposableEffect(bookId, raw) { onDispose { vm.unregisterBorrowed(raw, decoded?.bmp) } }
     val original = decoded?.takeIf { it.bookId == bookId && it.page == raw }?.bmp
@@ -592,6 +643,7 @@ private fun ReaderTopBar(
     onBookmarks: () -> Unit,
     onSettings: () -> Unit,
     onTranslate: () -> Unit,
+    showTranslate: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -612,12 +664,14 @@ private fun ReaderTopBar(
                 style = MaterialTheme.typography.titleSmall,
                 modifier = Modifier.weight(1f),
             )
-            IconButton(onClick = onTranslate) {
-                Icon(
-                    Icons.Filled.Translate, "翻译",
-                    tint = if (vm.open.value.translateEnabled) MaterialTheme.colorScheme.primary
-                    else Color.White,
-                )
+            if (showTranslate) {
+                IconButton(onClick = onTranslate) {
+                    Icon(
+                        Icons.Filled.Translate, "翻译",
+                        tint = if (vm.open.value.translateEnabled) MaterialTheme.colorScheme.primary
+                        else Color.White,
+                    )
+                }
             }
             IconButton(onClick = onRotate) {
                 Icon(Icons.Filled.RotateRight, "旋转", tint = Color.White)

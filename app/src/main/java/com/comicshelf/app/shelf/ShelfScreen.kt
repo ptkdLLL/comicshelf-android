@@ -131,6 +131,8 @@ import com.comicshelf.app.core.Json
 import com.comicshelf.app.ehmeta.EhBookTagsPanel
 import com.comicshelf.app.core.LibraryRow
 import com.comicshelf.app.core.NativeBridge
+import com.comicshelf.app.core.PdfBookSource
+import com.comicshelf.app.core.PdfMetaService
 import com.comicshelf.app.core.parseImageBundle
 import com.comicshelf.app.reader.BookTranslateJob
 import kotlinx.coroutines.delay
@@ -387,6 +389,7 @@ fun ShelfScreen(
                                 val n = withContext(CoreDispatcher) {
                                     NativeBridge.retryFailedCovers()
                                 }
+                                PdfMetaService.invalidateAll()
                                 coverRetryGen.value++
                                 Toast.makeText(
                                     ctx,
@@ -442,6 +445,7 @@ fun ShelfScreen(
                                             val n = withContext(CoreDispatcher) {
                                                 NativeBridge.retryFailedCovers()
                                             }
+                                            PdfMetaService.invalidateAll()
                                             coverRetryGen.value++
                                             Toast.makeText(
                                                 ctx,
@@ -1043,22 +1047,44 @@ internal fun produceCoverState(bookId: Long, lowFi: Boolean): androidx.compose.r
         if (lowFi) return@produceState
         if (value.bmp != null) return@produceState
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            // Fast path: covers already persisted in the native disk cache
+            // (including PDFs opened before this change) are one JNI call.
+            var (status, bmp) = pollCover(bookId)
+            val isPdf = PdfBookSource.isPdfBook(bookId)
             var tries = 0
             while (value.bmp == null) {
-                val (status, bmp) = pollCover(bookId)
                 if (status == 2 && bmp != null) {
                     CoverStore.put(bookId, bmp)
                     value = CoverSlot(bmp)
                     return@repeatOnLifecycle
                 }
-                if (status == 3) {
-                    // 不可用（永久失败，或瞬态失败冷却中）：占位 + 慢询等原生侧重试
-                    value = CoverSlot(unavailable = true)
-                    delay(30_000)
+                if (isPdf) {
+                    // The native pipeline deliberately defers PDFs; render page 0
+                    // through PdfRenderer and persist via putCover.
+                    when (val r = PdfMetaService.ensure(bookId)) {
+                        is PdfMetaService.Result.Ok -> {
+                            CoverStore.put(bookId, r.cover.bmp)
+                            value = CoverSlot(r.cover.bmp)
+                            return@repeatOnLifecycle
+                        }
+                        is PdfMetaService.Result.Failed -> {
+                            value = CoverSlot(unavailable = true)
+                            delay(if (r.permanent) 5 * 60_000L else 30_000L)
+                        }
+                    }
                 } else {
-                    value = CoverSlot(unavailable = false)
-                    tries++
-                    delay(if (tries <= 5) 80L else if (tries <= 20) 1_000L else 5_000L)
+                    if (status == 3) {
+                        // 不可用（永久失败，或瞬态失败冷却中）：占位 + 慢询等原生侧重试
+                        value = CoverSlot(unavailable = true)
+                        delay(30_000)
+                    } else {
+                        value = CoverSlot(unavailable = false)
+                        tries++
+                        delay(if (tries <= 5) 80L else if (tries <= 20) 1_000L else 5_000L)
+                    }
+                    val p = pollCover(bookId)
+                    status = p.first
+                    bmp = p.second
                 }
             }
         }

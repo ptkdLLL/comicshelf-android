@@ -3,6 +3,7 @@ package com.comicshelf.app.reader
 import android.graphics.Bitmap
 import android.util.Log
 import com.comicshelf.app.core.PageDecoder
+import com.comicshelf.app.core.PdfBookSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -75,6 +76,7 @@ object BookTranslateJob {
     /** 启动/续传本册整本翻译。已在跑则只更新焦点。 */
     fun ensureStarted(bookId: Long, pageCount: Int, startPage: Int) {
         if (pageCount <= 0) return
+        val old = _state.value.bookId
         synchronized(lock) {
             if (_state.value.bookId == bookId && worker?.isActive == true) {
                 pushFocus(startPage, pageCount)
@@ -89,6 +91,7 @@ object BookTranslateJob {
             pushFocus(start, pageCount)
             launchWorker(bookId, pageCount, start)   // caller 持锁
         }
+        if (old != 0L && old != bookId) PdfBookSource.closeJob(old)
     }
 
     // caller 持锁。worker 内任何未预期异常都不允许带崩进程。
@@ -156,6 +159,7 @@ object BookTranslateJob {
 
     /** 停止本册（不清档案；进度保留，再次 ensureStarted 从断点续传）。 */
     fun cancel() {
+        val old = _state.value.bookId
         synchronized(lock) {
             worker?.cancel()
             worker = null
@@ -164,6 +168,7 @@ object BookTranslateJob {
             attempts.clear()
             _state.value = State()
         }
+        if (old != 0L) PdfBookSource.closeJob(old)
     }
 
     // caller 持锁

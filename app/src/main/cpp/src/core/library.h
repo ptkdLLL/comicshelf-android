@@ -101,12 +101,15 @@ public:
     void forget_cover(const Book& b);
     /** 清空全部封面缓存（磁盘+内存）。 */
     void clear_all_covers();
+    /** Injects an externally rendered cover (e.g. a PDF first page). */
+    bool put_cover(int64_t book_id, const ImageRGBA& img);
 
     // ---- per-book user state (schema v4) ---------------------------------
     BookMeta meta(int64_t book_id);
     void set_favorite(int64_t book_id, bool favorite);
     void set_read_state(int64_t book_id, int read_state);
     void save_progress(int64_t book_id, int page);
+    bool set_page_count(int64_t book_id, int pages);
     // Removes the book row plus all of its user state; also drops its cover.
     bool delete_book(int64_t book_id);
 

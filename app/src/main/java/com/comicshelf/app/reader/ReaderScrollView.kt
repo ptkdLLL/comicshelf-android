@@ -181,7 +181,9 @@ private fun ScrollPageItem(
         var attempt = 0
         while (attempt < MAX_LOAD_ATTEMPTS) {      // 取消经挂起点传播（awaitAdmission 起）
             vm.awaitAdmission(raw)                 // P-R6：大页模式挂起等待放行（raw 域）
-            val job = async { vm.decodePageItem(bookId, raw, half, capBytes) }
+            val job = async {
+                vm.decodePageItem(bookId, raw, half, capBytes, foreground = isTopmost)
+            }
             val b = withTimeoutOrNull(STUCK_LOAD_MS) { job.await() }
             if (b == null) {
                 job.cancel()
@@ -193,6 +195,9 @@ private fun ScrollPageItem(
             attempt++
             if (attempt < MAX_LOAD_ATTEMPTS) delay(RETRY_DELAY_MS)
         }
+    }
+    LaunchedEffect(isTopmost, raw) {
+        if (isTopmost) vm.noteVisiblePage(raw)
     }
     // 7.3-A：身份判定注销（滚动"离屏→重组合→重解码"是常态，不污染"在位重解"检查）
     DisposableEffect(bookId, raw) { onDispose { vm.unregisterBorrowed(raw, decoded?.bmp) } }

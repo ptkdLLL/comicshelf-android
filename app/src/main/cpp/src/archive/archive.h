@@ -22,6 +22,14 @@ public:
     // Reads entry `i` fully into `out`. Thread-safety is backend-defined; callers
     // must serialize access to a single instance.
     virtual bool read(size_t i, std::vector<uint8_t>& out) = 0;
+    // Optional container-aware lookup (EPUB text/OPF/XHTML reads arbitrary hrefs).
+    // Backends that only expose page images keep the default unsupported result.
+    virtual bool read_named(const std::string& /*name*/, std::vector<uint8_t>& /*out*/) {
+        return false;
+    }
+    virtual std::vector<std::string> entry_names() const { return {}; }
+    // User-visible page count. ZIP/RAR/folder = image entries; EPUB = OPF spine.
+    virtual int page_count() const { return (int)entries().size(); }
     size_t count() const { return entries().size(); }
 };
 
@@ -36,6 +44,11 @@ std::unique_ptr<IArchive> open_archive_path(const std::string& utf8_path, std::s
 
 // SMB 上的 RAR 需要整档缓存（UnRAR 要真实文件句柄）；LibraryManager 初始化时设置。
 void set_archive_cache_dir(const std::string& utf8_dir);
+
+// Makes a book path locally readable for APIs that need a real seekable file.
+// Local paths are returned unchanged; SMB paths are downloaded to the archive
+// cache (same directory as RAR) and the cached file path is returned.
+bool materialize_local(const std::string& utf8_path, std::string* err, std::string* out_local);
 
 bool is_archive_path(const std::filesystem::path& p);
 

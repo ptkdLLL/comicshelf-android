@@ -15,8 +15,8 @@ android {
         applicationId = "com.comicshelf.app"
         minSdk = 30
         targetSdk = 36
-        versionCode = 31
-        versionName = "0.5.17-flipanim-android"
+        versionCode = 32
+        versionName = "0.5.18-epubpdf-android"
 
         externalNativeBuild {
             cmake {

@@ -258,6 +258,7 @@ void Scanner::run(int64_t lib_id, std::string root, ScanOptions opt) {
         progress_.dirs_seen += 1;
 
         bool has_image = false;
+        bool has_pdf = false;
         std::vector<std::string> subdirs;
         // EH 档（mode=1）专用延迟容器；通用档恒为空、不进入任何新分支。
         std::vector<const vfs::DirEntry*> eh_archives;
@@ -269,15 +270,19 @@ void Scanner::run(int64_t lib_id, std::string root, ScanOptions opt) {
             }
             if (!e.st.is_file) continue;
             const std::string ext = lower_ext_str(e.name);
-            if (paths::is_archive_ext(ext)) {
+            const bool is_pdf = paths::is_pdf_ext(ext);
+            const bool is_epub = paths::is_epub_ext(ext);
+            if (is_pdf) has_pdf = true;
+            if (paths::is_archive_ext(ext) || is_pdf) {
                 if (opt.mode == kScanModeEhDownloads) {
                     eh_archives.push_back(&e);               // 仅 EH 档：延迟下发
                 } else {
-                    Book b;                                  // 通用档：与现状逐字一致
+                    Book b;                                  // 通用档：与现状同构
                     b.lib_id = lib_id;
                     b.path = vfs->full_path(join_rel(dir, e.name));
                     b.rel_dir = lib_rel_of(base, dir);
-                    b.kind = BookKind::Archive;
+                    b.kind = is_pdf ? BookKind::Pdf
+                                    : (is_epub ? BookKind::Epub : BookKind::Archive);
                     b.title = stem_str(e.name);
                     b.ext = ext;
                     b.size = (int64_t)e.st.size;
@@ -297,7 +302,10 @@ void Scanner::run(int64_t lib_id, std::string root, ScanOptions opt) {
                 b.lib_id = lib_id;
                 b.path = vfs->full_path(join_rel(dir, ae->name));
                 b.rel_dir = lib_rel_of(base, dir);
-                b.kind = BookKind::Archive;
+                const std::string aext = lower_ext_str(ae->name);
+                b.kind = paths::is_pdf_ext(aext) ? BookKind::Pdf
+                       : paths::is_epub_ext(aext) ? BookKind::Epub
+                                                  : BookKind::Archive;
                 b.title = (cover_struct && eh_archives.size() == 1) ? base_name(dir)
                                                                     : stem_str(ae->name);
                 b.ext = lower_ext_str(ae->name);
@@ -308,8 +316,9 @@ void Scanner::run(int64_t lib_id, std::string root, ScanOptions opt) {
             if (cover_struct) return;   // 不下探；不产 Folder 书（"目录=一本书"语义等价）
         }
 
-        // 直接含图片的目录 = 一本书（与旧扫描器一致：不再下探，其中的归档也不单独入库）
-        if (opt.include_folders && has_image && dir != base) {
+        // 直接含图片的目录 = 一本书（与旧扫描器一致：不再下探，其中的归档也不单独入库）。
+        // 例外：目录里含 PDF 时，PDF 才是书（旁边的封面/广告图不额外产出一本目录书）。
+        if (opt.include_folders && has_image && !has_pdf && dir != base) {
             int64_t mtime = 0;
             vfs::FileStat dst;
             if (vfs->stat(dir, &dst)) mtime = dst.mtime;

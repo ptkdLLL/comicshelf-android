@@ -175,9 +175,11 @@ set(CS_CORE_SOURCES
     ${SRC}/vfs/vfs_local.cpp
     ${SRC}/vfs/vfs_smb.cpp
     ${SRC}/vfs/byte_source.cpp
+    ${SRC}/vfs/pdf_remote_source.cpp
     ${SRC}/archive/archive.cpp
     ${SRC}/archive/archive_zip.cpp
     ${SRC}/archive/archive_rar.cpp
+    ${SRC}/archive/archive_epub.cpp
     ${SRC}/image/image_util.cpp
     ${SRC}/image/image_util_webp.cpp
     ${SRC}/image/image_util_avif.cpp

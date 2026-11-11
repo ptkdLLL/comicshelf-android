@@ -11,9 +11,11 @@ import androidx.lifecycle.viewModelScope
 import com.comicshelf.app.core.BookmarkRow
 import com.comicshelf.app.core.CoreDispatcher
 import com.comicshelf.app.core.CsSettings
+import com.comicshelf.app.core.EpubBookSource
 import com.comicshelf.app.core.Json
 import com.comicshelf.app.core.NativeBridge
 import com.comicshelf.app.core.PageDecoder
+import com.comicshelf.app.core.PdfBookSource
 import com.comicshelf.app.core.parseImageBundle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -40,6 +42,10 @@ data class ReaderOpenState(
     val pageCount: Int = 0,
     val page: Int = 0,
     val translateEnabled: Boolean = false,
+    val isEpub: Boolean = false,
+    val isPdf: Boolean = false,
+    /** Non-null = PDF open failed; ReaderScreen shows this + retry. */
+    val error: String? = null,
 )
 
 enum class TranslatePageState { NONE, QUEUED, BUSY, READY, FAILED }
@@ -159,14 +165,54 @@ class ReaderViewModel : ViewModel() {
 
     // ---------------------------------------------------------------- open
 
+    private val openGen = java.util.concurrent.atomic.AtomicLong(0)
+
     fun openBook(bookId: Long, title: String, forceTranslate: Boolean) {
+        val gen = openGen.incrementAndGet()
         viewModelScope.launch(CoreDispatcher) {
-            val info = NativeBridge.readerOpen(bookId) ?: return@launch
+            // PDF 由 Kotlin 侧 PdfRenderer 渲染；EPUB 由 EpubReaderScreen 的
+            // 文本/图片块渲染。两者都不使用原生 IArchive 页会话。
+            val path = NativeBridge.bookPath(bookId)
+            val isPdf = path != null && path.endsWith(".pdf", ignoreCase = true)
+            val isEpub = path != null && path.endsWith(".epub", ignoreCase = true)
+            val pageCount: Int
+            val lastPage: Int
+            if (isEpub) {
+                val book = EpubBookSource.open(bookId) ?: run {
+                    Log.w("Reader", "EPUB open failed book=$bookId")
+                    // 明确失败态：ReaderScreen 显示“EPUB 打开失败”，而不是永久 spinner。
+                    if (gen != openGen.get()) return@launch
+                    open.value = ReaderOpenState(bookId, title, 0, 0, false, isEpub = true)
+                    return@launch
+                }
+                pageCount = book.spine.size
+                lastPage = NativeBridge.bookMeta(bookId)?.getOrNull(1) ?: 0
+                NativeBridge.setBookPageCount(bookId, pageCount)
+            } else if (isPdf) {
+                val pdfPath = path ?: return@launch
+                if (gen != openGen.get()) return@launch
+                open.value = ReaderOpenState(bookId, title, 0, 0, false, isPdf = true)
+                val res = PdfBookSource.open(bookId, pdfPath)
+                if (res.error != null) {
+                    // Explicit failure state: without this the old code left the
+                    // default state and ReaderScreen spun forever.
+                    if (gen != openGen.get()) return@launch
+                    open.value = ReaderOpenState(bookId, title, 0, 0, false,
+                                                 isPdf = true, error = res.error)
+                    return@launch
+                }
+                pageCount = res.pageCount
+                lastPage = NativeBridge.bookMeta(bookId)?.getOrNull(1) ?: 0
+                NativeBridge.setBookPageCount(bookId, pageCount)
+                PdfBookSource.setFocus(bookId, lastPage.coerceIn(0, pageCount - 1))
+            } else {
+                val info = NativeBridge.readerOpen(bookId) ?: return@launch
+                pageCount = info[0]          // raw 源页数
+                lastPage = info[1]           // raw 页号
+            }
             resetLoadGating()
             borrowed.clear()   // 切书防串页：旧书借用全部作废（新书页项自会重登记）
             pageDims.clear()   // 尺寸缓存同样不跨书（P-V7）
-            val pageCount = info[0]          // raw 源页数
-            val lastPage = info[1]           // raw 页号
             prefs.value = ReaderPrefs(
                 fit = CsSettings.int("reader_fit", 0),
                 rtl = CsSettings.bool("reader_rtl", false),
@@ -176,21 +222,31 @@ class ReaderViewModel : ViewModel() {
             )
             // P-V1：方向/连续按册解析（方向缺键回退旧全局 rtl——迁移语义，P-V9）
             _mode.value = ReaderMode.load(bookId, prefs.value.rtl)
-            // P-S1：切分开关按册读取；open.page/pageCount 全部为显示页域。
-            val split = CsSettings.bool("reader_split_$bookId", false)
+            // P-S1：切分开关按册读取；EPUB 无页位图，切分无意义。
+            val split = !isEpub && CsSettings.bool("reader_split_$bookId", false)
             _splitOn.value = split
             rawCount = pageCount
-            val vCount = SplitMode.vCount(pageCount, split)
+            val vCount = if (isEpub) pageCount else SplitMode.vCount(pageCount, split)
             val rawPage = if (lastPage in 0 until pageCount) lastPage else 0
-            val vPage = if (split) rawPage * 2 else rawPage
+            val vPage = if (isEpub) rawPage else if (split) rawPage * 2 else rawPage
             // 默认不翻译：只有本册被手动启用（或本次强制打开）才启动引擎。
-            val wantTranslate = forceTranslate ||
-                withContext(CoreDispatcher) { NativeBridge.getBookTranslateEnabled(bookId) }
+            // EPUB 的 sidecar 依赖图片页，文本章不适用；本轮禁用。
+            var wantTranslate = !isEpub && (forceTranslate ||
+                withContext(CoreDispatcher) { NativeBridge.getBookTranslateEnabled(bookId) })
             if (wantTranslate && engineMode() == "sidecar") {
-                NativeBridge.translateConfigure(null, null, null, -1, -1, -1, true)
-                NativeBridge.translateOpenBook(bookId)
+                if (isPdf) {
+                    // 原生 sidecar 通过 IArchive 打开书，没有 PDF 后端；
+                    // backend/端侧翻译仍可经 PageDecoder.decodeJob 工作。
+                    Log.w("Reader", "PDF sidecar translation unsupported, book=$bookId")
+                    wantTranslate = false
+                } else {
+                    NativeBridge.translateConfigure(null, null, null, -1, -1, -1, true)
+                    NativeBridge.translateOpenBook(bookId)
+                }
             }
-            open.value = ReaderOpenState(bookId, title, vCount, vPage, wantTranslate)
+            if (gen != openGen.get()) return@launch
+            open.value = ReaderOpenState(bookId, title, vCount, vPage, wantTranslate, isEpub,
+                                         isPdf = isPdf)
             if (wantTranslate) {
                 when (engineMode()) {
                     "sidecar" -> {
@@ -218,6 +274,9 @@ class ReaderViewModel : ViewModel() {
             // 读到的 page 已是 0 → 把进度写成 0。JDWP/高负载下必现）。
             val raw = rawOfPage(open.value.page)
             val rawN = rawCount
+            EpubBookSource.close(id)
+            PdfBookSource.closeJob(id)
+            PdfBookSource.close(id)
             viewModelScope.launch(CoreDispatcher) {
                 NativeBridge.saveProgress(id, raw, rawN)
                 NativeBridge.readerClose(id)
@@ -233,6 +292,21 @@ class ReaderViewModel : ViewModel() {
         synchronized(renderBaseCache) { renderBaseCache.clear() }   // v2: 渲染基随书释放
         resetLoadGating()
         open.value = ReaderOpenState()
+    }
+
+    /** ReaderScreen "重试"：回到加载态后重新走 openBook（PDF 失败可恢复）。 */
+    fun retryOpen() {
+        val st = open.value
+        if (st.bookId == 0L) return
+        open.value = ReaderOpenState(st.bookId, st.title, 0, 0, false,
+                                     isPdf = st.isPdf)
+        openBook(st.bookId, st.title, false)
+    }
+
+    /** Current visible page → PDF render queue focus (prefetch cannot starve it). */
+    fun noteVisiblePage(raw: Int) {
+        val st = open.value
+        if (st.isPdf && st.bookId != 0L) PdfBookSource.setFocus(st.bookId, raw)
     }
 
     /** v0.3.2：清空门控状态。v0.6.0：重试/看门狗已项内化，这里只剩大页模式条带（P-R6）。 */
@@ -292,7 +366,7 @@ class ReaderViewModel : ViewModel() {
      */
     fun setSplit(on: Boolean) {
         val st = open.value
-        if (st.bookId == 0L || rawCount <= 0) return
+        if (st.bookId == 0L || rawCount <= 0 || st.isEpub) return
         if (_splitOn.value == on) return
         val anchorRaw = SplitMode.rawOf(st.page, _splitOn.value)   // 旧映射下当前 raw
         CsSettings.setBool("reader_split_${st.bookId}", on)
@@ -347,7 +421,8 @@ class ReaderViewModel : ViewModel() {
      * 取消语义：项销毁 → 本协程（或以本函数为 body 的 job）取消 → 结果丢弃（位图 GC）。
      * [half]（P-S3）：WHOLE=整页；0/1=切分后的半页项（同 raw 两半各解一次，语义与现状同构）。
      */
-    suspend fun decodePageItem(bookId: Long, page: Int, half: Int, maxBytes: Long): Bitmap? {
+    suspend fun decodePageItem(bookId: Long, page: Int, half: Int, maxBytes: Long,
+                               foreground: Boolean = false): Bitmap? {
         // P-R8 精确形（动态阶段定稿）：**在位页**重新解码 = 回路签名本体
         //（回访是先离开窗口已注销再解码，属正常——旧 60s 计数形会误报）。
         // 切分开启时同 raw 的两个半页项互为"兄弟"（borrowed 按 raw 键共享），
@@ -360,7 +435,7 @@ class ReaderViewModel : ViewModel() {
         Log.i("Reader", "load start page=$page")
         var bmp: Bitmap? = null
         try {
-            bmp = PageDecoder.decode(bookId, page, maxBytes)
+            bmp = PageDecoder.decode(bookId, page, maxBytes, foreground)
         } catch (e: Throwable) {
             Log.w("Reader", "page $page load failed: $e")
         }
@@ -569,6 +644,7 @@ class ReaderViewModel : ViewModel() {
         if (page !in 0 until st.pageCount) return     // page = 显示页域
         val raw = rawOfPage(page)
         open.value = st.copy(page = page)
+        if (st.isPdf && st.bookId != 0L) PdfBookSource.setFocus(st.bookId, raw)
         if (st.translateEnabled && engineMode() == "sidecar") {
             viewModelScope.launch(CoreDispatcher) { NativeBridge.translateFocus(raw) }
         }

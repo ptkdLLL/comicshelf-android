@@ -13,10 +13,13 @@
 // primitive arrays instead of JSON to keep the per-call cost tiny.
 #include "core/library.h"
 #include "core/auto_sync.h"
+#include "archive/archive.h"
+#include "archive/archive_epub.h"
 #include "translate/llm_local.h"
 #include "util/path_util.h"
 #include "core/scanner.h"
 #include "vfs/vfs.h"
+#include "vfs/pdf_remote_source.h"
 #include "vfs/stall_watch.h"
 #include "core/settings.h"
 #include "image/image_util.h"
@@ -29,6 +32,7 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -65,6 +69,38 @@ struct ReaderSession {
     std::mutex mtx;
 };
 std::unordered_map<int64_t, std::shared_ptr<ReaderSession>> g_readers;
+
+// EPUB text session: independent from g_readers (the image reader). Holds the
+// same EpubArchive used for cover/OPF so chapter reads are random-access.
+struct EpubSession {
+    std::shared_ptr<IArchive> arch;
+    std::string opf_path;
+};
+std::unordered_map<int64_t, std::shared_ptr<EpubSession>> g_epubs;
+
+// PDF random-access source handles. The id is a positive monotonic token, so a
+// double close or a late ProxyFD onRelease cannot free another book's source.
+struct PdfSourceHandle {
+    std::shared_ptr<vfs::PdfRemoteSource> src;
+};
+std::mutex g_pdf_src_mtx;
+std::unordered_map<jlong, std::shared_ptr<PdfSourceHandle>> g_pdf_srcs;
+std::atomic<jlong> g_pdf_src_next{1};
+
+jlong pdf_src_put(std::shared_ptr<vfs::PdfRemoteSource> src) {
+    auto h = std::make_shared<PdfSourceHandle>();
+    h->src = std::move(src);
+    std::lock_guard<std::mutex> lk(g_pdf_src_mtx);
+    const jlong id = g_pdf_src_next.fetch_add(1);
+    g_pdf_srcs[id] = std::move(h);
+    return id;
+}
+
+std::shared_ptr<PdfSourceHandle> pdf_src_get(jlong id) {
+    std::lock_guard<std::mutex> lk(g_pdf_src_mtx);
+    auto it = g_pdf_srcs.find(id);
+    return it == g_pdf_srcs.end() ? nullptr : it->second;
+}
 
 // ---------------------------------------------------------------- helpers
 
@@ -107,6 +143,27 @@ jintArray to_int_array(JNIEnv* env, const std::vector<int>& v) {
     jintArray a = env->NewIntArray((jsize)v.size());
     if (!a) return nullptr;
     env->SetIntArrayRegion(a, 0, (jsize)v.size(), (const jint*)v.data());
+    return a;
+}
+
+jbyteArray to_byte_array(JNIEnv* env, const std::vector<uint8_t>& v) {
+    jbyteArray a = env->NewByteArray((jsize)v.size());
+    if (!a) return nullptr;
+    if (!v.empty())
+        env->SetByteArrayRegion(a, 0, (jsize)v.size(), (const jbyte*)v.data());
+    return a;
+}
+
+jobjectArray to_string_array(JNIEnv* env, const std::vector<std::string>& v) {
+    jclass cls = env->FindClass("java/lang/String");
+    if (!cls) return nullptr;
+    jobjectArray a = env->NewObjectArray((jsize)v.size(), cls, nullptr);
+    if (!a) return nullptr;
+    for (size_t i = 0; i < v.size(); ++i) {
+        jstring s = from_std(env, v[i]);
+        env->SetObjectArrayElement(a, (jsize)i, s);
+        env->DeleteLocalRef(s);
+    }
     return a;
 }
 
@@ -501,7 +558,7 @@ Java_com_comicshelf_app_core_NativeBridge_nativeSmbList(JNIEnv* env, jobject, js
                                         : e.name.substr(e.name.rfind('.') + 1);
             std::string ext;
             for (char ch : dot) ext.push_back((char)std::tolower((unsigned char)ch));
-            if (paths::is_archive_ext(ext)) ++archives;
+            if (paths::is_archive_ext(ext) || paths::is_pdf_ext(ext)) ++archives;
             else if (paths::is_image_ext(ext)) ++images;
         }
     }
@@ -836,7 +893,7 @@ Java_com_comicshelf_app_core_NativeBridge_nativeReaderOpen(JNIEnv* env, jobject,
         return nullptr;
     }
     log_info("reader open ok: " + b.path + " entries=" + std::to_string(session->arch->count()));
-    const int pages = (int)session->arch->count();
+    const int pages = session->arch->page_count();
     if (pages > 0) {
         g_core.lib->db().update_pages(b.id, pages);
     }
@@ -849,10 +906,203 @@ Java_com_comicshelf_app_core_NativeBridge_nativeReaderOpen(JNIEnv* env, jobject,
     return to_int_array(env, v);
 }
 
+// ---- PDF / local materialization -------------------------------------
+
+JNIEXPORT jstring JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativeBookPath(JNIEnv* env, jobject, jlong book_id) {
+    std::lock_guard<std::mutex> lk(g_bridge_mtx);
+    if (!g_core.lib) return nullptr;
+    Book b = find_book(book_id);
+    if (b.id == 0) return nullptr;
+    return from_std(env, b.path);
+}
+
+// int[3] {pages, lastPage, kind}
+JNIEXPORT jintArray JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativeBookMeta(JNIEnv* env, jobject, jlong book_id) {
+    std::lock_guard<std::mutex> lk(g_bridge_mtx);
+    if (!g_core.lib) return nullptr;
+    Book b = find_book(book_id);
+    if (b.id == 0) return nullptr;
+    std::vector<int> v{b.pages, b.last_page, (int)b.kind};
+    return to_int_array(env, v);
+}
+
+// Local path for APIs that require a seekable file. SMB downloads happen
+// without g_bridge_mtx (a 100 MB pull must not freeze every other JNI call).
+JNIEXPORT jstring JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativeMaterializeBook(JNIEnv* env, jobject,
+                                                               jlong book_id) {
+    Book b;
+    {
+        std::lock_guard<std::mutex> lk(g_bridge_mtx);
+        if (!g_core.lib) return nullptr;
+        b = find_book(book_id);
+    }
+    if (b.id == 0) return nullptr;
+    std::string local, err;
+    if (!materialize_local(b.path, &err, &local)) {
+        log_warn("materialize failed: " + err + " (" + b.path + ")");
+        return nullptr;
+    }
+    return from_std(env, local);
+}
+
+// ---- PDF random-access source (ProxyFileDescriptor backend) ----------------
+// SMB PDFs are read on demand instead of being materialized. The Kotlin side
+// owns the ParcelFileDescriptor and calls these four functions from the proxy
+// callback thread.
+JNIEXPORT jlong JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativePdfSourceOpen(JNIEnv*, jobject, jlong book_id) {
+    Book b;
+    {
+        std::lock_guard<std::mutex> lk(g_bridge_mtx);
+        if (!g_core.lib) return 0;
+        b = find_book(book_id);
+    }
+    if (b.id == 0 || b.kind != BookKind::Pdf) return 0;
+    std::string err;
+    auto src = vfs::PdfRemoteSource::open(b.path, &err);
+    if (!src) {
+        log_warn("pdf source open failed: " + err + " (" + b.path + ")");
+        return 0;
+    }
+    return pdf_src_put(std::move(src));
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativePdfSourceSize(JNIEnv*, jobject, jlong handle) {
+    auto h = pdf_src_get(handle);
+    return h ? (jlong)h->src->size() : -1;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativePdfSourceRead(
+    JNIEnv* env, jobject, jlong handle, jlong off, jbyteArray dst, jint len) {
+    if (!dst || len <= 0 || off < 0) return -1;
+    const jsize cap = env->GetArrayLength(dst);
+    if (len > cap) return -1;
+    auto h = pdf_src_get(handle);
+    if (!h) return -1;
+    const uint64_t total = h->src->size();
+    if ((uint64_t)off >= total) return 0;  // EOF: a short read is not an error
+    const jint want =
+        (jint)std::min<uint64_t>((uint64_t)len, total - (uint64_t)off);
+    std::vector<uint8_t> tmp((size_t)want);
+    if (!h->src->pread((uint64_t)off, tmp.data(), (size_t)want)) return -1;
+    env->SetByteArrayRegion(dst, 0, want, reinterpret_cast<const jbyte*>(tmp.data()));
+    return want;
+}
+
+JNIEXPORT void JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativePdfSourceClose(JNIEnv*, jobject, jlong handle) {
+    std::lock_guard<std::mutex> lk(g_pdf_src_mtx);
+    g_pdf_srcs.erase(handle);
+}
+
+JNIEXPORT void JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativeSetBookPages(JNIEnv*, jobject, jlong book_id,
+                                                            jint pages) {
+    if (pages <= 0) return;
+    std::lock_guard<std::mutex> lk(g_bridge_mtx);
+    if (g_core.lib) g_core.lib->set_page_count(book_id, (int)pages);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativePutCover(JNIEnv* env, jobject, jlong book_id,
+                                                        jint w, jint h, jintArray argb) {
+    if (!argb || w <= 0 || h <= 0) return JNI_FALSE;
+    const jsize n = env->GetArrayLength(argb);
+    if (n < (jsize)w * (jsize)h) return JNI_FALSE;
+    std::vector<jint> px((size_t)w * (size_t)h);
+    env->GetIntArrayRegion(argb, 0, (jsize)px.size(), px.data());
+    ImageRGBA img;
+    img.w = w;
+    img.h = h;
+    img.pixels.resize((size_t)w * (size_t)h * 4);
+    for (size_t i = 0; i < px.size(); ++i) {
+        const uint32_t c = (uint32_t)px[i];
+        img.pixels[i * 4 + 0] = (uint8_t)((c >> 16) & 0xFF);
+        img.pixels[i * 4 + 1] = (uint8_t)((c >> 8) & 0xFF);
+        img.pixels[i * 4 + 2] = (uint8_t)(c & 0xFF);
+        img.pixels[i * 4 + 3] = (uint8_t)((c >> 24) & 0xFF);
+    }
+    std::lock_guard<std::mutex> lk(g_bridge_mtx);
+    if (!g_core.lib) return JNI_FALSE;
+    return g_core.lib->put_cover(book_id, img) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_comicshelf_app_core_NativeBridge_nativeReaderClose(JNIEnv*, jobject, jlong book_id) {
     std::lock_guard<std::mutex> lk(g_bridge_mtx);
     g_readers.erase(book_id);
+}
+
+// ---------------------------------------------------------------- EPUB text
+JNIEXPORT jobjectArray JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativeEpubOpen(JNIEnv* env, jobject, jlong book_id) {
+    std::lock_guard<std::mutex> lk(g_bridge_mtx);
+    if (!g_core.lib) return nullptr;
+    Book b = find_book(book_id);
+    if (b.id == 0) {
+        log_warn("epub open: book " + std::to_string((long long)book_id) + " not found");
+        return nullptr;
+    }
+    std::string err;
+    std::shared_ptr<IArchive> arch(g_core.lib->open_book(b, &err));
+    if (!arch) {
+        log_warn("epub open failed: " + err + " (" + b.path + ")");
+        return nullptr;
+    }
+    std::vector<uint8_t> container, opf;
+    if (!arch->read_named("META-INF/container.xml", container)) {
+        log_warn("epub open: no container.xml (" + b.path + ")");
+        return nullptr;
+    }
+    std::string opf_path;
+    if (!epub_rootfile_from_container(container, &opf_path) ||
+        !arch->read_named(opf_path, opf)) {
+        log_warn("epub open: no readable opf (" + b.path + ")");
+        return nullptr;
+    }
+    const auto slash = opf_path.find_last_of('/');
+    const std::string opf_dir =
+        slash == std::string::npos ? std::string() : opf_path.substr(0, slash);
+    std::string entries;
+    for (const auto& n : arch->entry_names()) {
+        entries += n;
+        entries.push_back('\n');
+    }
+    auto sess = std::make_shared<EpubSession>();
+    sess->arch = std::move(arch);
+    sess->opf_path = opf_path;
+    g_epubs.clear();
+    g_epubs[book_id] = std::move(sess);
+    log_info("epub open ok: " + b.path + " opf=" + opf_path);
+    return to_string_array(env, {std::string((const char*)opf.data(), opf.size()), opf_dir,
+                                 entries});
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativeEpubReadHref(JNIEnv* env, jobject, jlong book_id,
+                                                             jstring href) {
+    std::shared_ptr<EpubSession> s;
+    {
+        std::lock_guard<std::mutex> lk(g_bridge_mtx);
+        const auto it = g_epubs.find(book_id);
+        if (it == g_epubs.end()) return nullptr;
+        s = it->second;
+    }
+    const std::string name = to_std(env, href);
+    std::vector<uint8_t> bytes;
+    if (!s->arch->read_named(name, bytes) || bytes.empty()) return nullptr;
+    return to_byte_array(env, bytes);
+}
+
+JNIEXPORT void JNICALL
+Java_com_comicshelf_app_core_NativeBridge_nativeEpubClose(JNIEnv*, jobject, jlong book_id) {
+    std::lock_guard<std::mutex> lk(g_bridge_mtx);
+    g_epubs.erase(book_id);
 }
 
 // 后台整本翻译专用读取通道（BookTranslateJob）：**独立于 UI 的单本阅读器会话**

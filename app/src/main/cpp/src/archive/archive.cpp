@@ -1,4 +1,5 @@
 #include "archive/archive.h"
+#include "archive/archive_epub.h"
 
 #include "util/logger.h"
 #include "util/path_util.h"
@@ -142,38 +143,39 @@ std::unique_ptr<IArchive> make_folder_archive_impl(const std::shared_ptr<vfs::Vf
 // ---- SMB 上的 RAR：整档落缓存后再本地打开 ----------------------------------
 // （RAR 是顺序格式，UnRAR 需要真实文件句柄；压缩包封面/翻页都在上层缓存，
 //   下载只发生在首次打开。）
-bool fetch_to_cache(const std::shared_ptr<vfs::Vfs>& vfs, const std::string& rel,
-                    std::string* err, std::string* out_local) {
+bool fetch_to_cache_ext(const std::shared_ptr<vfs::Vfs>& vfs, const std::string& rel,
+                        const std::string& suffix, const std::string& label,
+                        std::string* err, std::string* out_local) {
     std::string dir;
     {
         std::lock_guard<std::mutex> g(g_cache_mtx);
         dir = g_cache_dir;
     }
     if (dir.empty()) {
-        if (err) *err = "SMB 上的 RAR 需要缓存目录（未初始化）";
+        if (err) *err = "SMB 上的 " + label + " 需要缓存目录（未初始化）";
         return false;
     }
     vfs::FileStat st;
     if (!vfs->stat(rel, &st) || !st.is_file) {
-        if (err) *err = "RAR 不存在: " + vfs->full_path(rel);
+        if (err) *err = label + " 不存在: " + vfs->full_path(rel);
         return false;
     }
     std::error_code ec;
     std::filesystem::create_directories(paths::from_utf8(dir), ec);
     const std::string base =
         std::to_string(paths::fnv1a64(vfs->full_path(rel))) + "-" + std::to_string(st.size);
-    const std::string local = dir + "/" + base + ".rar";
+    const std::string local = dir + "/" + base + suffix;
     if (std::filesystem::is_regular_file(paths::from_utf8(local), ec) &&
         (uint64_t)std::filesystem::file_size(paths::from_utf8(local), ec) == st.size) {
         *out_local = local;
         return true;
     }
 
-    log_info("smb: 下载 RAR 到缓存 " + vfs->full_path(rel) + " (" +
+    log_info("smb: 下载 " + label + " 到缓存 " + vfs->full_path(rel) + " (" +
              std::to_string(st.size / 1024 / 1024) + " MB)");
     auto f = vfs->open(rel);
     if (!f) {
-        if (err) *err = "RAR 打开失败: " + vfs->full_path(rel);
+        if (err) *err = label + " 打开失败: " + vfs->full_path(rel);
         return false;
     }
     const std::string tmp = local + ".part";
@@ -197,7 +199,7 @@ bool fetch_to_cache(const std::shared_ptr<vfs::Vfs>& vfs, const std::string& rel
             out.write(reinterpret_cast<const char*>(buf.data()), r);
             done += (uint64_t)r;
             if (done >= next_log) {
-                log_info("smb: RAR 缓存 " + std::to_string(done / 1024 / 1024) + " MB");
+                log_info("smb: " + label + " 缓存 " + std::to_string(done / 1024 / 1024) + " MB");
                 next_log += 32ull << 20;
             }
         }
@@ -218,7 +220,31 @@ bool fetch_to_cache(const std::shared_ptr<vfs::Vfs>& vfs, const std::string& rel
     return true;
 }
 
+bool fetch_to_cache(const std::shared_ptr<vfs::Vfs>& vfs, const std::string& rel,
+                    std::string* err, std::string* out_local) {
+    return fetch_to_cache_ext(vfs, rel, ".rar", "RAR", err, out_local);
+}
+
 } // namespace
+
+bool materialize_local(const std::string& utf8_path, std::string* err,
+                       std::string* out_local) {
+    std::string rel, verr;
+    auto vfs = vfs::vfs_for_path(utf8_path, &rel, &verr);
+    if (!vfs) {
+        if (err) *err = verr;
+        return false;
+    }
+    if (vfs->scheme() != "smb") {
+        if (out_local) *out_local = utf8_path;
+        return true;
+    }
+    if (!out_local) {
+        if (err) *err = "materialize_local: out_local is null";
+        return false;
+    }
+    return fetch_to_cache_ext(vfs, rel, ".pdf", "PDF", err, out_local);
+}
 
 void set_archive_cache_dir(const std::string& utf8_dir) {
     std::lock_guard<std::mutex> g(g_cache_mtx);
@@ -240,6 +266,7 @@ std::unique_ptr<IArchive> open_archive_path(const std::string& utf8_path, std::s
     if (st.is_dir) return make_folder_archive_impl(vfs, rel, err);
 
     const std::string ext = paths::lower_ext(paths::from_utf8(utf8_path));
+    if (paths::is_epub_ext(ext)) return make_epub_archive(vfs, rel, err);
     if (paths::is_zip_ext(ext)) return make_zip_archive(vfs, rel, err);
     if (paths::is_rar_ext(ext)) {
 #if defined(CS_HAS_RAR) && CS_HAS_RAR

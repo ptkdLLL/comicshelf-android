@@ -21,6 +21,8 @@ bool is_image_ext(const std::string& ext);
 bool is_zip_ext(const std::string& ext);
 bool is_rar_ext(const std::string& ext);
 bool is_archive_ext(const std::string& ext);
+bool is_pdf_ext(const std::string& ext);
+bool is_epub_ext(const std::string& ext);
 
 // Stable 64-bit FNV-1a hash, used for cache keys.
 uint64_t fnv1a64(const std::string& data);

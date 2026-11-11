@@ -88,7 +88,15 @@ bool is_rar_ext(const std::string& ext) {
 }
 
 bool is_archive_ext(const std::string& ext) {
-    return is_zip_ext(ext) || is_rar_ext(ext);
+    return is_zip_ext(ext) || is_rar_ext(ext) || is_epub_ext(ext);
+}
+
+bool is_pdf_ext(const std::string& ext) {
+    return ext == "pdf";
+}
+
+bool is_epub_ext(const std::string& ext) {
+    return ext == "epub";
 }
 
 uint64_t fnv1a64(const std::string& data) {

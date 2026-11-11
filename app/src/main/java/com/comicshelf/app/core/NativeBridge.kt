@@ -125,12 +125,40 @@ object NativeBridge {
     fun setBookTags(bookId: Long, tagsJson: String) = nativeSetBookTags(bookId, tagsJson)
     fun deleteTag(name: String): Boolean = nativeDeleteTag(name)
 
+    // ---- PDF / book metadata ----------------------------------------------
+    /** Full UTF-8 path (local or smb://), null when the id is unknown. */
+    fun bookPath(bookId: Long): String? = nativeBookPath(bookId)
+    /** [pages, lastPage, kind] or null */
+    fun bookMeta(bookId: Long): IntArray? = nativeBookMeta(bookId)
+    /** Seekable local path; SMB books are downloaded to the archive cache on first use. */
+    fun materializeBook(bookId: Long): String? = nativeMaterializeBook(bookId)
+    fun setBookPageCount(bookId: Long, pages: Int) = nativeSetBookPages(bookId, pages)
+    /** Injects an externally rendered cover (ARGB pixels). */
+    fun putCover(bookId: Long, w: Int, h: Int, argb: IntArray): Boolean =
+        nativePutCover(bookId, w, h, argb)
+
+    // ---- PDF random-access source (ProxyFileDescriptor) -------------------
+    /** Opens a native ByteSource for a PDF; 0 on failure. */
+    fun pdfSourceOpen(bookId: Long): Long = nativePdfSourceOpen(bookId)
+    fun pdfSourceSize(handle: Long): Long = nativePdfSourceSize(handle)
+    /** Reads into dst; returns bytes read (0 = EOF) or -1 on error. */
+    fun pdfSourceRead(handle: Long, off: Long, dst: ByteArray, len: Int): Int =
+        nativePdfSourceRead(handle, off, dst, len)
+    fun pdfSourceClose(handle: Long) = nativePdfSourceClose(handle)
+
     // ---- reader -----------------------------------------------------------
     /** [pageCount, lastPage, kind] or null */
     fun readerOpen(bookId: Long): IntArray? = nativeReaderOpen(bookId)
     fun readerClose(bookId: Long) = nativeReaderClose(bookId)
     fun readPage(bookId: Long, index: Int): ByteArray? = nativeReadPage(bookId, index)
     fun pageCount(bookId: Long): Int = nativePageCount(bookId)
+
+    // ---- EPUB text ---------------------------------------------------------
+    /** [opfXml, opfDir, entryNamesJoined] or null. Opens a random-access ZIP session. */
+    fun epubOpen(bookId: Long): Array<String>? = nativeEpubOpen(bookId)
+    /** Reads any ZIP entry (OPF/XHTML/image) by its resolved path. */
+    fun epubRead(bookId: Long, href: String): ByteArray? = nativeEpubReadHref(bookId, href)
+    fun epubClose(bookId: Long) = nativeEpubClose(bookId)
     /** Object[2]: int[2] {w,h}, byte[] rgba — C++ decode fallback */
     fun decodePageRGBA(bytes: ByteArray, maxDim: Int): Array<Any?>? =
         nativeDecodePageRGBA(bytes, maxDim)
@@ -295,10 +323,22 @@ object NativeBridge {
     private external fun nativeBookTags(bookId: Long): String
     private external fun nativeSetBookTags(bookId: Long, tagsJson: String)
     private external fun nativeDeleteTag(name: String): Boolean
+    private external fun nativeBookPath(bookId: Long): String?
+    private external fun nativeBookMeta(bookId: Long): IntArray?
+    private external fun nativeMaterializeBook(bookId: Long): String?
+    private external fun nativeSetBookPages(bookId: Long, pages: Int)
+    private external fun nativePutCover(bookId: Long, w: Int, h: Int, argb: IntArray): Boolean
+    private external fun nativePdfSourceOpen(bookId: Long): Long
+    private external fun nativePdfSourceSize(handle: Long): Long
+    private external fun nativePdfSourceRead(handle: Long, off: Long, dst: ByteArray, len: Int): Int
+    private external fun nativePdfSourceClose(handle: Long)
     private external fun nativeReaderOpen(bookId: Long): IntArray?
     private external fun nativeReaderClose(bookId: Long)
     private external fun nativeReadPage(bookId: Long, index: Int): ByteArray?
     private external fun nativePageCount(bookId: Long): Int
+    private external fun nativeEpubOpen(bookId: Long): Array<String>?
+    private external fun nativeEpubReadHref(bookId: Long, href: String): ByteArray?
+    private external fun nativeEpubClose(bookId: Long)
     private external fun nativeDecodePageRGBA(bytes: ByteArray, maxDim: Int): Array<Any?>?
     private external fun nativeTranslateConfigure(url: String?, src: String?, dst: String?,
                                                    fwd: Int, back: Int, cacheMb: Int,

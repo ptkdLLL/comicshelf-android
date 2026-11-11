@@ -17,6 +17,8 @@ import com.comicshelf.app.reader.BookTranslateJob
 import com.comicshelf.app.core.Json
 import com.comicshelf.app.core.LibraryRow
 import com.comicshelf.app.core.NativeBridge
+import com.comicshelf.app.core.PdfBookSource
+import com.comicshelf.app.core.PdfMetaService
 import com.comicshelf.app.core.SmbCreds
 import com.comicshelf.app.core.parsePageBundle
 import kotlinx.coroutines.delay
@@ -24,6 +26,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
@@ -109,6 +112,7 @@ class ShelfPagingSource(private val q: ShelfQuery) : PagingSource<Long, BookCell
         }
 }
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class ShelfViewModel : ViewModel() {
 
     // ---- libraries ---------------------------------------------------------
@@ -120,19 +124,23 @@ class ShelfViewModel : ViewModel() {
         ShelfQuery(0, "", ShelfSort.ADDED, true, "", true, false, -1))
     val queryVersion = MutableStateFlow(0)   // bumped to invalidate the pager
 
-    val books: Flow<PagingData<BookCell>> = query.flatMapLatest { q ->
-        Pager(PagingConfig(
-            pageSize = 120,
-            initialLoadSize = 240,
-            prefetchDistance = 48,
-            // 滚动条跳转（S-1/S-2）：placeholders 让 itemCount=全库数（LoadResult.Page
-            // 携带 itemsBefore/After），配合 jumpingSupported/jumpThreshold 实现
-            // "丢弃中间页、直载目标窗"；maxSize 上界防跳来跳去时已加载页无限积累。
-            enablePlaceholders = true,
-            maxSize = 2048,
-            jumpThreshold = 240,
-        )) { ShelfPagingSource(q) }.flow
-    }.cachedIn(viewModelScope)
+    // queryVersion is a real invalidation signal (scan completion / read return /
+    // badge changes). The old flow ignored it, so newly scanned books and page
+    // counts only appeared after switching libraries or restarting.
+    val books: Flow<PagingData<BookCell>> =
+        combine(query, queryVersion) { q, _ -> q }.flatMapLatest { q ->
+            Pager(PagingConfig(
+                pageSize = 120,
+                initialLoadSize = 240,
+                prefetchDistance = 48,
+                // 滚动条跳转（S-1/S-2）：placeholders 让 itemCount=全库数（LoadResult.Page
+                // 携带 itemsBefore/After），配合 jumpingSupported/jumpThreshold 实现
+                // "丢弃中间页、直载目标窗"；maxSize 上界防跳来跳去时已加载页无限积累。
+                enablePlaceholders = true,
+                maxSize = 2048,
+                jumpThreshold = 240,
+            )) { ShelfPagingSource(q) }.flow
+        }.cachedIn(viewModelScope)
 
     // ---- scan progress -----------------------------------------------------
     private val _scan = MutableStateFlow<ScanProgressRow?>(null)
@@ -356,6 +364,8 @@ class ShelfViewModel : ViewModel() {
 
     fun rescan(id: Long = query.value.libId) {
         if (id <= 0) return
+        PdfBookSource.invalidateAllFlags()
+        PdfMetaService.invalidateAll()
         viewModelScope.launch(CoreDispatcher) { NativeBridge.scanStart(id) }
     }
 
@@ -425,12 +435,17 @@ class ShelfViewModel : ViewModel() {
     }
 
     fun deleteBooks(ids: List<Long>) = viewModelScope.launch(CoreDispatcher) {
-        ids.forEach { NativeBridge.deleteBook(it) }
+        ids.forEach {
+            PdfBookSource.invalidateFlags(it)
+            PdfMetaService.invalidate(it)
+            NativeBridge.deleteBook(it)
+        }
         queryVersion.value++
         refreshLibraries()
     }
 
     fun regenerateCover(id: Long) = viewModelScope.launch(CoreDispatcher) {
+        PdfMetaService.invalidate(id)
         NativeBridge.forgetCover(id)
     }
 

@@ -56,13 +56,32 @@ object PageDecoder {
      * 替代旧 targetDim+12MP 双判据——READER_FLICKER_FIX_PLAN v2 P-R3）。
      * Returns null when the page cannot be read at all.
      */
-    suspend fun decode(bookId: Long, page: Int, maxBytes: Long): Bitmap? =
+    suspend fun decode(bookId: Long, page: Int, maxBytes: Long,
+                       foreground: Boolean = false): Bitmap? =
         withContext(Dispatchers.IO) {
+            // PDF：直接按页预算栅格化，不做“编码→再解码”中转。
+            // foreground = 当前可见页；PDF 队列用它压过邻页预取。
+            if (PdfBookSource.isOpen(bookId)) {
+                return@withContext PdfBookSource.render(bookId, page, maxBytes, foreground)
+            }
             val bytes = readPage(bookId, page) ?: return@withContext null
             // P3（动图）：页级标记——探测纯读头零分配（静态页 ns 级，实测零影响）；
             // 首帧仍走下方原路径（渲染侧以本标记决定是否另解动画）。
             if (PageAnim.isAnimated(bytes)) animPages.add(animKey(bookId, page))
             decodeBytes(bookId, page, bytes,
+                        { tryDecodePlatformCapped(it, maxBytes) },
+                        nativeEdgeForCap(maxBytes))
+        }
+
+    /**
+     * EPUB text reader: decode an arbitrary ZIP entry image (cover/illustration)
+     * with the same platform/native fallback and byte budget as page images.
+     * bookId/page are 0 only for logging; no reader session is involved.
+     */
+    suspend fun decodeImageBytes(bytes: ByteArray, maxBytes: Long): Bitmap? =
+        withContext(Dispatchers.IO) {
+            if (bytes.isEmpty()) return@withContext null
+            decodeBytes(0L, 0, bytes,
                         { tryDecodePlatformCapped(it, maxBytes) },
                         nativeEdgeForCap(maxBytes))
         }
@@ -98,6 +117,10 @@ object PageDecoder {
      */
     suspend fun decodeJob(bookId: Long, page: Int, targetDim: Int): Bitmap? =
         withContext(Dispatchers.IO) {
+            // PDF：独立 PdfRenderer 会话（UI 可能已关书/换书）。
+            if (PdfBookSource.isPdfBook(bookId)) {
+                return@withContext PdfBookSource.renderJob(bookId, page, targetDim)
+            }
             val bytes = NativeBridge.jobReadPage(bookId, page) ?: return@withContext null
             decodeBytes(bookId, page, bytes,
                         { tryDecodePlatform(it, targetDim) }, targetDim)

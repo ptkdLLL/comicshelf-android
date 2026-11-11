@@ -188,8 +188,33 @@ void LibraryManager::set_thumb_resample(Resample r) {
     ThumbnailCache::set_variant(v);
 }
 
+bool LibraryManager::put_cover(int64_t book_id, const ImageRGBA& img) {
+    if (img.empty()) return false;
+    Book b;
+    if (!db_.get_book(book_id, b)) return false;
+    const std::string key = ThumbnailCache::make_key(b);
+    thumbs_.store(key, img, 85);
+    db_.update_cover(b.id, key);
+    {
+        std::lock_guard<std::mutex> lk(state_mtx_);
+        auto& e = cover_state_[key];
+        e.state = CoverState::Ready;
+        e.permanent = false;
+        e.stamp_ms = now_ms();
+    }
+    return true;
+}
+
 LibraryManager::CoverGenResult LibraryManager::generate_cover(const Book& b, ImageRGBA& out) const {
     CoverGenResult r;
+    // PDF is rendered by the Kotlin PdfMetaService (PdfRenderer + random-access
+    // ProxyFD). Do not touch SMB here: the old path only produced a permanent
+    // "unsupported container" failure after one useless stat per book.
+    if (b.kind == BookKind::Pdf) {
+        r.reason = "pdf managed by app";
+        r.permanent = true;
+        return r;
+    }
     std::string err;
     auto arch = open_archive_path(b.path, &err);
     if (!arch) {
@@ -397,6 +422,7 @@ void LibraryManager::warm_covers(int64_t lib_id, int max_books) {
     auto rows = db_.page_books(lib_id, "", SortKey::Added, false, 0, max_books);
     std::lock_guard<std::mutex> lk(state_mtx_);
     for (const auto& b : rows) {
+        if (b.kind == BookKind::Pdf) continue;  // Kotlin PdfMetaService owns PDF covers
         const std::string key = ThumbnailCache::make_key(b);
         auto it = cover_state_.find(key);
         if (it != cover_state_.end()) {
@@ -442,6 +468,10 @@ void LibraryManager::set_read_state(int64_t book_id, int read_state) {
 
 void LibraryManager::save_progress(int64_t book_id, int page) {
     db_.set_progress(book_id, page);
+}
+
+bool LibraryManager::set_page_count(int64_t book_id, int pages) {
+    return db_.update_pages(book_id, pages);
 }
 
 bool LibraryManager::delete_book(int64_t book_id) {
@@ -499,7 +529,8 @@ int LibraryManager::index_pages(const Book& b) {
     std::string err;
     auto arch = open_archive_path(b.path, &err);
     if (!arch) return 0;
-    int n = (int)arch->count();
+    // ZIP/RAR/folder = image entries; EPUB = OPF spine (not cover/image count).
+    const int n = arch->page_count();
     db_.update_pages(b.id, n);
     return n;
 }

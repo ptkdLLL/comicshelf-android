@@ -15,6 +15,8 @@ enum ScanMode : int {
 enum class BookKind : int {
     Archive = 0, // .zip / .cbz / .rar / .cbr
     Folder = 1,  // a directory that directly contains image files
+    Pdf = 2,     // .pdf rendered on demand by PdfRenderer
+    Epub = 3,    // .epub (image-only or text; read by EpubReaderScreen)
 };
 
 // A single row of the `books` table. Kept small on purpose: it is copied a lot.
