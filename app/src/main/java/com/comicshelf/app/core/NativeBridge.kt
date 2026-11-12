@@ -128,7 +128,7 @@ object NativeBridge {
     // ---- PDF / book metadata ----------------------------------------------
     /** Full UTF-8 path (local or smb://), null when the id is unknown. */
     fun bookPath(bookId: Long): String? = nativeBookPath(bookId)
-    /** [pages, lastPage, kind] or null */
+    /** [pages, lastPage, kind, readState] or null；readState: 0=未读,1=在读,2=读完 */
     fun bookMeta(bookId: Long): IntArray? = nativeBookMeta(bookId)
     /** Seekable local path; SMB books are downloaded to the archive cache on first use. */
     fun materializeBook(bookId: Long): String? = nativeMaterializeBook(bookId)

@@ -15,8 +15,8 @@ android {
         applicationId = "com.comicshelf.app"
         minSdk = 30
         targetSdk = 36
-        versionCode = 32
-        versionName = "0.5.18-epubpdf-android"
+        versionCode = 33
+        versionName = "0.5.19-shelfpos-android"
 
         externalNativeBuild {
             cmake {

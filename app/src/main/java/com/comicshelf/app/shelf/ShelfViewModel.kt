@@ -180,8 +180,39 @@ class ShelfViewModel : ViewModel() {
     fun scrollRestored(): Boolean = queryKey() in scrollRestoredKeys
     fun markScrollRestored() { scrollRestoredKeys.add(queryKey()) }
 
-    /** 读完书回到书架：刷新一下阅读徽标/页数（滚动位置由 gridState 保持）。 */
-    fun refreshAfterRead() { queryVersion.value++ }
+    // ---- 读书返回：单本读状态/进度 patch（不重建 Pager）-------------------
+    // 普通浏览查询返回时保持 gridState/scrollMemory；内容/查询失效仍走 queryVersion。
+    private val _readPatches = MutableStateFlow<Map<Long, ReadPatch>>(emptyMap())
+    internal val readPatches: StateFlow<Map<Long, ReadPatch>> = _readPatches.asStateFlow()
+
+    /**
+     * 读完书回到书架：普通查询只 patch 这一本，不重建 Pager；读依赖查询保留 0.5.18 回退。
+     * 读状态/进度在 closeBook 后由 nativeSaveProgress 写入，CoreDispatcher 单线程 FIFO
+     * 保证这里的 bookMeta 读到新值。
+     */
+    fun refreshAfterRead(bookId: Long) {
+        if (bookId <= 0L) return
+        val q = query.value
+        val readDependent = q.readState != -1 || q.history ||
+            q.sort == ShelfSort.LAST_READ || q.sort == ShelfSort.PAGES
+        if (readDependent) {
+            queryVersion.value++                  // 成员/顺序会变：保留 0.5.18 重载
+            return
+        }
+        val startVersion = queryVersion.value
+        viewModelScope.launch(CoreDispatcher) {
+            // JNI 失败/异常：静默降级为“不 patch”，不崩溃、不阻塞 UI
+            val meta = runCatching { NativeBridge.bookMeta(bookId) }.getOrNull() ?: return@launch
+            if (meta.size < 4) return@launch
+            if (queryVersion.value != startVersion) return@launch  // 期间有内容/查询变更
+            val patch = ReadPatch(meta[0], meta[1], meta[3], startVersion)
+            val next = LinkedHashMap(_readPatches.value)
+            next.remove(bookId)
+            next[bookId] = patch
+            while (next.size > 128) next.remove(next.keys.first())
+            _readPatches.value = next
+        }
+    }
 
     init {
         refreshLibraries()

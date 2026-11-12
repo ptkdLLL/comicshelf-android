@@ -917,14 +917,14 @@ Java_com_comicshelf_app_core_NativeBridge_nativeBookPath(JNIEnv* env, jobject, j
     return from_std(env, b.path);
 }
 
-// int[3] {pages, lastPage, kind}
+// int[4] {pages, lastPage, kind, readState}
 JNIEXPORT jintArray JNICALL
 Java_com_comicshelf_app_core_NativeBridge_nativeBookMeta(JNIEnv* env, jobject, jlong book_id) {
     std::lock_guard<std::mutex> lk(g_bridge_mtx);
     if (!g_core.lib) return nullptr;
     Book b = find_book(book_id);
     if (b.id == 0) return nullptr;
-    std::vector<int> v{b.pages, b.last_page, (int)b.kind};
+    std::vector<int> v{b.pages, b.last_page, (int)b.kind, b.read_state};
     return to_int_array(env, v);
 }
 

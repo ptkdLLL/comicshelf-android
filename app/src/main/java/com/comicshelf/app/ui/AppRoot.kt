@@ -50,9 +50,11 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
     // 系统返回键（手势/三键）与界面返回按钮走同一条路径（此前系统返回无人处理，
     // 阅读器/设置里按返回会直接退到桌面）。书架主屏不拦截：保持"退出应用"的默认行为。
     val closeReader: () -> Unit = {
+        // closeBook 末尾会重置 open；先捕获当前书 id（失败/未打开=0）
+        val st = readerVm.open.value
         readerVm.closeBook()
-        // 刷新阅读徽标/页数；书架滚动位置由 VM 里的 gridState 保持
-        shelfVm.refreshAfterRead()
+        // 刷新阅读徽标/页数；普通查询只 patch 这一本，不重建 Pager
+        shelfVm.refreshAfterRead(st.bookId)
         // 来源是标签检索页时：等量刷新其已加载行的阅读徽标（滚动位/模式由该页 VM 状态保持）
         if (readerOrigin is Screen.EhTags) ehTagVm.refreshLoadedRows()
         screen = readerOrigin

@@ -165,6 +165,8 @@ fun ShelfScreen(
     val scan by vm.scan.collectAsState()
     val items = vm.books.collectAsLazyPagingItems()
     val gridState = vm.gridState
+    val readPatches by vm.readPatches.collectAsState()
+    val queryVersion by vm.queryVersion.collectAsState()
 
     // ---- S-4 双通道低清门控（封面风暴止血；两通道隔离）----
     // 通道 A（直接滚格）：手指拖着滚 = 看内容，不抑制；松手后的惯性甩动 = 内容飞掠，抑制。
@@ -532,7 +534,9 @@ fun ShelfScreen(
                             count = items.itemCount,
                             key = items.itemKey { it.id },
                         ) { idx ->
-                            val cell = items[idx]
+                            val cell = items[idx]?.let { raw ->
+                                patchedCell(raw, readPatches[raw.id], queryVersion)
+                            }
                             if (cell == null) {
                                 // 占位格（目标窗未到，S-1/S-3）：骨架底色，跳转落点不空白
                                 Box(Modifier.padding(4.dp)) {
