@@ -48,7 +48,7 @@ import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(onBack: () -> Unit) {
+fun SettingsScreen(onBack: () -> Unit, onOrientationChanged: (AppOrientation) -> Unit) {
     val scope = rememberCoroutineScope()
     var selftestReport by remember { mutableStateOf<String?>(null) }
     var selftestScale by remember { mutableStateOf("200000") }
@@ -70,6 +70,19 @@ fun SettingsScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp),
         ) {
+            SettingsSection("显示") {
+                var orientation by remember { mutableStateOf(AppOrientation.load()) }
+                SettingsChoice(
+                    title = "应用屏幕方向",
+                    options = AppOrientation.entries.map { it to it.label },
+                    selected = orientation,
+                    onSelect = {
+                        it.save()
+                        orientation = it
+                        onOrientationChanged(it)
+                    },
+                )
+            }
             SettingsSection("离线翻译（本机 NPU）") {
                 OfflineOcrSection()
             }
