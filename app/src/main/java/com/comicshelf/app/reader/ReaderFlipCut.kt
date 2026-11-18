@@ -1,7 +1,6 @@
 package com.comicshelf.app.reader
 
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.pager.PagerState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
 import kotlin.math.abs
@@ -27,8 +26,8 @@ internal fun Modifier.cutFlipWhenOff(
     pageAnim: Boolean,
     vertical: Boolean,
     rtl: Boolean,
-    vm: ReaderViewModel,
-): Modifier = this.pointerInput(pageAnim, vertical, rtl) {
+    onTurn: (Int) -> Unit,
+): Modifier = this.pointerInput(pageAnim, vertical, rtl, onTurn) {
     if (pageAnim) return@pointerInput
     var total = 0f
     var t0 = 0L
@@ -46,8 +45,7 @@ internal fun Modifier.cutFlipWhenOff(
             val axisPx = if (vertical) size.height else size.width
             if (shouldFlipByDrag(total, axisPx, dur)) {
                 val advance = if (vertical) total < 0f else if (rtl) total > 0f else total < 0f
-                // 实时读页号（pointerInput 键不含 open，防陈旧闭包）
-                vm.goto(vm.open.value.page + if (advance) 1 else -1)
+                onTurn(if (advance) 1 else -1)
             }
             // 未过阈值：画面完全不动（cut 语义）
         },

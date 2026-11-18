@@ -62,6 +62,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -109,7 +110,7 @@ import kotlinx.coroutines.flow.map
  *  * translated overlay swaps in when the engine reports READY.
  */
 @Composable
-fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
+internal fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit, pageKeys: ReaderPageKeys?) {
     var showTrEnable by remember { mutableStateOf(false) }
     var showTrMenu by remember { mutableStateOf(false) }
     val open by vm.open.collectAsState()
@@ -120,6 +121,7 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
     var rotation by remember { mutableIntStateOf(0) }
     var showBookmarks by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    val activePageKeys = pageKeys.takeUnless { showTrEnable || showTrMenu || showBookmarks || showSettings }
 
     val bg = when (prefs.bg) {
         1 -> Color.White
@@ -170,14 +172,14 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
                 )
             }
         } else if (open.isEpub && open.pageCount > 0) {
-            EpubReaderScreen(vm, open)
+            EpubReaderScreen(vm, open, activePageKeys)
         } else if (open.pageCount > 0) {
             // 四容器分派（P-V3）：方向 × 连续——独立成项；页项/同步语义与 pager 同构
             if (mode.scroll) {
-                ReaderScrollView(vm, open, mode, splitOn, prefs.fit, rotation,
+                ReaderScrollView(vm, open, mode, splitOn, prefs.fit, rotation, activePageKeys,
                                  onToggleChrome = { chrome = !chrome })
             } else {
-                ReaderPager(vm, open, mode, splitOn, prefs.fit, rotation, prefs.spread,
+                ReaderPager(vm, open, mode, splitOn, prefs.fit, rotation, prefs.spread, activePageKeys,
                             onToggleChrome = { chrome = !chrome })
             }
         } else {
@@ -255,6 +257,7 @@ private fun ReaderPager(
     fit: Int,
     rotation: Int,
     spread: Boolean,
+    pageKeys: ReaderPageKeys?,
     onToggleChrome: () -> Unit,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -268,13 +271,20 @@ private fun ReaderPager(
         val step = if (spread && landscape) 2 else 1
         val pageCount = open.pageCount
         val pageCountEff = if (step == 2) (pageCount + 1) / 2 else pageCount
-        val pager = rememberPagerState(
-            initialPage = open.page / step,
-            initialPageOffsetFraction = 0f,
-        ) { pageCountEff }
+        // Rotation can change the number of pages per slot. Anchor on the
+        // visible book page rather than reusing a slot index from another layout.
+        val pager = key(open.bookId, step) {
+            rememberPagerState(initialPage = open.page / step) { pageCountEff }
+        }
         // v3（§10）：翻页动画开关——组合可见态，驱动 userScrollEnabled 与切页手势层
         val readerPrefs by vm.prefs.collectAsState()
         val pageAnim = readerPrefs.pageAnim
+        ReaderPagerPageKeyEffect(pageKeys, pager, vm)
+        val onTurn: (Int) -> Unit = remember(pager) {
+            { delta ->
+                pageTurnTarget(pager.currentPage, pager.pageCount, delta)?.let { vm.goto(it * step) }
+            }
+        }
 
         // v0.6.0：预算快照一次/进入阅读器（availMem 漂移不重启解码，评估 G7）；
         // cap 只随 step（双页/旋转）变化（P-R3 v2：min(48MB, BUDGET÷瞬时最大窗口页数)）。
@@ -288,15 +298,14 @@ private fun ReaderPager(
         // Sync external goto -> pager & persist progress.
         // v0.3.4 的"落定必加载"真空修复由"组合项在=解码协程在"结构性接管（评估 G4/G8），
         // 落定分支不再补发 ensurePage。
-        LaunchedEffect(pager.currentPage, pager.isScrollInProgress) {
+        LaunchedEffect(pager, pager.currentPage, pager.isScrollInProgress) {
             if (!pager.isScrollInProgress) {
-                val page = pager.currentPage * step
-                if (page != vm.open.value.page) {
-                    vm.goto(page)
+                if (pager.currentPage != vm.open.value.page / step) {
+                    vm.goto(pager.currentPage * step)
                 }
             }
         }
-        LaunchedEffect(open.page) {
+        LaunchedEffect(pager, open.page) {
             val idx = open.page / step
             if (idx != pager.currentPage && !pager.isScrollInProgress) {
                 // 动画开关（全局键 reader_page_anim）：关 = 瞬间切页；读值于决策时刻实时取
@@ -311,10 +320,10 @@ private fun ReaderPager(
             val isCurrentItem = pager.currentPage == idx   // P-R5：项作用域读取，只重组该项
             Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center) {
                 ZoomablePage(vm, open, first, splitOn, fit, rotation, rtl, vertical, capBytes,
-                             isCurrentItem, onToggleChrome, Modifier.weight(1f))
+                             isCurrentItem, onTurn, onToggleChrome, Modifier.weight(1f))
                 if (step == 2 && first + 1 < pageCount) {
                     ZoomablePage(vm, open, first + 1, splitOn, fit, rotation, rtl, vertical, capBytes,
-                                 isCurrentItem, onToggleChrome, Modifier.weight(1f))
+                                 isCurrentItem, onTurn, onToggleChrome, Modifier.weight(1f))
                 }
             }
         }
@@ -324,7 +333,7 @@ private fun ReaderPager(
                 beyondViewportPageCount = 2,   // 同上：组合即预取
                 userScrollEnabled = pageAnim,  // v3：关 = 禁用内建跟手/惯性/吸附
                 modifier = Modifier.fillMaxSize()
-                    .cutFlipWhenOff(pageAnim, vertical, rtl, vm),
+                    .cutFlipWhenOff(pageAnim, vertical, rtl, onTurn),
             ) { idx -> pageContent(idx) }
         } else {
             HorizontalPager(
@@ -333,7 +342,7 @@ private fun ReaderPager(
                 beyondViewportPageCount = 2,   // compose neighbors => decode prefetch（大页模式由准入收紧，组合仍保留）
                 userScrollEnabled = pageAnim,  // v3：关 = 禁用内建跟手/惯性/吸附
                 modifier = Modifier.fillMaxSize()
-                    .cutFlipWhenOff(pageAnim, vertical, rtl, vm),
+                    .cutFlipWhenOff(pageAnim, vertical, rtl, onTurn),
             ) { idx -> pageContent(idx) }
         }
     }
@@ -355,6 +364,7 @@ private fun ZoomablePage(
     vertical: Boolean,
     capBytes: Long,
     isCurrent: Boolean,
+    onTurn: (Int) -> Unit,
     onToggleChrome: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -457,22 +467,22 @@ private fun ZoomablePage(
                     } while (event.changes.any { it.pressed })
                 }
             }
-            .pointerInput(page, splitOn, rtl, vertical, fit, rotation) {
+            .pointerInput(page, splitOn, rtl, vertical, fit, rotation, onTurn) {
                 detectTapGestures(
                     onTap = { pos ->
                         if (vertical) {
                             // 竖直轴：上/下 1/3 = 上/下一页（起点侧=上一页，P-V5）
                             val third = size.height / 3f
                             when {
-                                pos.y < third -> vm.goto(open.page - 1)
-                                pos.y > 2 * third -> vm.goto(open.page + 1)
+                                pos.y < third -> onTurn(-1)
+                                pos.y > 2 * third -> onTurn(1)
                                 else -> onToggleChrome()
                             }
                         } else {
                             val third = size.width / 3f
                             when {
-                                pos.x < third -> if (rtl) vm.goto(open.page + 1) else vm.goto(open.page - 1)
-                                pos.x > 2 * third -> if (rtl) vm.goto(open.page - 1) else vm.goto(open.page + 1)
+                                pos.x < third -> onTurn(if (rtl) 1 else -1)
+                                pos.x > 2 * third -> onTurn(if (rtl) -1 else 1)
                                 else -> onToggleChrome()
                             }
                         }

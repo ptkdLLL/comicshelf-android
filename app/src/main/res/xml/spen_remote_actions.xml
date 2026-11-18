@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<remote-actions version="1.2">
+    <action
+        id="next_page"
+        label="@string/spen_next_page"
+        priority="1"
+        trigger_key="F9">
+        <preference name="gesture" value="click" />
+    </action>
+    <action
+        id="previous_page"
+        label="@string/spen_previous_page"
+        priority="2"
+        trigger_key="F10">
+        <preference name="gesture" value="double_click" />
+    </action>
+</remote-actions>

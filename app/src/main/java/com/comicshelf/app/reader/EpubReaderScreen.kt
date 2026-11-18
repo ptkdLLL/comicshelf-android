@@ -39,8 +39,9 @@ import com.comicshelf.app.core.EpubBookSource.Page
  * ReaderViewModel.goto (the same page domain as the pager).
  */
 @Composable
-internal fun EpubReaderScreen(vm: ReaderViewModel, open: ReaderOpenState) {
+internal fun EpubReaderScreen(vm: ReaderViewModel, open: ReaderOpenState, pageKeys: ReaderPageKeys?) {
     val list = rememberLazyListState(initialFirstVisibleItemIndex = open.page)
+    ReaderListPageKeyEffect(pageKeys, list, vm)
 
     // Same double-guard as ReaderScrollView: settle writes, external jumps scroll.
     LaunchedEffect(list.firstVisibleItemIndex, list.isScrollInProgress) {

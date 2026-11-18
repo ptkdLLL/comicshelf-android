@@ -18,6 +18,7 @@ import com.comicshelf.app.ehmeta.EhEngine
 import com.comicshelf.app.ehmeta.EhPhase
 import com.comicshelf.app.ehmeta.EhTagScreen
 import com.comicshelf.app.ehmeta.EhTagViewModel
+import com.comicshelf.app.reader.ReaderPageKeys
 import com.comicshelf.app.reader.ReaderScreen
 import com.comicshelf.app.reader.ReaderViewModel
 import com.comicshelf.app.settings.SettingsScreen
@@ -33,7 +34,10 @@ sealed class Screen {
 }
 
 @Composable
-fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
+internal fun AppRoot(
+    onOpenAllFilesAccess: () -> Unit,
+    readerPageKeys: ReaderPageKeys,
+) {
     var screen by remember { mutableStateOf<Screen>(Screen.Shelf) }
     // 打开阅读器的来源（关闭时回到这里；仅两个赋值点：书架 / 标签检索页）
     var readerOrigin by remember { mutableStateOf<Screen>(Screen.Shelf) }
@@ -117,6 +121,7 @@ fun AppRoot(onOpenAllFilesAccess: () -> Unit) {
                 ReaderScreen(
                     vm = readerVm,
                     onBack = closeReader,
+                    pageKeys = readerPageKeys.takeIf { s == current && opened.bookId == s.bookId },
                 )
             }
             is Screen.Settings -> SettingsScreen(

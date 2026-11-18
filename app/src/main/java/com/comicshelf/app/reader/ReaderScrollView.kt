@@ -73,6 +73,7 @@ internal fun ReaderScrollView(
     splitOn: Boolean,
     fit: Int,
     rotation: Int,
+    pageKeys: ReaderPageKeys?,
     onToggleChrome: () -> Unit,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -90,6 +91,7 @@ internal fun ReaderScrollView(
         val capBytes = remember(budget) { PageBudget.perPageCap(budget, PageBudget.windowPages(1)) }
 
         val list = rememberLazyListState(initialFirstVisibleItemIndex = open.page)
+        ReaderListPageKeyEffect(pageKeys, list, vm)
 
         // 落定回写（守卫结构与 pager 同构）：settle 才 goto（persist），防环
         LaunchedEffect(list.firstVisibleItemIndex, list.isScrollInProgress) {
