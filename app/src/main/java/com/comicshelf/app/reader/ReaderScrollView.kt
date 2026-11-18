@@ -23,7 +23,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -45,13 +44,11 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.async
@@ -144,11 +141,9 @@ internal fun ReaderScrollView(
                 items(open.pageCount) { v -> itemContent(v) }
             }
         } else {
-            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                LazyRow(state = list, reverseLayout = rtl,
-                        modifier = Modifier.fillMaxSize().then(tapMod)) {
-                    items(open.pageCount) { v -> itemContent(v) }
-                }
+            LazyRow(state = list, reverseLayout = rtl,
+                    modifier = Modifier.fillMaxSize().then(tapMod)) {
+                items(open.pageCount) { v -> itemContent(v) }
             }
         }
     }

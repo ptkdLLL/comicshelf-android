@@ -8,10 +8,10 @@ import org.junit.Test
 class ReaderModeTest {
 
     @Test
-    fun defaultsToLeftToRightUnlessMigratingLegacyRtl() {
-        assertEquals(ReaderMode.DIR_L2R, ReaderMode.resolveDefaultDir(-1, legacyRtl = false))
+    fun keepsUpstreamTopToBottomDefaultUnlessMigratingLegacyRtl() {
+        assertEquals(ReaderMode.DIR_T2B, ReaderMode.resolveDefaultDir(-1, legacyRtl = false))
         assertEquals(ReaderMode.DIR_R2L, ReaderMode.resolveDefaultDir(-1, legacyRtl = true))
-        assertEquals(ReaderMode.DIR_L2R, ReaderMode.resolveDefaultDir(3, legacyRtl = false))
+        assertEquals(ReaderMode.DIR_T2B, ReaderMode.resolveDefaultDir(3, legacyRtl = false))
     }
 
     @Test

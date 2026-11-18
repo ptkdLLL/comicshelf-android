@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -59,7 +58,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -87,13 +85,11 @@ import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.comicshelf.app.core.BookmarkRow
@@ -194,8 +190,9 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
 
         if (chrome) {
             ReaderTopBar(
-                title = open.title, onBack = onBack, vm = vm,
-                onRotate = if (open.isEpub) null else ({ rotation = (rotation + 90) % 360 }),
+                title = open.title, onBack = onBack, prefs = prefs, vm = vm,
+                rotation = rotation,
+                onRotate = { rotation = (rotation + 90) % 360 },
                 onBookmarks = { showBookmarks = true },
                 onSettings = { showSettings = true },
                 onTranslate = {
@@ -312,16 +309,12 @@ private fun ReaderPager(
         val pageContent: @Composable (Int) -> Unit = { idx ->
             val first = idx * step
             val isCurrentItem = pager.currentPage == idx   // P-R5：项作用域读取，只重组该项
-            // Pager reversal orders the spreads; the two pages within each spread must agree.
-            val spreadDirection = if (rtl) LayoutDirection.Rtl else LayoutDirection.Ltr
-            CompositionLocalProvider(LocalLayoutDirection provides spreadDirection) {
-                Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center) {
-                    ZoomablePage(vm, open, first, splitOn, fit, rotation, rtl, vertical, capBytes,
+            Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center) {
+                ZoomablePage(vm, open, first, splitOn, fit, rotation, rtl, vertical, capBytes,
+                             isCurrentItem, onToggleChrome, Modifier.weight(1f))
+                if (step == 2 && first + 1 < pageCount) {
+                    ZoomablePage(vm, open, first + 1, splitOn, fit, rotation, rtl, vertical, capBytes,
                                  isCurrentItem, onToggleChrome, Modifier.weight(1f))
-                    if (step == 2 && first + 1 < pageCount) {
-                        ZoomablePage(vm, open, first + 1, splitOn, fit, rotation, rtl, vertical, capBytes,
-                                     isCurrentItem, onToggleChrome, Modifier.weight(1f))
-                    }
                 }
             }
         }
@@ -334,16 +327,14 @@ private fun ReaderPager(
                     .cutFlipWhenOff(pageAnim, vertical, rtl, vm),
             ) { idx -> pageContent(idx) }
         } else {
-            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                HorizontalPager(
-                    state = pager,
-                    reverseLayout = rtl,
-                    beyondViewportPageCount = 2,   // compose neighbors => decode prefetch（大页模式由准入收紧，组合仍保留）
-                    userScrollEnabled = pageAnim,  // v3：关 = 禁用内建跟手/惯性/吸附
-                    modifier = Modifier.fillMaxSize()
-                        .cutFlipWhenOff(pageAnim, vertical, rtl, vm),
-                ) { idx -> pageContent(idx) }
-            }
+            HorizontalPager(
+                state = pager,
+                reverseLayout = rtl,
+                beyondViewportPageCount = 2,   // compose neighbors => decode prefetch（大页模式由准入收紧，组合仍保留）
+                userScrollEnabled = pageAnim,  // v3：关 = 禁用内建跟手/惯性/吸附
+                modifier = Modifier.fillMaxSize()
+                    .cutFlipWhenOff(pageAnim, vertical, rtl, vm),
+            ) { idx -> pageContent(idx) }
         }
     }
 }
@@ -645,8 +636,10 @@ internal fun hasPanRoom(ns: Float, vw: Float, vh: Float, iw: Int, ih: Int, mode:
 private fun ReaderTopBar(
     title: String,
     onBack: () -> Unit,
+    prefs: ReaderPrefs,
     vm: ReaderViewModel,
-    onRotate: (() -> Unit)?,
+    rotation: Int,
+    onRotate: () -> Unit,
     onBookmarks: () -> Unit,
     onSettings: () -> Unit,
     onTranslate: () -> Unit,
@@ -680,10 +673,8 @@ private fun ReaderTopBar(
                     )
                 }
             }
-            if (onRotate != null) {
-                IconButton(onClick = onRotate) {
-                    Icon(Icons.Filled.RotateRight, "旋转页面", tint = Color.White)
-                }
+            IconButton(onClick = onRotate) {
+                Icon(Icons.Filled.RotateRight, "旋转", tint = Color.White)
             }
             IconButton(onClick = onBookmarks) {
                 Icon(Icons.Filled.BookmarkBorder, "书签", tint = Color.White)
@@ -733,87 +724,110 @@ private fun retranslateGuarded(vm: ReaderViewModel, ctx: Context) {
 private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
     val open by vm.open.collectAsState()
     val prefs by vm.prefs.collectAsState()
-    val mode by vm.mode.collectAsState()
-    val splitOn by vm.splitOn.collectAsState()
     val ctx = LocalContext.current
-    var defaultDirection by remember { mutableIntStateOf(ReaderMode.defaultDirection()) }
-    val hasBook = open.pageCount > 0
-
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("阅读设置") },
         text = {
+            // B1：设置项增多/横屏矮屏——内容可滚动（根因修复）；指示条仅内容溢出时渲染
             val scroll = rememberScrollState()
             Box {
                 Column(Modifier.verticalScroll(scroll)) {
-                    ReaderSettingRow("本册方向") {
-                        ReaderMode.directionOptions.forEach { (dir, label) ->
-                            TextButton(enabled = hasBook, onClick = { vm.setDir(dir) }) {
-                                Text(if (hasBook && mode.dir == dir) "●$label" else label)
-                            }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("适配", Modifier.width(64.dp))
+                    listOf(0 to "整页", 1 to "宽度", 2 to "高度", 3 to "原始").forEach { (k, label) ->
+                        TextButton(onClick = { vm.setPrefs(prefs.copy(fit = k)) }) {
+                            Text(if (prefs.fit == k) "●$label" else label,
+                                 color = if (prefs.fit == k) MaterialTheme.colorScheme.primary
+                                 else MaterialTheme.colorScheme.onSurface)
                         }
                     }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("背景", Modifier.width(64.dp))
+                    listOf(0 to "黑", 1 to "白", 2 to "灰").forEach { (k, label) ->
+                        TextButton(onClick = { vm.setPrefs(prefs.copy(bg = k)) }) {
+                            Text(if (prefs.bg == k) "●$label" else label)
+                        }
+                    }
+                }
+                // 本册方向优先；清除覆盖后继续跟随应用设置中的默认方向。
+                val mode by vm.mode.collectAsState()
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("本册方向", Modifier.width(64.dp))
+                    ReaderMode.directionOptions.forEach { (k, label) ->
+                        TextButton(enabled = open.pageCount > 0, onClick = { vm.setDir(k) }) {
+                            Text(if (mode.dir == k) "●$label" else label,
+                                 color = if (mode.dir == k) MaterialTheme.colorScheme.primary
+                                 else MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
+                if (open.pageCount > 0) {
                     Row(Modifier.padding(start = 64.dp), verticalAlignment = Alignment.CenterVertically) {
-                        if (!hasBook) {
-                            Text("打开后可设置", style = MaterialTheme.typography.bodySmall)
-                        } else if (mode.followsDefaultDirection) {
+                        if (mode.followsDefaultDirection) {
                             Text("跟随默认方向", style = MaterialTheme.typography.bodySmall)
                         } else {
                             TextButton(onClick = { vm.setDir(null) }) { Text("跟随默认") }
-                            val isDefault = mode.dir == defaultDirection
-                            TextButton(enabled = !isDefault, onClick = {
-                                ReaderMode.saveDefaultDirection(mode.dir)
-                                defaultDirection = mode.dir
-                            }) { Text(if (isDefault) "已是默认" else "设为默认") }
                         }
                     }
-                    if (open.isEpub) {
-                        if (!mode.vertical) {
-                            Text(
-                                "横向按节翻页，节内可上下滚动。",
-                                modifier = Modifier.padding(start = 64.dp, top = 8.dp, bottom = 8.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                    } else {
-                        ReaderSettingRow("适配") {
-                            listOf("整页", "宽度", "高度", "原始").forEachIndexed { fit, label ->
-                                TextButton(onClick = { vm.setPrefs(prefs.copy(fit = fit)) }) {
-                                    Text(if (prefs.fit == fit) "●$label" else label)
-                                }
-                            }
-                        }
-                        ReaderSettingRow("连续滚动") {
-                            ReaderToggleButtons(mode.scroll, vm::setScroll, enabled = hasBook)
-                        }
-                        ReaderSettingRow("双页") {
-                            if (mode.scroll) {
-                                Text("关闭连续滚动后可用", style = MaterialTheme.typography.bodySmall)
-                            } else {
-                                TextButton(onClick = { vm.setPrefs(prefs.copy(spread = !prefs.spread)) }) {
-                                    Text(if (prefs.spread) "●开（横屏生效）" else "关（横屏生效）")
-                                }
-                            }
-                        }
-                        ReaderSettingRow("切分阅读") {
-                            ReaderToggleButtons(splitOn, vm::setSplit, enabled = hasBook)
-                        }
-                        ReaderSettingRow("翻页动画") {
-                            ReaderToggleButtons(prefs.pageAnim, { vm.setPrefs(prefs.copy(pageAnim = it)) })
-                        }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("双页", Modifier.width(64.dp))
+                    TextButton(onClick = { vm.setPrefs(prefs.copy(spread = !prefs.spread)) }) {
+                        Text(if (prefs.spread) "●开" else "关（横屏生效）")
                     }
-                    ReaderSettingRow("背景") {
-                        listOf("黑", "白", "灰").forEachIndexed { bg, label ->
-                            TextButton(onClick = { vm.setPrefs(prefs.copy(bg = bg)) }) {
-                                Text(if (prefs.bg == bg) "●$label" else label)
-                            }
-                        }
+                }
+                // 切分阅读（P-S7）：每册记忆的手动开关；开 = 每页按正中切成两半逐半显示。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("切分阅读", Modifier.width(64.dp))
+                    val splitOn by vm.splitOn.collectAsState()
+                    TextButton(onClick = { vm.setSplit(false) }) {
+                        Text(if (!splitOn) "●关" else "关",
+                             color = if (!splitOn) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
                     }
-                    if (open.translateEnabled) {
-                        ReaderSettingRow("翻译") {
-                            TextButton(onClick = { retranslateGuarded(vm, ctx) }) { Text("重译当前页") }
-                        }
+                    TextButton(onClick = { vm.setSplit(true) }) {
+                        Text(if (splitOn) "●开" else "开",
+                             color = if (splitOn) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
                     }
+                }
+                // 连续滚动（P-V2）：每册记忆的手动开关；开 = 该"方向"变为连续滚动（瀑布流）。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("连续滚动", Modifier.width(64.dp))
+                    TextButton(onClick = { vm.setScroll(false) }) {
+                        Text(if (!mode.scroll) "●关" else "关",
+                             color = if (!mode.scroll) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                    TextButton(onClick = { vm.setScroll(true) }) {
+                        Text(if (mode.scroll) "●开" else "开",
+                             color = if (mode.scroll) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                }
+                // 翻页动画（全局键 reader_page_anim）：关 = 全部翻页方式瞬时（点按/滑块/书签 + 滑动 cut）。
+                // 行形制与 切分阅读/连续滚动 对齐（双按钮 ●关/●开）——v4 对齐修正。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("翻页动画", Modifier.width(64.dp))
+                    TextButton(onClick = { vm.setPrefs(prefs.copy(pageAnim = false)) }) {
+                        Text(if (!prefs.pageAnim) "●关" else "关",
+                             color = if (!prefs.pageAnim) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                    TextButton(onClick = { vm.setPrefs(prefs.copy(pageAnim = true)) }) {
+                        Text(if (prefs.pageAnim) "●开" else "开",
+                             color = if (prefs.pageAnim) MaterialTheme.colorScheme.primary
+                             else MaterialTheme.colorScheme.onSurface)
+                    }
+                }
+                if (open.translateEnabled) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("翻译", Modifier.width(64.dp))
+                        TextButton(onClick = { retranslateGuarded(vm, ctx) }) { Text("重译当前页") }
+                    }
+                }
                 }
                 SettingsScrollIndicator(
                     state = scroll,
@@ -823,24 +837,6 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
     )
-}
-
-@Composable
-private fun ReaderSettingRow(label: String, content: @Composable RowScope.() -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.width(64.dp))
-        content()
-    }
-}
-
-@Composable
-private fun ReaderToggleButtons(value: Boolean, onChange: (Boolean) -> Unit, enabled: Boolean = true) {
-    TextButton(enabled = enabled, onClick = { onChange(false) }) {
-        Text(if (!value) "●关" else "关")
-    }
-    TextButton(enabled = enabled, onClick = { onChange(true) }) {
-        Text(if (value) "●开" else "开")
-    }
 }
 
 /** 指示条几何（纯函数，单测锁定）：内容不足一屏返回 (0,0)=不显示；top 恒 0（纵向位置由组件按滚动比例算）。 */

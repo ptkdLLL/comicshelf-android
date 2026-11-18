@@ -7,7 +7,7 @@ import com.comicshelf.app.core.CsSettings
  *
  * 方向 dir = 0 左→右 / 1 右→左 / 2 上→下；连续 scroll = 关/开。
  * 按册记忆：`reader_dir_<bookId>`；连续滚动为全局键 `reader_scroll`（v0.5.13 起）。
- * 方向优先级：本册设置 → 全局默认方向 → 旧全局 RTL → 左→右。连续缺省仍为开。
+ * 方向优先级：本册设置 → 全局默认方向 → 旧全局 RTL → 上→下。连续缺省仍为开。
  */
 data class ReaderMode(
     val dir: Int = DIR_L2R,
@@ -33,7 +33,7 @@ data class ReaderMode(
         private fun isDirection(value: Int) = value in DIR_L2R..DIR_T2B
 
         internal fun resolveDefaultDir(key: Int, legacyRtl: Boolean): Int =
-            if (isDirection(key)) key else if (legacyRtl) DIR_R2L else DIR_L2R
+            if (isDirection(key)) key else if (legacyRtl) DIR_R2L else DIR_T2B
 
         fun defaultDirection(): Int = resolveDefaultDir(
             CsSettings.int(DEFAULT_DIR_KEY, UNSPECIFIED_DIR),
