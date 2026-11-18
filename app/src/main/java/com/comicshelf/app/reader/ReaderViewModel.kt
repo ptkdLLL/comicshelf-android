@@ -30,7 +30,6 @@ import kotlinx.coroutines.withContext
 /** Reader chrome state persisted via config.ini, like the Windows app. */
 data class ReaderPrefs(
     val fit: Int = 0,          // 0 page, 1 width, 2 height, 3 original
-    val rtl: Boolean = false,
     val spread: Boolean = false,
     val bg: Int = 0,           // 0 black, 1 white, 2 gray
     val pageAnim: Boolean = true,   // 翻页动画（全局键 reader_page_anim；缺省=开=现行为）
@@ -215,13 +214,11 @@ class ReaderViewModel : ViewModel() {
             pageDims.clear()   // 尺寸缓存同样不跨书（P-V7）
             prefs.value = ReaderPrefs(
                 fit = CsSettings.int("reader_fit", 0),
-                rtl = CsSettings.bool("reader_rtl", false),
                 spread = CsSettings.bool("reader_spread", false),
                 bg = CsSettings.int("reader_bg", 0),
                 pageAnim = CsSettings.bool("reader_page_anim", true),
             )
-            // P-V1：方向/连续按册解析（方向缺键回退旧全局 rtl——迁移语义，P-V9）
-            _mode.value = ReaderMode.load(bookId, prefs.value.rtl)
+            _mode.value = ReaderMode.load(bookId)
             // P-S1：切分开关按册读取；EPUB 无页位图，切分无意义。
             val split = !isEpub && CsSettings.bool("reader_split_$bookId", false)
             _splitOn.value = split
@@ -386,13 +383,15 @@ class ReaderViewModel : ViewModel() {
     // ---------------------------------------------------------------- continuous scroll
 
     /** 方向切换（P-V7：本册记忆，改即存；锚定 open.page——显示页域两模式同域，无重映射）。 */
-    fun setDir(dir: Int) {
+    fun setDir(dir: Int?) {
         val st = open.value
-        if (st.bookId == 0L || dir !in ReaderMode.DIR_L2R..ReaderMode.DIR_T2B) return
-        if (_mode.value.dir == dir) return
-        CsSettings.setInt("reader_dir_${st.bookId}", dir)
-        CsSettings.save()
-        _mode.value = _mode.value.copy(dir = dir)
+        if (st.bookId == 0L) return
+        val mode = _mode.value
+        val followsDefault = dir == null
+        val effectiveDir = dir ?: ReaderMode.defaultDirection()
+        if (mode.dir == effectiveDir && mode.followsDefaultDirection == followsDefault) return
+        ReaderMode.saveBookDirection(st.bookId, dir)
+        _mode.value = mode.copy(dir = effectiveDir, followsDefaultDirection = followsDefault)
     }
 
     /** 连续滚动开关（全局：任意书改一次，处处生效；锚定 open.page）。 */
@@ -665,7 +664,6 @@ class ReaderViewModel : ViewModel() {
     fun setPrefs(p: ReaderPrefs) {
         prefs.value = p
         CsSettings.setInt("reader_fit", p.fit)
-        CsSettings.setBool("reader_rtl", p.rtl)
         CsSettings.setBool("reader_spread", p.spread)
         CsSettings.setInt("reader_bg", p.bg)
         CsSettings.setBool("reader_page_anim", p.pageAnim)
