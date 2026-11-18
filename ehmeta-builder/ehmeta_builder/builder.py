@@ -14,6 +14,7 @@ import hashlib
 import json
 import mmap
 import os
+from pathlib import Path
 import re
 import sqlite3
 import time
@@ -51,7 +52,8 @@ def clean_zh(s):
 
 def load_zh(path, log):
     """→ (zh, mixed_names, other_names, sha)。（原 build_ehmeta.py:73-89）"""
-    data = json.loads(open(path, encoding="utf-8").read())
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
     zh = {}
     mixed_names, other_names = set(), set()
     for item in data["data"]:
@@ -373,10 +375,12 @@ CREATE TABLE replaced(old_gid INTEGER PRIMARY KEY, current_gid INTEGER);
 
     # ---------------- [3/6] eh_lite.db（历史标题别名） ----------------
     st_e = dict(rec=0, titles=0)
-    if use_ehdb and os.path.isfile(S("sources/ehdb/eh_lite.db")):
+    eh_lite = S("sources/ehdb/eh_lite.db")
+    included_ehdb = use_ehdb and os.path.isfile(eh_lite)
+    if included_ehdb:
         P("[3/6] eh_lite.db 2019 快照（历史标题别名）…")
         t0 = time.time()
-        src = sqlite3.connect(f"file:{S('sources/ehdb/eh_lite.db')}?mode=ro", uri=True)
+        src = sqlite3.connect(Path(eh_lite).resolve().as_uri() + "?mode=ro", uri=True)
         b = Batch(conn, "INSERT OR IGNORE INTO gallery(gid,token,category,posted,rating,filesize,expunged) "
                         "VALUES(?,?,?,?,?,?,0)")
         lim = f" LIMIT {limit}" if limit else ""
@@ -390,7 +394,8 @@ CREATE TABLE replaced(old_gid INTEGER PRIMARY KEY, current_gid INTEGER);
         st_e["titles"] = b.cnt_t
         P(f"      记录 {st_e['rec']:,} | 标题行 {st_e['titles']:,} | {time.time() - t0:.0f}s")
     else:
-        P("[3/6] eh_lite.db 跳过（可选源缺失）——标题别名将略少")
+        reason = "可选源缺失" if use_ehdb else "未选用早期标题别名"
+        P(f"[3/6] eh_lite.db 跳过（{reason}）——标题别名将略少")
 
     # ---------------- [4/6] bogey_csv（历史标题别名） ----------------
     P("[4/6] bogey_csv 2023-07 快照（历史标题别名）…")
@@ -444,7 +449,7 @@ CREATE INDEX ix_tag_ns_name ON tag(ns,name);
     conn.commit()
     P("      索引完成，开始 VACUUM INTO …")
     t0 = time.time()
-    conn.execute(f"VACUUM INTO '{DB}'")
+    conn.execute("VACUUM INTO ?", (DB,))
     conn.close()
     P(f"      VACUUM {time.time() - t0:.0f}s → {DB}")
 
@@ -469,7 +474,7 @@ CREATE INDEX ix_tag_ns_name ON tag(ns,name);
         "sources": {
             "hwei": {"version": versions.get("hwei", ""), "records": st_h["rec"], "edges": st_h["edges"]},
             "bogey_raw": {"records": st_b["rec"], "edges": st_b["edges"]},
-            "eh_lite": {"records": st_e["rec"], "role": "alias-only" if use_ehdb else "skipped"},
+            "eh_lite": {"records": st_e["rec"], "role": "alias-only" if included_ehdb else "skipped"},
             "bogey_csv": {"records": st_c["rec"], "role": "alias-only"},
             "ehtagtranslation": {"sha": ehtag_sha, "version": versions.get("ehtag", ""), "zh": len(zh)},
         },

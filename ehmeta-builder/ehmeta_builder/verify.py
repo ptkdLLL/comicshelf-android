@@ -7,6 +7,7 @@ from __future__ import annotations
 注意：金标准只在"同一批源"下有约束力；上游换期后计数会合法变化——对账命令显式传入
 `--golden` 时才作一致性断言（用于移植对账/回归），日常构建只报告计数。
 """
+from pathlib import Path
 import sqlite3
 
 GOLDEN_COUNTS = {
@@ -28,7 +29,7 @@ SENTINELS = (9, 1478328)
 
 
 def verify(db_path: str, *, log=print, limit: int = 0, golden: bool = False) -> dict:
-    v = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    v = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
 
     def one(sql):
         return v.execute(sql).fetchone()[0]

@@ -87,15 +87,16 @@ def github_latest(repo: str, proxy: str | None) -> tuple[str, dict]:
 # ---------------------------------------------------------------- 下载
 
 def fetch_url(url: str, dest: str, *, proxy=None, expected_size=0,
-              progress=None, resume=True, timeout=60, log=None) -> tuple[int, str]:
-    """下载到 dest（.part 中转 + 校验后改名）。progress(done, total)。→ (size, sha256)。"""
+              expected_sha256="", progress=None, resume=True, timeout=60,
+              log=None) -> tuple[int, str]:
+    """下载到 dest（.part 通过体积和 SHA 校验后才替换缓存）。→ (size, sha256)。"""
     os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
     part = dest + ".part"
     done = 0
     if resume and os.path.isfile(part):
         done = os.path.getsize(part)
-    if os.path.isfile(dest) and expected_size and os.path.getsize(dest) == expected_size:
-        return os.path.getsize(dest), sha256_file(dest)   # 已就位（调用方另有版本判断）
+        if expected_size and done >= expected_size:
+            done = 0
 
     headers = {"User-Agent": UA}
     mode = "wb"
@@ -128,6 +129,9 @@ def fetch_url(url: str, dest: str, *, proxy=None, expected_size=0,
     if expected_size and size != expected_size:
         raise IOError(f"体积不符：{size} != {expected_size}（{os.path.basename(dest)}，.part 保留可续传）")
     sha = sha256_file(part)
+    if expected_sha256 and sha != expected_sha256:
+        os.remove(part)
+        raise IOError(f"sha256 不符：{sha} != {expected_sha256}（{os.path.basename(dest)}）")
     os.replace(part, dest)
     return size, sha
 
@@ -176,22 +180,22 @@ def check_source(s: Source, workdir: str, proxy: str | None, manifest: dict, log
 
 
 def ensure_source(s: Source, workdir: str, proxy: str | None, manifest: dict,
-                  log=print, progress=None, force=False) -> bool:
-    """确保源已缓存且校验通过。→ True=已就位（含新下载），False=可选源跳过。"""
+                  log=print, progress=None, force=False, allow_download=True) -> bool:
+    """优先使用就绪的缓存。禁用下载且没有可用缓存时返回 False。"""
     local = os.path.join(workdir, s.local_rel)
-    if not force and os.path.isfile(local):
+    if (not force or not allow_download) and os.path.isfile(local):
         if s.size and os.path.getsize(local) == s.size:
             log(f"  [{s.key}] 已缓存（{os.path.getsize(local):,}B）")
             return True
         if not s.size:   # 动态源：靠 manifest 版本判定在 check_source 里做
             log(f"  [{s.key}] 已缓存（{os.path.getsize(local):,}B）")
             return True
-    if s.optional and not os.path.isfile(local):
-        log(f"  [{s.key}] 可选源未缓存 —— 跳过（{s.label}）")
+    if not allow_download:
+        log(f"  [{s.key}] 没有可用缓存 —— 跳过（--skip-optional）")
         return False
 
     st = check_source(s, workdir, proxy, manifest, log=log)
-    if not st["changed"] and os.path.isfile(local):
+    if not force and not st["changed"] and os.path.isfile(local):
         log(f"  [{s.key}] 已是最新（{st['version']}）")
         return True
 
@@ -202,16 +206,15 @@ def ensure_source(s: Source, workdir: str, proxy: str | None, manifest: dict,
         try:
             size, sha = fetch_url(st["url"], local, proxy=proxy,
                                   expected_size=st["size"] if s.size else 0,
+                                  expected_sha256=s.sha256,
                                   progress=(lambda d, t: progress(s.key, d, t)) if progress else None,
                                   log=log)
-            if s.sha256 and sha != s.sha256:
-                raise IOError(f"[{s.key}] sha256 不符：{sha} != {s.sha256}")
             break
         except Exception as e:
+            if s.optional and isinstance(e, urllib.error.HTTPError) and e.code in (402, 403):
+                raise
             last_err = e
             size, sha = None, None
-            if "sha256 不符" in str(e) and os.path.isfile(local):
-                os.remove(local)      # 同尺寸损坏（罕见）：清掉坏文件重下
             log(f"  [{s.key}] 第 {attempt}/3 次失败：{type(e).__name__}: {e}")
             if attempt < 3:
                 log("  3s 后重试（自动续传）…")
