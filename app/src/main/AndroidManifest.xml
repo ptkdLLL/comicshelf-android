@@ -32,6 +32,10 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Honor the user's app orientation choice on Android 16 tablets. -->
+            <property
+                android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY"
+                android:value="true" />
         </activity>
 
         <!-- The QNN HTP user-space driver links against the vendor fastrpc
