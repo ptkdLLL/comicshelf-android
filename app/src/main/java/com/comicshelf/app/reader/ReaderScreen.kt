@@ -170,7 +170,7 @@ fun ReaderScreen(vm: ReaderViewModel, onBack: () -> Unit) {
                 )
             }
         } else if (open.isEpub && open.pageCount > 0) {
-            EpubReaderScreen(vm, open)
+            EpubReaderScreen(vm, open, mode, prefs)
         } else if (open.pageCount > 0) {
             // 四容器分派（P-V3）：方向 × 连续——独立成项；页项/同步语义与 pager 同构
             if (mode.scroll) {
@@ -722,6 +722,7 @@ private fun retranslateGuarded(vm: ReaderViewModel, ctx: Context) {
 
 @Composable
 private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
+    val open by vm.open.collectAsState()
     val prefs by vm.prefs.collectAsState()
     val ctx = LocalContext.current
     AlertDialog(
@@ -750,15 +751,24 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                         }
                     }
                 }
-                // 方向（P-V2）：三档按册记忆；只管"阅读推进方向"，朝向由旋转按钮决定、与设置无关。
+                // 本册方向优先；清除覆盖后继续跟随应用设置中的默认方向。
                 val mode by vm.mode.collectAsState()
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("方向", Modifier.width(64.dp))
-                    listOf(0 to "左→右", 1 to "右→左", 2 to "上→下").forEach { (k, label) ->
-                        TextButton(onClick = { vm.setDir(k) }) {
+                    Text("本册方向", Modifier.width(64.dp))
+                    ReaderMode.directionOptions.forEach { (k, label) ->
+                        TextButton(enabled = open.pageCount > 0, onClick = { vm.setDir(k) }) {
                             Text(if (mode.dir == k) "●$label" else label,
                                  color = if (mode.dir == k) MaterialTheme.colorScheme.primary
                                  else MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
+                if (open.pageCount > 0) {
+                    Row(Modifier.padding(start = 64.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (mode.followsDefaultDirection) {
+                            Text("跟随默认方向", style = MaterialTheme.typography.bodySmall)
+                        } else {
+                            TextButton(onClick = { vm.setDir(null) }) { Text("跟随默认") }
                         }
                     }
                 }
@@ -812,7 +822,6 @@ private fun ReaderSettingsDialog(vm: ReaderViewModel, onDismiss: () -> Unit) {
                              else MaterialTheme.colorScheme.onSurface)
                     }
                 }
-                val open by vm.open.collectAsState()
                 if (open.translateEnabled) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("翻译", Modifier.width(64.dp))

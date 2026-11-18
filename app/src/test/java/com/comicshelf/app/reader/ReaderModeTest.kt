@@ -5,43 +5,43 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** ReaderMode 纯函数单测（READER_VERTICAL_SCROLL_PLAN P-V10a：缺键回退/映射）。 */
 class ReaderModeTest {
 
     @Test
-    fun defaultVerticalExceptLegacyRtl() {
-        // 缺键（-1）：旧全局 rtl=true → 右→左（迁移保留）；否则 → 上→下（新默认，2026-10-11）
-        assertEquals(ReaderMode.DIR_T2B, ReaderMode.resolveDirKey(-1, legacyRtl = false))
-        assertEquals(ReaderMode.DIR_R2L, ReaderMode.resolveDirKey(-1, legacyRtl = true))
+    fun keepsUpstreamTopToBottomDefaultUnlessMigratingLegacyRtl() {
+        assertEquals(ReaderMode.DIR_T2B, ReaderMode.resolveDefaultDir(-1, legacyRtl = false))
+        assertEquals(ReaderMode.DIR_R2L, ReaderMode.resolveDefaultDir(-1, legacyRtl = true))
+        assertEquals(ReaderMode.DIR_T2B, ReaderMode.resolveDefaultDir(3, legacyRtl = false))
     }
 
     @Test
-    fun defaultTruthTableExhaustive() {
-        // P-D5：默认真值表穷举（把"缺省"收口为单点；未来再改默认时这里必红）
-        for (rtl in booleanArrayOf(false, true)) {
-            for (k in -2..3) {
-                val expect = when {
-                    k in ReaderMode.DIR_L2R..ReaderMode.DIR_T2B -> k
-                    rtl -> ReaderMode.DIR_R2L
-                    else -> ReaderMode.DIR_T2B
-                }
-                assertEquals("k=$k rtl=$rtl", expect, ReaderMode.resolveDirKey(k, rtl))
+    fun explicitGlobalDefaultWinsOverLegacyRtl() {
+        for (dir in ReaderMode.DIR_L2R..ReaderMode.DIR_T2B) {
+            assertEquals(dir, ReaderMode.resolveDefaultDir(dir, legacyRtl = true))
+            assertEquals(dir, ReaderMode.resolveDefaultDir(dir, legacyRtl = false))
+        }
+    }
+
+    @Test
+    fun reopenedBooksKeepTheirOwnDirectionAfterGlobalDefaultChanges() {
+        for (saved in ReaderMode.DIR_L2R..ReaderMode.DIR_T2B) {
+            for (defaultDir in ReaderMode.DIR_L2R..ReaderMode.DIR_T2B) {
+                val reopened = ReaderMode.resolveMode(saved, defaultDir, scroll = true)
+                assertEquals(saved, reopened.dir)
+                assertFalse(reopened.followsDefaultDirection)
+                assertTrue(reopened.scroll)
             }
         }
     }
 
     @Test
-    fun dirKeyTakesPrecedenceOverLegacy() {
-        for (d in 0..2) {
-            assertEquals(d, ReaderMode.resolveDirKey(d, legacyRtl = true))
-            assertEquals(d, ReaderMode.resolveDirKey(d, legacyRtl = false))
+    fun newOrResetBooksFollowGlobalDefault() {
+        for (key in listOf(-1, -2, 3)) {
+            val mode = ReaderMode.resolveMode(key, ReaderMode.DIR_R2L, scroll = false)
+            assertEquals(ReaderMode.DIR_R2L, mode.dir)
+            assertTrue(mode.followsDefaultDirection)
+            assertFalse(mode.scroll)
         }
-    }
-
-    @Test
-    fun outOfRangeKeyFallsBack() {
-        assertEquals(ReaderMode.DIR_R2L, ReaderMode.resolveDirKey(3, legacyRtl = true))
-        assertEquals(ReaderMode.DIR_T2B, ReaderMode.resolveDirKey(-2, legacyRtl = false))
     }
 
     @Test

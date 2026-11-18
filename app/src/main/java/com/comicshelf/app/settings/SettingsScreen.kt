@@ -41,6 +41,7 @@ import com.comicshelf.app.core.ArchiveCache
 import com.comicshelf.app.core.CoreDispatcher
 import com.comicshelf.app.core.CsSettings
 import com.comicshelf.app.core.NativeBridge
+import com.comicshelf.app.reader.ReaderMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -70,6 +71,19 @@ fun SettingsScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp),
         ) {
+            SettingsSection("阅读") {
+                var direction by remember { mutableStateOf(ReaderMode.defaultDirection()) }
+                SettingsChoice(
+                    title = "默认阅读方向",
+                    options = ReaderMode.directionOptions,
+                    selected = direction,
+                    onSelect = {
+                        ReaderMode.saveDefaultDirection(it)
+                        direction = it
+                    },
+                )
+                Text("用于未单独设置方向的书籍。", style = MaterialTheme.typography.bodySmall)
+            }
             SettingsSection("离线翻译（本机 NPU）") {
                 OfflineOcrSection()
             }

@@ -7,14 +7,12 @@ import com.comicshelf.app.core.CsSettings
  *
  * 方向 dir = 0 左→右 / 1 右→左 / 2 上→下；连续 scroll = 关/开。
  * 按册记忆：`reader_dir_<bookId>`；连续滚动为全局键 `reader_scroll`（v0.5.13 起）。
- * **缺省口径（2026-10-11 变更，READER_MODE_DEFAULT_PLAN）**：方向缺键回退 = 旧全局
- * reader_rtl 为真→右→左（旧用户零变化），否则→**上→下**（新默认）；连续缺省 = **开**。
- * 写键只在用户于设置中改动时发生（P-V9）；本文件只读。
- * resolveDirKey / vertical / rtl 为纯函数（单测覆盖，P-V10a）。
+ * 方向优先级：本册设置 → 全局默认方向 → 旧全局 RTL → 上→下。连续缺省仍为开。
  */
 data class ReaderMode(
     val dir: Int = DIR_L2R,
     val scroll: Boolean = false,
+    val followsDefaultDirection: Boolean = true,
 ) {
     /** 主轴竖直（上→下）。 */
     val vertical: Boolean get() = dir == DIR_T2B
@@ -27,14 +25,41 @@ data class ReaderMode(
         const val DIR_R2L = 1
         const val DIR_T2B = 2
 
-        /** 纯函数：本册键值 → 生效方向。缺键/越界：旧全局 rtl=true 保 右→左；否则默认 上→下。 */
-        fun resolveDirKey(key: Int, legacyRtl: Boolean): Int =
-            if (key in DIR_L2R..DIR_T2B) key else if (legacyRtl) DIR_R2L else DIR_T2B
+        private const val DEFAULT_DIR_KEY = "reader_default_dir"
+        private const val UNSPECIFIED_DIR = -1
 
-        /** 读键解析本册模式（只读，不改任何存储）。 */
-        fun load(bookId: Long, legacyRtl: Boolean): ReaderMode = ReaderMode(
-            dir = resolveDirKey(CsSettings.int("reader_dir_$bookId", -1), legacyRtl),
-            scroll = CsSettings.bool("reader_scroll", true),
+        internal val directionOptions = listOf(DIR_L2R to "左→右", DIR_R2L to "右→左", DIR_T2B to "上→下")
+
+        private fun isDirection(value: Int) = value in DIR_L2R..DIR_T2B
+
+        internal fun resolveDefaultDir(key: Int, legacyRtl: Boolean): Int =
+            if (isDirection(key)) key else if (legacyRtl) DIR_R2L else DIR_T2B
+
+        fun defaultDirection(): Int = resolveDefaultDir(
+            CsSettings.int(DEFAULT_DIR_KEY, UNSPECIFIED_DIR),
+            CsSettings.bool("reader_rtl", false),
         )
+
+        fun saveDefaultDirection(dir: Int) {
+            require(isDirection(dir))
+            CsSettings.setInt(DEFAULT_DIR_KEY, dir)
+            CsSettings.save()
+        }
+
+        internal fun resolveMode(bookDir: Int, defaultDir: Int, scroll: Boolean): ReaderMode =
+            if (isDirection(bookDir)) ReaderMode(bookDir, scroll, followsDefaultDirection = false)
+            else ReaderMode(defaultDir, scroll)
+
+        fun load(bookId: Long): ReaderMode = resolveMode(
+            CsSettings.int("reader_dir_$bookId", UNSPECIFIED_DIR),
+            defaultDirection(),
+            CsSettings.bool("reader_scroll", true),
+        )
+
+        fun saveBookDirection(bookId: Long, dir: Int?) {
+            require(dir == null || isDirection(dir))
+            CsSettings.setInt("reader_dir_$bookId", dir ?: UNSPECIFIED_DIR)
+            CsSettings.save()
+        }
     }
 }

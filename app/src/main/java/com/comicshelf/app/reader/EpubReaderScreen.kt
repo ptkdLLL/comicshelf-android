@@ -14,9 +14,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
@@ -25,7 +30,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.comicshelf.app.core.EpubBookSource
@@ -33,13 +40,21 @@ import com.comicshelf.app.core.EpubBookSource.Block
 import com.comicshelf.app.core.EpubBookSource.Page
 
 /**
- * EPUB reader: one LazyColumn item per spine entry. Text chapters render as
- * Compose paragraphs (no giant page bitmaps); image pages/illustrations use the
- * same bounded decoder as the image reader. Scroll settle writes progress via
- * ReaderViewModel.goto (the same page domain as the pager).
+ * One EPUB spine entry per navigation step. Horizontal reading pages between
+ * sections while allowing long chapters to scroll vertically within a section.
  */
 @Composable
-internal fun EpubReaderScreen(vm: ReaderViewModel, open: ReaderOpenState) {
+internal fun EpubReaderScreen(
+    vm: ReaderViewModel,
+    open: ReaderOpenState,
+    mode: ReaderMode,
+    prefs: ReaderPrefs,
+) {
+    val textColor = if (prefs.bg == 1) Color(0xFF202020) else Color(0xFFE8E8E8)
+    if (!mode.vertical) {
+        EpubHorizontalReader(vm, open, mode.rtl, textColor)
+        return
+    }
     val list = rememberLazyListState(initialFirstVisibleItemIndex = open.page)
 
     // Same double-guard as ReaderScrollView: settle writes, external jumps scroll.
@@ -56,12 +71,6 @@ internal fun EpubReaderScreen(vm: ReaderViewModel, open: ReaderOpenState) {
         }
     }
 
-    val textColor = when (vm.prefs.value.bg) {
-        1 -> Color(0xFF202020)       // white background
-        2 -> Color(0xFFE8E8E8)       // gray
-        else -> Color(0xFFE8E8E8)    // black
-    }
-
     LazyColumn(
         state = list,
         modifier = Modifier.fillMaxSize(),
@@ -69,6 +78,41 @@ internal fun EpubReaderScreen(vm: ReaderViewModel, open: ReaderOpenState) {
     ) {
         items(open.pageCount, key = { it }) { index ->
             EpubSpineItemView(vm, open.bookId, index, textColor)
+        }
+    }
+}
+
+@Composable
+private fun EpubHorizontalReader(
+    vm: ReaderViewModel,
+    open: ReaderOpenState,
+    rtl: Boolean,
+    textColor: Color,
+) {
+    val pager = rememberPagerState(initialPage = open.page) { open.pageCount }
+    LaunchedEffect(pager.currentPage, pager.isScrollInProgress) {
+        if (!pager.isScrollInProgress && pager.currentPage != vm.open.value.page) {
+            vm.goto(pager.currentPage)
+        }
+    }
+    LaunchedEffect(open.page) {
+        if (open.page != pager.currentPage && !pager.isScrollInProgress) {
+            if (vm.prefs.value.pageAnim) pager.animateScrollToPage(open.page)
+            else pager.scrollToPage(open.page)
+        }
+    }
+    val contentDirection = LocalLayoutDirection.current
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        HorizontalPager(state = pager, reverseLayout = rtl, modifier = Modifier.fillMaxSize()) { index ->
+            CompositionLocalProvider(LocalLayoutDirection provides contentDirection) {
+                Column(
+                    Modifier.fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(top = 96.dp, bottom = 88.dp),
+                ) {
+                    EpubSpineItemView(vm, open.bookId, index, textColor)
+                }
+            }
         }
     }
 }
