@@ -33,7 +33,7 @@ packaging\build_win.bat         # Windows（需在 Windows 机器上执行，未
 2. **代理**：填 `127.0.0.1:7897` 或 `http://127.0.0.1:7897` → 点「测试连接」看到 GitHub ✓ / HuggingFace ✓；
    - Clash Verge 请在设置里确认「混合端口」（默认 7897，同时支持 HTTP/HTTPS）；
    - 本工具只支持 **HTTP 代理**（纯标准库实现）；SOCKS-only 端口请改用混合端口；
-3. 点 **「一键构建最新数据库」**：自动查上游版本 → 只下载有变化的源 → 解压/转换 → 6 阶段构建 → 产出；
+3. 点 **「一键构建最新数据库」**：自动查上游版本 → 取源 → 解压/转换 → 6 阶段构建 → 产出。「包含 ehdb 早期标题别名」默认勾选，首次额外下载约 616 MB；只想用主源时可以取消勾选。
 4. 完成后点「打开产物文件夹」，把 `out/ehmeta.db.zip` 传到手机，在 ComicShelf 设置页导入。
 
 ## 数据来源（均为公开来源，全部在 v0.5.0 生产包上验证过）
@@ -48,7 +48,7 @@ packaging\build_win.bat         # Windows（需在 Windows 机器上执行，未
 
 ## 磁盘与流量预算
 
-- 首次全量：下载 ~5.1GB（其中 ehdb 616MB 可选），峰值磁盘 ~9GB，构建 ~5-10 分钟；
+- 首次全量：主源约 4.4GB，勾选 ehdb 时另取约 616MB；峰值磁盘 ~9GB，构建 ~5-10 分钟；
 - 之后每期：下载仅 ~567MB，重建 ~5-10 分钟（缓存源复用）；
 - 勾选「构建后清理解压的大文件」可回收 ~2GB（zip 保留，重建时自动再解压）。
 
@@ -57,12 +57,16 @@ packaging\build_win.bat         # Windows（需在 Windows 机器上执行，未
 ```bash
 python3 -m ehmeta_builder fetch  --proxy http://127.0.0.1:7897      # 只取源
 python3 -m ehmeta_builder fetch  --only hwei,ehtag                  # 只更新指定源
+python3 -m ehmeta_builder fetch  --only ehdb                        # 可选：下载并转换早期标题别名
 python3 -m ehmeta_builder build  --limit 5000 --nozip               # 冒烟
 python3 -m ehmeta_builder update --proxy http://127.0.0.1:7897      # 一键（取源+构建）
 python3 -m ehmeta_builder verify out/ehmeta.db --golden             # 与金标准对账
 ```
 
 环境变量 `EH_PROXY` 可作默认代理；`--workdir` 指定工作目录。
+用 `--skip-ehdb` 可完全排除这个源（包括已有缓存）；用 `--skip-optional` 则只禁止下载可选源，仍使用有效的本地缓存。
+如果已有原始文件，把它放到工作目录的 `sources/ehdb/gdata.json`，先运行
+`fetch --only ehdb --skip-optional` 转换，再运行 `build`；单独运行 `build` 不会转换原始文件。
 
 ## 可信度说明
 
@@ -76,7 +80,7 @@ python3 -m ehmeta_builder verify out/ehmeta.db --golden             # 与金标�
 ## 常见问题
 
 - **下载失败/超时**：先点「测试连接」；中国内地直连 GitHub/HuggingFace 通常不可达，请填代理；
-- **ehdb 源 402/403**：GitHub LFS 带宽配额被耗尽，取消勾选「包含 ehdb 早期快照」即可继续（别名略少，其余不受影响）；
+- **ehdb 源 402/403**：GitHub LFS 不可用时，工具会跳过下载失败的可选源并继续构建；若没有读入本地 `eh_lite.db`，产物的 `meta.json.sources.eh_lite.role` 会记为 `skipped`。
 - **Windows**：源码与打包脚本已提供；二进制**未在开发机验证**，如遇编码/路径问题请反馈；
 - **产物导入不了**：确认文件是 `out/ehmeta.db.zip`（不要手动解压），且手机 App 为 v0.5.0+。
 

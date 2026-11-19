@@ -51,7 +51,7 @@ class App:
         opt.pack(fill="x", **pad)
         self.with_ehdb = tk.BooleanVar(value=True)
         self.clean_extracted = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt, text="包含 ehdb 早期快照（历史标题别名；GitHub LFS，失败会自动跳过）",
+        ttk.Checkbutton(opt, text="包含 ehdb 早期标题别名（首次额外约 616 MB；下载失败时继续构建）",
                         variable=self.with_ehdb).pack(anchor="w")
         ttk.Checkbutton(opt, text="构建后清理解压的大文件（省 ~2GB；zip 保留可再解压）",
                         variable=self.clean_extracted).pack(anchor="w")
@@ -160,9 +160,8 @@ class App:
             self._log(f"一键构建：workdir={wd}  proxy={proxy or '直连'}")
             self._status("取源…", 0)
             from . import cli, builder
-            skip_optional = not with_ehdb
             versions = cli.fetch(wd, proxy, log=self._log,
-                                 skip_optional=skip_optional,
+                                 skip_ehdb=not with_ehdb,
                                  progress=lambda k, d, t: self._status(f"下载 {k}…", (d / t * 100) if t else None))
             self._status("构建…")
             r = builder.build(wd, log=self._log, use_ehdb=with_ehdb, clean_extracted=clean,
