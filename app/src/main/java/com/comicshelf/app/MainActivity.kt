@@ -1,38 +1,38 @@
 package com.comicshelf.app
 
-import android.Manifest
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.provider.Settings
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
+import com.comicshelf.app.reader.ReaderPageKeys
 import com.comicshelf.app.ui.AppRoot
 
 class MainActivity : ComponentActivity() {
+    private val readerPageKeys = ReaderPageKeys()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             ComicShelfTheme {
-                AppRoot(onOpenAllFilesAccess = ::openAllFilesAccess)
+                AppRoot(
+                    onOpenAllFilesAccess = ::openAllFilesAccess,
+                    readerPageKeys = readerPageKeys,
+                )
             }
         }
     }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
+        readerPageKeys.onKeyDown(keyCode, event.repeatCount) || super.onKeyDown(keyCode, event)
 
     private fun openAllFilesAccess() {
         try {
